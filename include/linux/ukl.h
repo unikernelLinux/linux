@@ -16,7 +16,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
-
+#include <linux/perf_event.h>
 #include <trace/events/printk.h>
 #include <asm/unistd.h>
 #include <linux/fs.h>
@@ -71,6 +71,8 @@
 #include <linux/sys.h>
 #include <linux/futex.h>
 #include <linux/sched/mm.h>
+
+int ukl_perf_event_open(struct perf_event_attr *hw_event, pid_t pid,int cpu, int group_fd, unsigned long flags);
 
 ssize_t ukl_write(int fds, const void* buf, size_t count);
 
