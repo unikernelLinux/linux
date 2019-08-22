@@ -1045,7 +1045,7 @@ static long do_restart_poll(struct restart_block *restart_block)
 }
 
 #ifdef CONFIG_UNIKERNEL_LINUX
-int ukl_poll(struct pollfd * ufds, unsigned int nfds, int timeout_msecs)
+int __ukl_poll(struct pollfd * ufds, unsigned int nfds, int timeout_msecs)
 #else
 SYSCALL_DEFINE3(poll, struct pollfd __user *, ufds, unsigned int, nfds,
 		int, timeout_msecs)
