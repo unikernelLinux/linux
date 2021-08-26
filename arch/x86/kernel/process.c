@@ -193,6 +193,19 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 	frame->bx = 0;
 	*childregs = *current_pt_regs();
 	childregs->ax = 0;
+
+#ifdef CONFIG_UNIKERNEL_LINUX
+	/*
+	 * UKL leaves return address and flags on user stack. This works
+	 * fine for clone (i.e., VM shared) but not for 'fork' style
+	 * clone (i.e., VM not shared). This is where we clean those extra
+	 * elements from user stack.
+	 */
+	if (is_ukl_thread() & !(clone_flags & CLONE_VM)) {
+		childregs->sp += 2*(sizeof(long));
+	}
+#endif
+
 	if (sp)
 		childregs->sp = sp;
 
