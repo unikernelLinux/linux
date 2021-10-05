@@ -33,8 +33,9 @@ jobs:
       - name: Checkout MakeFile
         uses: actions/checkout@v2
         with:
-          repository: whunt1965/ukl
+          repository: unikernelLinux/ukl
           token: ${{ secrets.UKLCLI }}
+          ref: actions-files
           path: ukl
     
       #Copy the Linux Directory into the UKL directory
@@ -75,8 +76,8 @@ jobs:
       - name: checkout min-initrd repo
         uses: actions/checkout@v2
         with:
-            repository: whunt1965/min-initrd
-            ref: master
+            repository: unikernelLinux/min-initrd
+            ref: actions-files
             token: ${{ secrets.UKLCLI }}
             path: ukl/min-initrd
 
