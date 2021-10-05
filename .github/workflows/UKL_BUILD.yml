@@ -80,9 +80,11 @@ jobs:
             token: ${{ secrets.UKLCLI }}
             path: ukl/min-initrd
 
-      # Installs required packages for build
-      - name: Install package requirements
-        run: sudo apt-get install git build-essential flex bison supermin libelf-dev libssl-dev texinfo libgmp3-dev libmpc-dev libmpfr-dev
+          # Updates/Installs required packages for build
+      - name: Update and Install package requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install git build-essential flex bison supermin libelf-dev libssl-dev texinfo libgmp3-dev libmpc-dev libmpfr-dev
 
       # Runs Make All to build the UKL
       - name: make UKL
