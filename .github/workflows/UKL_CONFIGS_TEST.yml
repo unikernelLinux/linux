@@ -1,0 +1,388 @@
+# This workflow builds the UKL Kernel from Scratch with different permutations of the UKL config flags, 
+# Boots it in QEMU, and runs a single unit test.
+
+name: UKL CONFIG TESTS
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the ukl-5.14 branch
+  push:
+    branches: [ ukl-5.14 ]
+  pull_request:
+    branches: [ ukl-5.14 ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+
+  #Test Turning all UKL Config Options Off (except Afterspace)
+  TEST_NO_UKL_OPTIONS_ENABLED:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+      
+      # Turn On AfterSpace Configuration Option
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #test Config with LM Bench Sys Calls Tests
+      - name: Run LM Bench Sys Calls tests
+        run: |
+          cd ukl/tests
+          ./run_lmbench_syscalls.sh
+      
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+  #Test Turning all UKL Config Options On
+  TEST_ALL_UKL_OPTIONS_ENABLED:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+      
+      #Update Config File Options
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            echo "CONFIG_UKL_SAME_STACK=y" >> linux_config_permute
+            echo "CONFIG_UKL_USE_RET=y" >> linux_config_permute
+            echo "CONFIG_UKL_USE_IST_PF=y" >> linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+      
+
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #test Config with LM Bench Sys Calls Tests
+      - name: Run LM Bench Sys Calls tests
+        run: |
+          cd ukl/tests
+          ./run_lmbench_syscalls.sh
+      
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+  #Test UKL Same Stack Only Config
+  UKL_SAME_STACK_ONLY:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+      
+      #Update Config File Options
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            echo "CONFIG_UKL_SAME_STACK=y" >> linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+      
+
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #test Config with LM Bench Sys Calls Tests
+      - name: Run LM Bench Sys Calls tests
+        run: |
+          cd ukl/tests
+          ./run_lmbench_syscalls.sh
+      
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+  #Test Turning all UKL Config Options On
+  TEST_UKL_USE_RET_ONLY:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+      
+      #Update Config File Options
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            echo "CONFIG_UKL_USE_RET=y" >> linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+      
+
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #test Config with LM Bench Sys Calls Tests
+      - name: Run LM Bench Sys Calls tests
+        run: |
+          cd ukl/tests
+          ./run_lmbench_syscalls.sh
+      
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+  #Test Turning only only UKL USE IST
+  TEST_UKL_USE_IST_ONLY:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+      
+      #Update Config File Options
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            echo "CONFIG_UKL_USE_IST_PF=y" >> linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+      
+
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #test Config with LM Bench Sys Calls Tests
+      - name: Run LM Bench Sys Calls tests
+        run: |
+          cd ukl/tests
+          ./run_lmbench_syscalls.sh
+      
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+  #Test UKL Use Same Stack and UKL use Ret
+  TEST_UKL_USE_SAME_STACK_and_UKL_USE_RET:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+      
+      #Update Config File Options
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            echo "CONFIG_UKL_SAME_STACK=y" >> linux_config_permute
+            echo "CONFIG_UKL_USE_RET=y" >> linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #test Config with LM Bench Sys Calls Tests
+      - name: Run LM Bench Sys Calls tests
+        run: |
+          cd ukl/tests
+          ./run_lmbench_syscalls.sh
+      
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+          
+          
+  #Test UKL Same Stack and UKL Use IST
+  TEST_UKL_SAME_STACK_and_UKL_USE_IST:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+      
+      #Update Config File Options
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            echo "CONFIG_UKL_SAME_STACK=y" >> linux_config_permute
+            echo "CONFIG_UKL_USE_IST_PF=y" >> linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+      
+
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #test Config with LM Bench Sys Calls Tests
+      - name: Run LM Bench Sys Calls tests
+        run: |
+          cd ukl/tests
+          ./run_lmbench_syscalls.sh
+      
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+#Test Turning all UKL Config Options On
+  TEST_UKL_USE_IST_and_UKL_USE_RET:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+      
+      #Update Config File Options
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            echo "CONFIG_UKL_USE_RET=y" >> linux_config_permute
+            echo "CONFIG_UKL_USE_IST_PF=y" >> linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+      
+
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #test Config with LM Bench Sys Calls Tests
+      - name: Run LM Bench Sys Calls tests
+        run: |
+          cd ukl/tests
+          ./run_lmbench_syscalls.sh
+      
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .

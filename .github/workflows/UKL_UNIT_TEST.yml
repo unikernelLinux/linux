@@ -1,6 +1,6 @@
-# This workflow builds the UKL Kernel from Scratch
+# This workflow builds the from Scratch, Boots it in QEMU, and runs unit tests
 
-name: UKL Build Test
+name: UKL UNIT TESTS
 
 # Controls when the workflow will run
 on:
@@ -13,14 +13,14 @@ on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
+
+  #Boot Test Job
+  Boot-Test:
+  
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
           
       #Checkout UKL/Linux repo - branch 5.14      
@@ -29,66 +29,77 @@ jobs:
         with:
             path: linux
     
-      # Checks-out Makefile from UKL repo
-      - name: Checkout MakeFile
-        uses: actions/checkout@v2
-        with:
-          repository: unikernelLinux/ukl
-          token: ${{ secrets.UKLCLI }}
-          ref: actions-files
-          path: ukl
-    
-      #Copy the Linux Directory into the UKL directory
-      - name: Copy Linux dir into ukl dir
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+          
+      # Turn On AfterSpace Configuration Option
+      - name: Update Config Options
         run: |
-          mv /home/runner/work/linux/linux/linux ukl/
-          cd ukl
-    
-      
-      #Checkout Linux-Configs repo
-      - name: checkout config file
-        uses: actions/checkout@v2
-        with:
-            repository: unikernelLinux/Linux-Configs
-            ref: master
-            token: ${{ secrets.UKLCLI }}
-            path: ukl/Linux-Configs
-            
-            
-      #Checkout gcc repo - branch releases/gcc-9.3.0     
-      - name: checkout GCC repo
-        uses: actions/checkout@v2
-        with:
-            repository: gcc-mirror/gcc
-            ref: releases/gcc-9.3.0
-            path: ukl/gcc
-            
-      #Checkout UKL/glibc repo - branch ukl   
-      - name: checkout glibc repo
-        uses: actions/checkout@v2
-        with:
-            repository: unikernelLinux/glibc
-            ref: ukl
-            token: ${{ secrets.UKLCLI }}
-            path: ukl/glibc
-            
-      #Checkout min-initrd repo - branch ukl   
-      - name: checkout min-initrd repo
-        uses: actions/checkout@v2
-        with:
-            repository: unikernelLinux/min-initrd
-            ref: actions-files
-            token: ${{ secrets.UKLCLI }}
-            path: ukl/min-initrd
-
-          # Updates/Installs required packages for build
-      - name: Update and Install package requirements
-        run: |
-          sudo apt-get update
-          sudo apt-get install git build-essential flex bison supermin libelf-dev libssl-dev texinfo libgmp3-dev libmpc-dev libmpfr-dev
-
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+          
       # Runs Make All to build the UKL
-      - name: make UKL
+      - name: Compile UKL
         run: |
           cd ukl/
           make all
+      
+      #Run Boot Test
+      - name: Run UKL Boot Test
+        run: |
+          cd ukl/tests
+          ./run_boot.sh
+      
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+  #Run LM Bench System Calls Tests
+  LMBench_SysCalls_Tests:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos  
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI  }}
+          
+      # Turn On AfterSpace Configuration Option
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+          
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #Run LM Bench Sys Calls Tests
+      - name: Run LM Bench Sys Calls tests
+        run: |
+          cd ukl/tests
+          ./run_lmbench_syscalls.sh
+          
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .

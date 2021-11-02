@@ -1,0 +1,73 @@
+# This Composite Workflow is Used to perform the repetitive task of cloning repos and installing dependencies
+
+name: "UKL CLONE REPOS"
+description: "Clones all UKL Dependency Repos"
+
+inputs:
+  ukl_token:
+    description: "Token Needed to Access Private UKL Dependency Repos"
+    required: true
+    
+runs:
+  using: "composite"
+  steps:
+    
+    # Checks-out Makefile from UKL repo
+    - name: Checkout MakeFile
+      uses: actions/checkout@v2
+      with:
+        repository: unikernelLinux/ukl
+        token: ${{ inputs.ukl_token }}
+        ref:  actions-files
+        path: ukl
+    
+    #Copy the Linux Directory into the UKL directory
+    - name: Copy Linux dir into ukl dir
+      shell: bash
+      run: |
+        mv /home/runner/work/linux/linux/linux ukl/
+        cd ukl
+    
+    #Checkout Linux-Configs repo
+    - name: checkout config file
+      uses: actions/checkout@v2
+      with:
+        repository: unikernelLinux/Linux-Configs
+        ref: master
+        token: ${{ inputs.ukl_token }}
+        path: ukl/Linux-Configs
+            
+            
+    #Checkout gcc repo - branch releases/gcc-9.3.0     
+    - name: checkout GCC repo
+      uses: actions/checkout@v2
+      with:
+          repository: gcc-mirror/gcc
+          ref: releases/gcc-9.3.0
+          path: ukl/gcc
+            
+    #Checkout UKL/glibc repo - branch ukl   
+    - name: checkout glibc repo
+      uses: actions/checkout@v2
+      with:
+          repository: unikernelLinux/glibc
+          ref: ukl
+          token: ${{ inputs.ukl_token }}
+          path: ukl/glibc
+            
+    #Checkout min-initrd repo - branch ukl   
+    - name: checkout min-initrd repo
+      uses: actions/checkout@v2
+      with:
+          repository: unikernelLinux/min-initrd
+          ref: actions-files
+          token: ${{ inputs.ukl_token }}
+          path: ukl/min-initrd
+
+    # Installs required packages for build
+    - name: Update and install package requirements
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install git build-essential flex bison supermin libelf-dev libssl-dev texinfo libgmp3-dev libmpc-dev libmpfr-dev qemu-kvm
+      
