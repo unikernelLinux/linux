@@ -18,7 +18,7 @@ runs:
       with:
         repository: unikernelLinux/ukl
         token: ${{ inputs.ukl_token }}
-        ref:  unit-tests-actions-files
+        ref:  actions-files
         path: ukl
     
     #Copy the Linux Directory into the UKL directory
@@ -60,7 +60,7 @@ runs:
       uses: actions/checkout@v2
       with:
           repository: unikernelLinux/min-initrd
-          ref: unit-test-actions
+          ref: actions-files
           token: ${{ inputs.ukl_token }}
           path: ukl/min-initrd
 
