@@ -1509,7 +1509,11 @@ static int ukl_create_afterspace(void* tmp){
 	wait_for_completion(&ukl_done);
 	printk("PID %d and in_user is %d is creating afterspace.\n",\
 			current->pid, get_in_user());
-	return kernel_execve("/init", NULL, NULL);
+	/**
+	 * Call "shutdown" script in min-initrd to reboot the system (used for unit testing with
+	 * UKL_CREATE_AFTERSPACE flag turned on)
+	 */ 
+	return kernel_execve("/shutdown", NULL, NULL);
 }
 #endif
 
