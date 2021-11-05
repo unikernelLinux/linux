@@ -1,5 +1,5 @@
 # This workflow builds the UKL Kernel from Scratch with different permutations of the UKL config flags, 
-# Boots it in QEMU, and runs a single unit test.
+# Boots it in QEMU, and runs a single unit test (LE Bench System Calls Test).
 
 name: UKL CONFIG TESTS
 
@@ -48,11 +48,11 @@ jobs:
           cd ukl/
           make all
       
-      #test Config with LM Bench Sys Calls Tests
-      - name: Run LM Bench Sys Calls tests
+      #test Config with LE Bench Sys Calls Tests
+      - name: Run LE Bench Sys Calls tests
         run: |
           cd ukl/tests
-          ./run_lmbench_syscalls.sh
+          ./run_lebench_syscalls.sh
       
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup
@@ -96,11 +96,11 @@ jobs:
           cd ukl/
           make all
       
-      #test Config with LM Bench Sys Calls Tests
-      - name: Run LM Bench Sys Calls tests
+      #test Config with LE Bench Sys Calls Tests
+      - name: Run LE Bench Sys Calls tests
         run: |
           cd ukl/tests
-          ./run_lmbench_syscalls.sh
+          ./run_lebench_syscalls.sh
       
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup
@@ -142,11 +142,11 @@ jobs:
           cd ukl/
           make all
       
-      #test Config with LM Bench Sys Calls Tests
-      - name: Run LM Bench Sys Calls tests
+      #test Config with LE Bench Sys Calls Tests
+      - name: Run LE Bench Sys Calls tests
         run: |
           cd ukl/tests
-          ./run_lmbench_syscalls.sh
+          ./run_lebench_syscalls.sh
       
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup
@@ -188,11 +188,11 @@ jobs:
           cd ukl/
           make all
       
-      #test Config with LM Bench Sys Calls Tests
-      - name: Run LM Bench Sys Calls tests
+      #test Config with LE Bench Sys Calls Tests
+      - name: Run LE Bench Sys Calls tests
         run: |
           cd ukl/tests
-          ./run_lmbench_syscalls.sh
+          ./run_lebench_syscalls.sh
       
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup
@@ -234,11 +234,11 @@ jobs:
           cd ukl/
           make all
       
-      #test Config with LM Bench Sys Calls Tests
-      - name: Run LM Bench Sys Calls tests
+      #test Config with LE Bench Sys Calls Tests
+      - name: Run LE Bench Sys Calls tests
         run: |
           cd ukl/tests
-          ./run_lmbench_syscalls.sh
+          ./run_lebench_syscalls.sh
       
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup
@@ -279,11 +279,11 @@ jobs:
           cd ukl/
           make all
       
-      #test Config with LM Bench Sys Calls Tests
-      - name: Run LM Bench Sys Calls tests
+      #test Config with LE Bench Sys Calls Tests
+      - name: Run LE Bench Sys Calls tests
         run: |
           cd ukl/tests
-          ./run_lmbench_syscalls.sh
+          ./run_lebench_syscalls.sh
       
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup
@@ -328,11 +328,11 @@ jobs:
           cd ukl/
           make all
       
-      #test Config with LM Bench Sys Calls Tests
-      - name: Run LM Bench Sys Calls tests
+      #test Config with LE Bench Sys Calls Tests
+      - name: Run LE Bench Sys Calls tests
         run: |
           cd ukl/tests
-          ./run_lmbench_syscalls.sh
+          ./run_lebench_syscalls.sh
       
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup
@@ -375,11 +375,11 @@ jobs:
           cd ukl/
           make all
       
-      #test Config with LM Bench Sys Calls Tests
-      - name: Run LM Bench Sys Calls tests
+      #test Config with LE Bench Sys Calls Tests
+      - name: Run LE Bench Sys Calls tests
         run: |
           cd ukl/tests
-          ./run_lmbench_syscalls.sh
+          ./run_lebench_syscalls.sh
       
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup

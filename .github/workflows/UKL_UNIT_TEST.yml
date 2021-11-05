@@ -59,8 +59,9 @@ jobs:
         if: always()
         run: | 
           mv ukl/linux .
-  #Run LM Bench System Calls Tests
-  LMBench_SysCalls_Tests:
+  
+  #Run LE Bench System Calls Tests
+  LEBench_SysCalls_Tests:
   
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
@@ -92,11 +93,11 @@ jobs:
           cd ukl/
           make all
       
-      #Run LM Bench Sys Calls Tests
-      - name: Run LM Bench Sys Calls tests
+      #Run LE Bench Sys Calls Tests
+      - name: Run LE Bench Sys Calls tests
         run: |
           cd ukl/tests
-          ./run_lmbench_syscalls.sh
+          ./run_lebench_syscalls.sh
           
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup
