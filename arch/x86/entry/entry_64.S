@@ -397,6 +397,26 @@ SYM_CODE_START(ret_from_fork)
 	movq    RSP(%rsp), %rdi
 	call    find_user_vma
 #endif
+	/* check if we are fork, need to clear the stack of ret address and flags there */
+	/* clone does not need it because it starts from a clean stack */
+	/* fork uses the same stack as the parent, but in a different address space */
+	/* First check if UKL thread with get in user */
+	/* Then check pt_regs on stack to see if what the child stack addr was */
+	/* If zero, this is fork. If not zero, this is clone */
+	/* Need to fix user stack on fork to remove ret addr and flags */
+	testb   $3, CS(%rsp)
+        jnz     3f /* user threads */
+	
+	cmpq    $0, RSI(%rsp)
+        jne      3f
+	/* This is fork handling */
+	pushq	%rax
+	movq    RSP+0x8(%rsp), %rax
+	addq    $0x10, %rax
+	movq	%rax, RSP+0x8(%rsp)
+	popq	%rax
+
+3:
 	jmp	swapgs_restore_regs_and_return_to_usermode
 
 1:
@@ -409,6 +429,15 @@ SYM_CODE_START(ret_from_fork)
 	 * calling kernel_execve().  Exit to userspace to complete the execve()
 	 * syscall.
 	 */
+	testb   $3, CS(%rsp)
+        jnz     4f /* user threads */
+
+	pushq   %rax
+        movq    RSP+0x8(%rsp), %rax
+        subq    $0x10, %rax
+        movq    %rax, RSP+0x8(%rsp)
+        popq    %rax
+4:
 	movq	$0, RAX(%rsp)
 	jmp	2b
 SYM_CODE_END(ret_from_fork)
