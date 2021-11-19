@@ -29,6 +29,8 @@ jobs:
     # (in Azure). To run on a self-hosted machine, follow the steps provided in the documentation and change
     # 'ubuntu-latest' to 'self-hosted'
     runs-on: ubuntu-latest
+
+    steps:
           
       #Checkout UKL/Linux repo       
       - name: checkout Linux UKL Repo
