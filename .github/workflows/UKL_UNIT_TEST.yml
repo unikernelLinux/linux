@@ -1,4 +1,8 @@
-# This workflow builds the from Scratch, Boots it in QEMU, and runs unit tests
+# This workflow builds the from Scratch, Boots it in QEMU, and runs the following unit tests:
+#   - Boot-Test: Tests whether QEMU can boot the UKL (where the UKL includes simple application which prints a string and exits)
+#   - LeBench_Sys_Calls_Tests: Tests that the various system calls in lebench can run in the UKL
+#   - Multi_Thread_Tests: Tests whether the UKL can run a program that uses multiple threads
+#   - Memcached_Tests: Tests networking by running Memcached in the UKL and testing writes/reads from host to UKL
 
 name: UKL UNIT TESTS
 
@@ -9,6 +13,10 @@ on:
     branches: [ ukl-5.14 ]
   pull_request:
     branches: [ ukl-5.14 ]
+
+  #Schedules run at 05:00 UTC (~12AM EST)
+  schedule:
+    - cron:  '0 5 * * *'
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
@@ -29,7 +37,7 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 
@@ -74,11 +82,11 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 
-          ukl_token: ${{ secrets.UKLCLI  }}
+          ukl_token: ${{ secrets.UKLCLI }}
           
       # Turn On AfterSpace Configuration Option
       - name: Update Config Options
@@ -98,6 +106,168 @@ jobs:
         run: |
           cd ukl/tests
           ./run_lebench_syscalls.sh
+          
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+
+  #Run P Threads Tests
+  Multi_Thread_Tests:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos - Token is required for cloning private repositories
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+          
+      # Turn On AfterSpace Configuration Option
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+          
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #Run P Threads Test
+      - name: Run PThreads Test
+        run: |
+          cd ukl/tests
+          ./run_pthread.sh
+          
+      #Move Linux back to Parent Directory to enable default action cleanup
+      - name: Prepare for Cleanup
+        if: always()
+        run: | 
+          mv ukl/linux .
+
+  #Run Memcached Networking Tests
+  Memcached_Tests:
+  
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo - branch 5.14      
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos - Token is required for cloning private repositories
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+          
+      # Turn On AfterSpace Configuration Option
+      - name: Update Config Options to use AfterSpace
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+      
+      # Install Packages for Compiling Libevent/Memcached
+      - name: Install Packages for Compiling Libevent/Memcached
+        run: |
+            sudo apt-get update
+            sudo apt-get install automake libtool libevent-dev telnet
+      
+      
+      # Install libmemcached for Memaslap)
+      - name: Install libmemcached (for Memaslap networking test tool)
+        run: |
+            cd ./ukl/tests/memcached
+            tar xvzf libmemcached-1.0.18.tar.gz
+            cp ./memflush.cc ./libmemcached-1.0.18/clients/
+            cp ./Makefile.in ./libmemcached-1.0.18
+            cd libmemcached-1.0.18
+            ./configure --enable-memaslap
+            sudo make install 
+            
+      #Checkout UKL memcached Repo - Token is required as repo is private
+      - name: Checkout memcached Repo (port for UKL) 
+        uses: actions/checkout@v2
+        with:
+            repository: unikernelLinux/memcached
+            ref: ukl
+            token: ${{ secrets.UKLCLI }}
+            path: ukl/memcached
+      
+      #Checkout UKL libevent Repo - Token is required as repo is private
+      - name: Checkout Libevent Repo (port for UKL) 
+        uses: actions/checkout@v2
+        with:
+            repository: unikernelLinux/libevent
+            ref: ukl
+            token: ${{ secrets.UKLCLI }}
+            path: ukl/libevent
+     
+     #Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+           cd ukl/
+           make all
+           
+     #Runs 'make libevent' to build libevent 
+      - name: Compile libevent
+        run: |
+           cd ukl/
+           make libevent
+           
+      #Runs 'make memcached' to build memcached 
+      - name: Compile memcached
+        run: |
+           cd ukl/
+           make memcached      
+       
+     #Runs 'make linux-build' to build final UKL with Memcached
+      - name: Build UKL with Memcached
+        run: |
+           cd ukl/
+           make linux-build   
+
+     #Start ukl memcached server as background process
+      - name: Start ukl Memcached Server as Background Process
+        run: |
+          cd ukl/tests
+          ./run_memcached_server.sh
+
+      #Run memaslap Tests
+      - name: Run Memaslap Tests
+        run: |
+          cd ukl/tests/memcached
+          ./run_memaslap_tests.sh
+      
+      #Run telnet Tests
+      - name: Run telnet Tests
+        run: |
+          cd ukl/tests/memcached
+          ./run_telnet_tests.sh
+          
+      #Kill Qemu to stop UKL Memcached Server
+      - name: Stop UKL Memcached Server
+        run: |
+          export QEMU_PID=`pidof qemu-system-x86_64`
+          sudo kill $QEMU_PID
           
       #Move Linux back to Parent Directory to enable default action cleanup
       - name: Prepare for Cleanup
