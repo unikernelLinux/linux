@@ -1,7 +1,7 @@
-# This workflow builds the UKL Kernel from Scratch with different permutations of the UKL config flags, 
-# Boots it in QEMU, and runs a single unit test (LE Bench System Calls Test).
-
-name: UKL CONFIG TESTS
+# This workflow builds the UKL from Scratch with different permutations of the UKL config flags, 
+# boots it in QEMU, and runs a single unit test (LE Bench System Calls Test) to ensure that the UKL
+# is able to compile/run with these new configurations. NOTE: the UKL_CREATE_AFTERSPACE configuration 
+# is enabled across all tests.
 
 # Controls when the workflow will run
 on:
@@ -10,13 +10,17 @@ on:
     branches: [ ukl-5.14 ]
   pull_request:
     branches: [ ukl-5.14 ]
+  
+  #Schedules run at 05:00 UTC (~12AM EST)
+  schedule:
+    - cron:  '0 5 * * *'
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
 jobs:
 
-  #Test Turning all UKL Config Options Off (except Afterspace)
+  #Disable all UKL configurations (except UKL_CREATE_AFTERSPACE)
   TEST_NO_UKL_OPTIONS_ENABLED:
   
     # The type of runner that the job will run on
@@ -30,7 +34,7 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 
@@ -59,7 +63,8 @@ jobs:
         if: always()
         run: | 
           mv ukl/linux .
-  #Test Turning all UKL Config Options On
+
+  #Enable all UKL configurations (UKL_CREATE_AFTERSPACE, UKL_SAME_STACK, UKL_USE_RET, UKL_USE_IST_PF)
   TEST_ALL_UKL_OPTIONS_ENABLED:
   
     # The type of runner that the job will run on
@@ -73,7 +78,7 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 
@@ -107,7 +112,8 @@ jobs:
         if: always()
         run: | 
           mv ukl/linux .
-  #Test UKL Same Stack Only Config
+
+  #Enable only UKL_CREATE_AFTERSPACE and UKL_SAME_STACK
   UKL_SAME_STACK_ONLY:
   
     # The type of runner that the job will run on
@@ -121,7 +127,7 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 
@@ -153,7 +159,8 @@ jobs:
         if: always()
         run: | 
           mv ukl/linux .
-  #Test Turning all UKL Config Options On
+
+  #Enable only UKL_CREATE_AFTERSPACE and UKL_USE_RET
   TEST_UKL_USE_RET_ONLY:
   
     # The type of runner that the job will run on
@@ -167,7 +174,7 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 
@@ -199,7 +206,8 @@ jobs:
         if: always()
         run: | 
           mv ukl/linux .
-  #Test Turning only only UKL USE IST
+
+  #Enable only UKL_CREATE_AFTERSPACE and UKL_USE_IST_PF
   TEST_UKL_USE_IST_ONLY:
   
     # The type of runner that the job will run on
@@ -213,7 +221,7 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 
@@ -245,7 +253,8 @@ jobs:
         if: always()
         run: | 
           mv ukl/linux .
-  #Test UKL Use Same Stack and UKL use Ret
+
+  #Enable only UKL_CREATE_AFTERSPACE, UKL_SAME_STACK, and UKL_USE_RET
   TEST_UKL_USE_SAME_STACK_and_UKL_USE_RET:
   
     # The type of runner that the job will run on
@@ -259,7 +268,7 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 
@@ -292,7 +301,7 @@ jobs:
           mv ukl/linux .
           
           
-  #Test UKL Same Stack and UKL Use IST
+  #Enable only UKL_CREATE_AFTERSPACE, UKL_SAME_STACK, and UKL_USE_IST_PF
   TEST_UKL_SAME_STACK_and_UKL_USE_IST:
   
     # The type of runner that the job will run on
@@ -306,7 +315,7 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 
@@ -339,7 +348,8 @@ jobs:
         if: always()
         run: | 
           mv ukl/linux .
-#Test Turning all UKL Config Options On
+
+  #Enable only UKL_CREATE_AFTERSPACE, UKL_USE_RET and UKL_USE_IST_PF
   TEST_UKL_USE_IST_and_UKL_USE_RET:
   
     # The type of runner that the job will run on
@@ -353,7 +363,7 @@ jobs:
         with:
             path: linux
     
-      #Clone Repos  
+      #Clone Repos - Token is required for cloning private repositories
       - name: Clone Dependency Repos
         uses: ./linux/.github/workflows/composite/clone
         with: 

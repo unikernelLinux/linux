@@ -1,4 +1,5 @@
 # This Composite Workflow is Used to perform the repetitive task of cloning repos and installing dependencies
+# required for compiling and running the UKL
 
 name: "UKL CLONE REPOS"
 description: "Clones all UKL Dependency Repos"
@@ -21,11 +22,12 @@ runs:
         ref:  actions-files
         path: ukl
     
-    #Copy the Linux Directory into the UKL directory
+    #Copy the Linux Directory into the UKL directory (to make ukl the parent directory of linux)
     - name: Copy Linux dir into ukl dir
       shell: bash
       run: |
-        mv /home/runner/work/linux/linux/linux ukl/
+        export BASE_DIR=`pwd`
+        mv $BASE_DIR/linux ukl/
         cd ukl
     
     #Checkout Linux-Configs repo
