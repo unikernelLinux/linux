@@ -3,6 +3,8 @@
 # is able to compile/run with these new configurations. NOTE: the UKL_CREATE_AFTERSPACE configuration 
 # is enabled across all tests.
 
+name: UKL CONFIGS TEST
+
 # Controls when the workflow will run
 on:
   # Triggers the workflow on push or pull request events but only for the ukl-5.14 branch
