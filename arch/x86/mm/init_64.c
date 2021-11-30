@@ -1264,6 +1264,7 @@ int kernel_set_to_readonly;
 
 void mark_rodata_ro(void)
 {
+#pragma GCC diagnostic ignored "-Wunused-variable"
 	unsigned long start = PFN_ALIGN(_text);
 	unsigned long rodata_start = PFN_ALIGN(__start_rodata);
 #ifdef CONFIG_UNIKERNEL_LINUX
@@ -1278,6 +1279,7 @@ void mark_rodata_ro(void)
 	unsigned long rodata_end = PFN_ALIGN(__end_rodata);
 #endif
 	unsigned long all_end;
+#pragma GCC diagnostic pop
 
 	printk(KERN_INFO "Write protecting the kernel read-only data: %luk\n",
 	       (end - start) >> 10);
