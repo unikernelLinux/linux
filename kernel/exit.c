@@ -733,11 +733,6 @@ void __noreturn do_exit(long code)
 	struct task_struct *tsk = current;
 	int group_dead;
 
-#ifdef CONFIG_UKL_CREATE_AFTERSPACE
-	if (unlikely(is_global_init(tsk))){
-		complete(&ukl_done);
-	}
-#endif
 
 	/*
 	 * We can get here from a kernel oops, sometimes with preemption off.
@@ -802,6 +797,9 @@ void __noreturn do_exit(long code)
 		 */
 		if (unlikely(is_global_init(tsk))){
 			printk("UKL exiting\n");
+#ifdef CONFIG_UKL_CREATE_AFTERSPACE
+			complete(&ukl_done);
+#endif
 			while(1){
 				current->__state = TASK_INTERRUPTIBLE;
 				schedule();
