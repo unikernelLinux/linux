@@ -258,6 +258,8 @@ SYM_CODE_START(ukl_entry_SYSCALL_64)
 	SWITCH_TO_KERNEL_CR3 scratch_reg=%rsp
 #ifndef CONFIG_UKL_SAME_STACK
 	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+#else
+        subq    $8, %rsp
 #endif
 
 	/* Construct struct pt_regs on stack */
