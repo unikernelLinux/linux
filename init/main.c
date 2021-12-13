@@ -1509,7 +1509,7 @@ static int ukl_create_afterspace(void* tmp){
 	wait_for_completion(&ukl_done);
 	printk("PID %d and in_user is %d is creating afterspace.\n",\
 			current->pid, get_in_user());
-	return kernel_execve("/init", NULL, NULL);
+	return kernel_execve("/afterinit", NULL, NULL);
 }
 #endif
 
