@@ -402,7 +402,7 @@ noinstr void irqentry_exit(struct pt_regs *regs, irqentry_state_t state)
 	lockdep_assert_irqs_disabled();
 
 	/* Check whether this returns to user mode */
-	if (user_mode(regs)) {
+	if (user_mode(regs) && current->ukl_bypass_syscall == 0) {
 		irqentry_exit_to_user_mode(regs);
 	} else if (!regs_irqs_disabled(regs)) {
 		/*
