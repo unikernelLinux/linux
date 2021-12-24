@@ -8,10 +8,10 @@ name: LATENCY TEST
 on:
 
 # Uncomment the below lines to trigger this test on push/pull requests
-#   push:
-#     branches: [ ukl-5.14 ]
-#   pull_request:
-#     branches: [ ukl-5.14 ]
+   push:
+     branches: [ ukl-5.14 ]
+   pull_request:
+     branches: [ ukl-5.14 ]
 
 # Uncomment/edit the below lines to run on at a scheduled time
   # schedule:
