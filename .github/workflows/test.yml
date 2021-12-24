@@ -1,0 +1,61 @@
+name: LATENCY TEST
+
+# Controls when the workflow will run, for now, only manual runs through the GitHub online UI 
+# ("Workflow Dispatch") are enabled
+on:
+
+# Uncomment the below lines to trigger this test on push/pull requests
+   push:
+     branches: [ ukl-5.14 ]
+   pull_request:
+     branches: [ ukl-5.14 ]
+
+# Uncomment/edit the below lines to run on at a scheduled time
+  # schedule:
+  #   - cron:  '0 5 * * *'
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+
+  #LEBench Latency Test Job
+  LEBench-Latency-Test:
+  
+    # The type of runner that the job will run on. For now, this is set to run on a GitHub-hosted machine
+    # (in Azure). To run on a self-hosted machine, follow the steps provided in the documentation and change
+    # 'ubuntu-latest' to 'self-hosted'
+    runs-on: ubuntu-latest
+
+    steps:
+          
+      #Checkout UKL/Linux repo       
+      - name: checkout Linux UKL Repo
+        uses: actions/checkout@v2
+        with:
+            path: linux
+    
+      #Clone Repos - Token is required for cloning private repositories
+      - name: Clone Dependency Repos
+        uses: ./linux/.github/workflows/composite/clone
+        with: 
+          ukl_token: ${{ secrets.UKLCLI }}
+          
+      # Turn On AfterSpace Configuration Option
+      - name: Update Config Options
+        run: |
+            cd ./ukl/tests
+            cat linux_config > linux_config_permute
+            cp linux_config_permute ../Linux-Configs/ukl/golden_config-5.7-broadcom
+          
+      # Runs Make All to build the UKL
+      - name: Compile UKL
+        run: |
+          cd ukl/
+          make all
+      
+      #Run LE Bench Latency Test
+      - name: Run LE Bench Latency Test
+        run: |
+          cd ukl/tests
+          ./run_lebench_latency.sh
