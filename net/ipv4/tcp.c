@@ -1465,6 +1465,227 @@ int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 }
 EXPORT_SYMBOL(tcp_sendmsg);
 
+static inline loff_t *file_ppos(struct file *file)
+{
+	return file->f_mode & FMODE_STREAM ? NULL : &file->f_pos;
+}
+
+
+#define SZ_CACHE 200
+
+struct sock *my_sock_cache[SZ_CACHE];
+
+struct kiocb_cache_entry{
+  struct kiocb kiocb_;
+  // Check valid to see if entry exists.
+  int valid;
+};
+struct kiocb_cache_entry my_kiocb_cache[SZ_CACHE];
+
+void shortcut_purge_cache_entry(int fd){
+  my_sock_cache[fd] = NULL;
+  my_kiocb_cache[fd].valid = 0;
+}
+
+EXPORT_SYMBOL(shortcut_purge_cache_entry);
+
+int one_time_work_done  = 0;
+/* struct kiocb global_kiocb; */
+struct msghdr global_msg;
+struct sock *global_sk = NULL;
+
+/* struct sock *sock_array[200] = NULL; */
+
+int shortcut_tcp_sendmsg(int fd, struct iovec* iov)
+{
+	int ret;
+
+  struct fd f;
+  struct socket *socket;
+  struct sock *sk;
+	struct iov_iter iter;
+  struct kiocb kiocb;
+  loff_t pos, *ppos;
+
+  // First time we have to do some setup.
+  /* if (one_time_work_done == 0){ */
+  /*   memset(sock_array); */
+  /*   one_time_work_done = 1; */
+  /* } */
+
+  /* if(sock_array[fd] == NULL){ */
+  /*   // get socket ptr */
+  /*   sock_array[fd] = socket ptr */
+  /*     }{ */
+  /*   // use it. */
+  /* } */
+
+
+  // Need iter to put into msg
+  // TODO: doesn't this change, so needs to be done every time?
+  iov_iter_init(&iter, WRITE, iov, 1, iov->iov_len);
+
+
+
+  // Get fd struct
+  f = fdget_pos(fd);
+  // Check file pointer
+  if(f.file == 0){
+    // printk("Error, file is zero\n");
+  }
+
+  ppos = file_ppos(f.file);
+  if (ppos) {
+    pos = *ppos;
+    ppos = &pos;
+  }
+
+  // Get socket ptr
+  socket = (struct socket *) f.file->private_data;
+
+  // Copy sk to global var
+  // TODO: roundabout
+  global_sk = socket->sk;
+
+  if (one_time_work_done == 0){
+
+      // This is always 0
+
+      init_sync_kiocb(&kiocb, f.file);
+
+      kiocb.ki_pos = (ppos ? *ppos : 0);
+
+      // Copy msg struct to global
+      global_msg.msg_iocb = &kiocb;
+
+      one_time_work_done = 1;
+    }
+
+    sk = global_sk;
+
+  global_msg.msg_iter = iter;
+  struct msghdr msg = global_msg;
+
+	lock_sock(sk);
+
+  // printk("%s: sk: %px, msg %px, iov.iov_len %ld \n",
+         /* __func__, sk, &msg, iov->iov_len); */
+
+	ret = tcp_sendmsg_locked(sk, &msg, iov->iov_len);
+	release_sock(sk);
+
+  // printk("%s: ret: %d \n", __func__, ret);
+
+	return ret;
+}
+EXPORT_SYMBOL(shortcut_tcp_sendmsg);
+
+int shortcut_tcp_sendmsg_cached(int fd, struct iovec* iov)
+{
+	int ret;
+
+  /* struct fd f; */
+  struct sock *sk;
+	struct iov_iter iter;
+  /* struct kiocb kiocb; */
+  /* loff_t pos, *ppos; */
+
+  // First time we have to do some setup.
+  /* if (one_time_work_done == 0){ */
+  /*   memset(sock_array); */
+  /*   one_time_work_done = 1; */
+  /* } */
+
+  /* if(sock_array[fd] == NULL){ */
+  /*   // get socket ptr */
+  /*   sock_array[fd] = socket ptr */
+  /*     }{ */
+  /*   // use it. */
+  /* } */
+
+
+  // Need iter to put into msg
+  // TODO: doesn't this change, so needs to be done every time?
+  iov_iter_init(&iter, WRITE, iov, 1, iov->iov_len);
+
+
+
+  /* // Get fd struct */
+  /* f = fdget_pos(fd); */
+  /* // Check file pointer */
+  /* if(f.file == 0){ */
+  /*   // printk("Error, file is zero\n"); */
+  /* } */
+
+  /* ppos = file_ppos(f.file); */
+  /* if (ppos) { */
+  /*   pos = *ppos; */
+  /*   ppos = &pos; */
+  /* } */
+
+  // Get socket ptr
+  /* socket = (struct socket *) f.file->private_data; */
+
+  // Copy sk to global var
+  // TODO: roundabout
+  /* global_sk = socket->sk; */
+
+  /* if (one_time_work_done == 0){ */
+
+  /*     // This is always 0 */
+
+  /*     init_sync_kiocb(&kiocb, f.file); */
+
+  /*     kiocb.ki_pos = (ppos ? *ppos : 0); */
+
+  /*     // Copy msg struct to global */
+  /*     global_msg.msg_iocb = &kiocb; */
+
+  /*     one_time_work_done = 1; */
+  /*   } */
+
+  if(fd >= SZ_CACHE){
+    panic("FD is too darn big\n");
+  }
+
+  // has to be in the cache
+  if(my_sock_cache[fd] == NULL){
+    // // printk("fd is %d\n", fd);
+    panic("Entry wasn't in the cache??? WTF?");
+  }
+
+  sk = my_sock_cache[fd];
+
+
+  // Kiocb should be accessed via cache
+  if(my_kiocb_cache[fd].valid == 0){
+    panic("We truly believe this is impossible\n");
+  }
+
+  struct msghdr msg;
+  msg.msg_iter = iter;
+  msg.msg_iocb = &my_kiocb_cache[fd].kiocb_;
+
+	lock_sock(sk);
+
+  // // printk("%s: sk: %px, msg %px, iov.iov_len %ld \n",
+         /* __func__, sk, &msg, iov->iov_len); */
+
+  // printk("msg is %px\n", &msg);
+
+  if(&msg == NULL){
+    panic("msg is null\n");
+  }
+
+	ret = tcp_sendmsg_locked(sk, &msg, iov->iov_len);
+	release_sock(sk);
+
+  // // printk("%s: ret: %d \n", __func__, ret);
+
+	return ret;
+}
+EXPORT_SYMBOL(shortcut_tcp_sendmsg_cached);
+
 /*
  *	Handle reading urgent data. BSD has very simple semantics for
  *	this, no blocking and very strange errors 8)
@@ -2564,6 +2785,648 @@ int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
 	return ret;
 }
 EXPORT_SYMBOL(tcp_recvmsg);
+
+struct sock *shortcut_fd_to_sock(int fd){
+  struct fd f;
+  struct socket *socket;
+
+  // Get fd struct
+  f = fdget_pos(fd);
+  // Check file pointer
+  if(f.file == 0){
+    // // printk("Error, file is zero\n");
+  }
+  // Get socket ptr
+  socket = (struct socket *) f.file->private_data;
+
+  // Copy sk to global var
+  // TODO: roundabout
+  return socket->sk;
+
+}
+
+void shortcut_get_kiocb(int fd, struct kiocb *kiocb){
+  struct fd f;
+  loff_t pos, *ppos;
+
+  f = fdget_pos(fd);
+  init_sync_kiocb(kiocb, f.file);
+
+  ppos = file_ppos(f.file);
+  if (ppos) {
+    pos = *ppos;
+    ppos = &pos;
+  }
+  kiocb->ki_pos = (ppos ? *ppos : 0);
+}
+
+int shortcut_tcp_recvmsg(int fd, struct iovec *iov){
+  //  struct sock *sk,
+  // struct msghdr *msg, size_t len, int nonblock, int flags, int *addr_len)
+  struct sock* sk;
+  sk = shortcut_fd_to_sock(fd);
+  /* msg has a msg_iter and kiocb ptr and msg_iter has a iovec ptr */
+
+	struct iov_iter iter;
+  iov_iter_init(&iter, WRITE, iov, 1, iov->iov_len);
+
+  struct kiocb kiocb;
+  shortcut_get_kiocb(fd, &kiocb);
+
+  struct msghdr msg_struct;
+  msg_struct.msg_iocb = &kiocb;
+  msg_struct.msg_iter = iter;
+
+  struct msghdr *msg = &msg_struct;
+
+  size_t len = iov->iov_len;
+  int nonblock = 64;
+  int flags = 0;
+
+  int my_addr = 0;
+  int *addr_len = &my_addr;
+
+
+  /* struct msghdr msg; */
+
+
+	struct tcp_sock *tp = tcp_sk(sk);
+	int copied = 0;
+	u32 peek_seq;
+	u32 *seq;
+	unsigned long used;
+	int err, inq;
+	int target;		/* Read at least this many bytes */
+	long timeo;
+	struct sk_buff *skb, *last;
+	u32 urg_hole = 0;
+	struct scm_timestamping_internal tss;
+	int cmsg_flags;
+
+  // // printk("%s: sk: %px, msg %px, len %ld\nnonblock %d, flags %d, addr_len_p %px, addr_len %d \n", __func__, sk, msg, len, nonblock, flags, addr_len, *addr_len);
+
+	if (unlikely(flags & MSG_ERRQUEUE))
+		return inet_recv_error(sk, msg, len, addr_len);
+
+	if (sk_can_busy_loop(sk) && skb_queue_empty_lockless(&sk->sk_receive_queue) &&
+	    (sk->sk_state == TCP_ESTABLISHED))
+		sk_busy_loop(sk, nonblock);
+
+	lock_sock(sk);
+
+	err = -ENOTCONN;
+	if (sk->sk_state == TCP_LISTEN)
+		goto out;
+
+	cmsg_flags = tp->recvmsg_inq ? 1 : 0;
+	timeo = sock_rcvtimeo(sk, nonblock);
+
+	/* Urgent data needs to be handled specially. */
+	if (flags & MSG_OOB)
+		goto recv_urg;
+
+	if (unlikely(tp->repair)) {
+		err = -EPERM;
+		if (!(flags & MSG_PEEK))
+			goto out;
+
+		if (tp->repair_queue == TCP_SEND_QUEUE)
+			goto recv_sndq;
+
+		err = -EINVAL;
+		if (tp->repair_queue == TCP_NO_QUEUE)
+			goto out;
+
+		/* 'common' recv queue MSG_PEEK-ing */
+	}
+
+	seq = &tp->copied_seq;
+	if (flags & MSG_PEEK) {
+		peek_seq = tp->copied_seq;
+		seq = &peek_seq;
+	}
+
+	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+
+	do {
+		u32 offset;
+
+		/* Are we at urgent data? Stop if we have read anything or have SIGURG pending. */
+		if (tp->urg_data && tp->urg_seq == *seq) {
+			if (copied)
+				break;
+			if (signal_pending(current)) {
+				copied = timeo ? sock_intr_errno(timeo) : -EAGAIN;
+				break;
+			}
+		}
+
+		/* Next get a buffer. */
+
+		last = skb_peek_tail(&sk->sk_receive_queue);
+		skb_queue_walk(&sk->sk_receive_queue, skb) {
+			last = skb;
+			/* Now that we have two receive queues this
+			 * shouldn't happen.
+			 */
+			if (WARN(before(*seq, TCP_SKB_CB(skb)->seq),
+				 "TCP recvmsg seq # bug: copied %X, seq %X, rcvnxt %X, fl %X\n",
+				 *seq, TCP_SKB_CB(skb)->seq, tp->rcv_nxt,
+				 flags))
+				break;
+
+			offset = *seq - TCP_SKB_CB(skb)->seq;
+			if (unlikely(TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)) {
+				pr_err_once("%s: found a SYN, please report !\n", __func__);
+				offset--;
+			}
+			if (offset < skb->len)
+				goto found_ok_skb;
+			if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
+				goto found_fin_ok;
+			WARN(!(flags & MSG_PEEK),
+			     "TCP recvmsg seq # bug 2: copied %X, seq %X, rcvnxt %X, fl %X\n",
+			     *seq, TCP_SKB_CB(skb)->seq, tp->rcv_nxt, flags);
+		}
+
+		/* Well, if we have backlog, try to process it now yet. */
+
+		if (copied >= target && !READ_ONCE(sk->sk_backlog.tail))
+			break;
+
+		if (copied) {
+			if (sk->sk_err ||
+			    sk->sk_state == TCP_CLOSE ||
+			    (sk->sk_shutdown & RCV_SHUTDOWN) ||
+			    !timeo ||
+			    signal_pending(current))
+				break;
+		} else {
+			if (sock_flag(sk, SOCK_DONE))
+				break;
+
+			if (sk->sk_err) {
+				copied = sock_error(sk);
+				break;
+			}
+
+			if (sk->sk_shutdown & RCV_SHUTDOWN)
+				break;
+
+			if (sk->sk_state == TCP_CLOSE) {
+				/* This occurs when user tries to read
+				 * from never connected socket.
+				 */
+				copied = -ENOTCONN;
+				break;
+			}
+
+			if (!timeo) {
+				copied = -EAGAIN;
+				break;
+			}
+
+			if (signal_pending(current)) {
+				copied = sock_intr_errno(timeo);
+				break;
+			}
+		}
+
+		tcp_cleanup_rbuf(sk, copied);
+
+		if (copied >= target) {
+			/* Do not sleep, just process backlog. */
+			release_sock(sk);
+			lock_sock(sk);
+		} else {
+			sk_wait_data(sk, &timeo, last);
+		}
+
+		if ((flags & MSG_PEEK) &&
+		    (peek_seq - copied - urg_hole != tp->copied_seq)) {
+			net_dbg_ratelimited("TCP(%s:%d): Application bug, race in MSG_PEEK\n",
+					    current->comm,
+					    task_pid_nr(current));
+			peek_seq = tp->copied_seq;
+		}
+		continue;
+
+found_ok_skb:
+		/* Ok so how much can we use? */
+		used = skb->len - offset;
+		if (len < used)
+			used = len;
+
+		/* Do we have urgent data here? */
+		if (tp->urg_data) {
+			u32 urg_offset = tp->urg_seq - *seq;
+			if (urg_offset < used) {
+				if (!urg_offset) {
+					if (!sock_flag(sk, SOCK_URGINLINE)) {
+						WRITE_ONCE(*seq, *seq + 1);
+						urg_hole++;
+						offset++;
+						used--;
+						if (!used)
+							goto skip_copy;
+					}
+				} else
+					used = urg_offset;
+			}
+		}
+
+		if (!(flags & MSG_TRUNC)) {
+			err = skb_copy_datagram_msg(skb, offset, msg, used);
+			if (err) {
+				/* Exception. Bailout! */
+				if (!copied)
+					copied = -EFAULT;
+				break;
+			}
+		}
+
+		WRITE_ONCE(*seq, *seq + used);
+		copied += used;
+		len -= used;
+
+		tcp_rcv_space_adjust(sk);
+
+skip_copy:
+		if (tp->urg_data && after(tp->copied_seq, tp->urg_seq)) {
+			tp->urg_data = 0;
+			tcp_fast_path_check(sk);
+		}
+
+		if (TCP_SKB_CB(skb)->has_rxtstamp) {
+			tcp_update_recv_tstamps(skb, &tss);
+			cmsg_flags |= 2;
+		}
+
+		if (used + offset < skb->len)
+			continue;
+
+		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
+			goto found_fin_ok;
+		if (!(flags & MSG_PEEK))
+			sk_eat_skb(sk, skb);
+		continue;
+
+found_fin_ok:
+		/* Process the FIN. */
+		WRITE_ONCE(*seq, *seq + 1);
+		if (!(flags & MSG_PEEK))
+			sk_eat_skb(sk, skb);
+		break;
+	} while (len > 0);
+
+	/* According to UNIX98, msg_name/msg_namelen are ignored
+	 * on connected socket. I was just happy when found this 8) --ANK
+	 */
+
+	/* Clean up data we have read: This will do ACK frames. */
+	tcp_cleanup_rbuf(sk, copied);
+
+	release_sock(sk);
+
+	if (cmsg_flags) {
+		if (cmsg_flags & 2)
+			tcp_recv_timestamp(msg, sk, &tss);
+		if (cmsg_flags & 1) {
+			inq = tcp_inq_hint(sk);
+			put_cmsg(msg, SOL_TCP, TCP_CM_INQ, sizeof(inq), &inq);
+		}
+	}
+
+	return copied;
+
+out:
+	release_sock(sk);
+	return err;
+
+recv_urg:
+	err = tcp_recv_urg(sk, msg, len, flags);
+	goto out;
+
+recv_sndq:
+	err = tcp_peek_sndq(sk, msg, len);
+	goto out;
+}
+EXPORT_SYMBOL(shortcut_tcp_recvmsg);
+
+int my_cache_zeroed = 0;
+
+int shortcut_tcp_recvmsg_cached(int fd, struct iovec *iov){
+
+  if(my_cache_zeroed == 0){
+    memset(my_sock_cache, 0, sizeof(my_sock_cache));
+    memset(my_kiocb_cache, 0, sizeof(my_kiocb_cache));
+
+    my_cache_zeroed = 1;
+  }
+
+  if(fd > (SZ_CACHE - 1 )){
+    panic("FD is bigger than sock cache, silly\n");
+  }
+
+  if(my_sock_cache[fd] == NULL){
+    my_sock_cache[fd] = shortcut_fd_to_sock(fd);
+  }
+
+  struct sock *sk = my_sock_cache[fd];
+
+  if(my_kiocb_cache[fd].valid == 0){
+    shortcut_get_kiocb(fd, &(my_kiocb_cache[fd].kiocb_));
+    my_kiocb_cache[fd].valid = 1;
+  }
+
+
+
+  //  struct sock *sk,
+  // struct msghdr *msg, size_t len, int nonblock, int flags, int *addr_len)
+  /* msg has a msg_iter and kiocb ptr and msg_iter has a iovec ptr */
+
+	struct iov_iter iter;
+  iov_iter_init(&iter, READ, iov, 1, iov->iov_len);
+
+  struct msghdr msg_struct;
+  msg_struct.msg_iocb = &my_kiocb_cache[fd].kiocb_;
+  msg_struct.msg_iter = iter;
+
+  struct msghdr *msg = &msg_struct;
+
+  size_t len = iov->iov_len;
+  int nonblock = 64;
+  int flags = 0;
+
+  int my_addr = 0;
+  int *addr_len = &my_addr;
+
+
+  /* struct msghdr msg; */
+
+
+	struct tcp_sock *tp = tcp_sk(sk);
+	int copied = 0;
+	u32 peek_seq;
+	u32 *seq;
+	unsigned long used;
+	int err, inq;
+	int target;		/* Read at least this many bytes */
+	long timeo;
+	struct sk_buff *skb, *last;
+	u32 urg_hole = 0;
+	struct scm_timestamping_internal tss;
+	int cmsg_flags;
+
+  // // printk("%s: sk: %px, msg %px, len %ld\nnonblock %d, flags %d, addr_len_p %px, addr_len %d \n", __func__, sk, msg, len, nonblock, flags, addr_len, *addr_len);
+
+	if (unlikely(flags & MSG_ERRQUEUE))
+		return inet_recv_error(sk, msg, len, addr_len);
+
+	if (sk_can_busy_loop(sk) && skb_queue_empty_lockless(&sk->sk_receive_queue) &&
+	    (sk->sk_state == TCP_ESTABLISHED))
+		sk_busy_loop(sk, nonblock);
+
+	lock_sock(sk);
+
+	err = -ENOTCONN;
+	if (sk->sk_state == TCP_LISTEN)
+		goto out;
+
+	cmsg_flags = tp->recvmsg_inq ? 1 : 0;
+	timeo = sock_rcvtimeo(sk, nonblock);
+
+	/* Urgent data needs to be handled specially. */
+	if (flags & MSG_OOB)
+		goto recv_urg;
+
+	if (unlikely(tp->repair)) {
+		err = -EPERM;
+		if (!(flags & MSG_PEEK))
+			goto out;
+
+		if (tp->repair_queue == TCP_SEND_QUEUE)
+			goto recv_sndq;
+
+		err = -EINVAL;
+		if (tp->repair_queue == TCP_NO_QUEUE)
+			goto out;
+
+		/* 'common' recv queue MSG_PEEK-ing */
+	}
+
+	seq = &tp->copied_seq;
+	if (flags & MSG_PEEK) {
+		peek_seq = tp->copied_seq;
+		seq = &peek_seq;
+	}
+
+	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+
+	do {
+		u32 offset;
+
+		/* Are we at urgent data? Stop if we have read anything or have SIGURG pending. */
+		if (tp->urg_data && tp->urg_seq == *seq) {
+			if (copied)
+				break;
+			if (signal_pending(current)) {
+				copied = timeo ? sock_intr_errno(timeo) : -EAGAIN;
+				break;
+			}
+		}
+
+		/* Next get a buffer. */
+
+		last = skb_peek_tail(&sk->sk_receive_queue);
+		skb_queue_walk(&sk->sk_receive_queue, skb) {
+			last = skb;
+			/* Now that we have two receive queues this
+			 * shouldn't happen.
+			 */
+			if (WARN(before(*seq, TCP_SKB_CB(skb)->seq),
+				 "TCP recvmsg seq # bug: copied %X, seq %X, rcvnxt %X, fl %X\n",
+				 *seq, TCP_SKB_CB(skb)->seq, tp->rcv_nxt,
+				 flags))
+				break;
+
+			offset = *seq - TCP_SKB_CB(skb)->seq;
+			if (unlikely(TCP_SKB_CB(skb)->tcp_flags & TCPHDR_SYN)) {
+				pr_err_once("%s: found a SYN, please report !\n", __func__);
+				offset--;
+			}
+			if (offset < skb->len)
+				goto found_ok_skb;
+			if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
+				goto found_fin_ok;
+			WARN(!(flags & MSG_PEEK),
+			     "TCP recvmsg seq # bug 2: copied %X, seq %X, rcvnxt %X, fl %X\n",
+			     *seq, TCP_SKB_CB(skb)->seq, tp->rcv_nxt, flags);
+		}
+
+		/* Well, if we have backlog, try to process it now yet. */
+
+		if (copied >= target && !READ_ONCE(sk->sk_backlog.tail))
+			break;
+
+		if (copied) {
+			if (sk->sk_err ||
+			    sk->sk_state == TCP_CLOSE ||
+			    (sk->sk_shutdown & RCV_SHUTDOWN) ||
+			    !timeo ||
+			    signal_pending(current))
+				break;
+		} else {
+			if (sock_flag(sk, SOCK_DONE))
+				break;
+
+			if (sk->sk_err) {
+				copied = sock_error(sk);
+				break;
+			}
+
+			if (sk->sk_shutdown & RCV_SHUTDOWN)
+				break;
+
+			if (sk->sk_state == TCP_CLOSE) {
+				/* This occurs when user tries to read
+				 * from never connected socket.
+				 */
+				copied = -ENOTCONN;
+				break;
+			}
+
+			if (!timeo) {
+				copied = -EAGAIN;
+				break;
+			}
+
+			if (signal_pending(current)) {
+				copied = sock_intr_errno(timeo);
+				break;
+			}
+		}
+
+		tcp_cleanup_rbuf(sk, copied);
+
+		if (copied >= target) {
+			/* Do not sleep, just process backlog. */
+			release_sock(sk);
+			lock_sock(sk);
+		} else {
+			sk_wait_data(sk, &timeo, last);
+		}
+
+		if ((flags & MSG_PEEK) &&
+		    (peek_seq - copied - urg_hole != tp->copied_seq)) {
+			net_dbg_ratelimited("TCP(%s:%d): Application bug, race in MSG_PEEK\n",
+					    current->comm,
+					    task_pid_nr(current));
+			peek_seq = tp->copied_seq;
+		}
+		continue;
+
+found_ok_skb:
+		/* Ok so how much can we use? */
+		used = skb->len - offset;
+		if (len < used)
+			used = len;
+
+		/* Do we have urgent data here? */
+		if (tp->urg_data) {
+			u32 urg_offset = tp->urg_seq - *seq;
+			if (urg_offset < used) {
+				if (!urg_offset) {
+					if (!sock_flag(sk, SOCK_URGINLINE)) {
+						WRITE_ONCE(*seq, *seq + 1);
+						urg_hole++;
+						offset++;
+						used--;
+						if (!used)
+							goto skip_copy;
+					}
+				} else
+					used = urg_offset;
+			}
+		}
+
+		if (!(flags & MSG_TRUNC)) {
+			err = skb_copy_datagram_msg(skb, offset, msg, used);
+			if (err) {
+				/* Exception. Bailout! */
+				if (!copied)
+					copied = -EFAULT;
+				break;
+			}
+		}
+
+		WRITE_ONCE(*seq, *seq + used);
+		copied += used;
+		len -= used;
+
+		tcp_rcv_space_adjust(sk);
+
+skip_copy:
+		if (tp->urg_data && after(tp->copied_seq, tp->urg_seq)) {
+			tp->urg_data = 0;
+			tcp_fast_path_check(sk);
+		}
+
+		if (TCP_SKB_CB(skb)->has_rxtstamp) {
+			tcp_update_recv_tstamps(skb, &tss);
+			cmsg_flags |= 2;
+		}
+
+		if (used + offset < skb->len)
+			continue;
+
+		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
+			goto found_fin_ok;
+		if (!(flags & MSG_PEEK))
+			sk_eat_skb(sk, skb);
+		continue;
+
+found_fin_ok:
+		/* Process the FIN. */
+		WRITE_ONCE(*seq, *seq + 1);
+		if (!(flags & MSG_PEEK))
+			sk_eat_skb(sk, skb);
+		break;
+	} while (len > 0);
+
+	/* According to UNIX98, msg_name/msg_namelen are ignored
+	 * on connected socket. I was just happy when found this 8) --ANK
+	 */
+
+	/* Clean up data we have read: This will do ACK frames. */
+	tcp_cleanup_rbuf(sk, copied);
+
+	release_sock(sk);
+
+	if (cmsg_flags) {
+		if (cmsg_flags & 2)
+			tcp_recv_timestamp(msg, sk, &tss);
+		if (cmsg_flags & 1) {
+			inq = tcp_inq_hint(sk);
+			put_cmsg(msg, SOL_TCP, TCP_CM_INQ, sizeof(inq), &inq);
+		}
+	}
+
+	return copied;
+
+out:
+	release_sock(sk);
+	return err;
+
+recv_urg:
+	err = tcp_recv_urg(sk, msg, len, flags);
+	goto out;
+
+recv_sndq:
+	err = tcp_peek_sndq(sk, msg, len);
+	goto out;
+}
+EXPORT_SYMBOL(shortcut_tcp_recvmsg_cached);
 
 void tcp_set_state(struct sock *sk, int state)
 {
