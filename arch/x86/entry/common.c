@@ -111,7 +111,7 @@ void find_user_vma(unsigned long addr){
 
 void ukl_set_bypass_limit(int val){
         current->ukl_bypass_limit = val;
-        printk("Setting bypass limit to %d\n", val);
+//        printk("Setting bypass limit to %d\n", val);
 }
 
 void ukl_set_bypass_syscall(int val){
