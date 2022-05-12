@@ -1814,7 +1814,7 @@ static int exec_binprm(struct linux_binprm *bprm)
 static int bprm_execve(struct linux_binprm *bprm,
 		       int fd, struct filename *filename, int flags)
 {
-	struct file *file;
+	struct file *file = NULL;
 	int retval;
 
 	retval = prepare_bprm_creds(bprm);
