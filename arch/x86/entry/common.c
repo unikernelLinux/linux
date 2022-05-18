@@ -142,6 +142,10 @@ int ukl_get_bypass_syscall(void){
         return ret;
 }
 
+void ukl_increment_bypass_syscall(void){
+        current->ukl_bypass_current++;
+}
+
 __visible noinstr void do_syscall_64(struct pt_regs *regs, int nr)
 {
 	add_random_kstack_offset();
