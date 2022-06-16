@@ -59,7 +59,6 @@ config UKL_USE_IST_PF
 
 config UKL_CREATE_AFTERSPACE
         bool "UKL create an afterspace to run after UKL finishes"
-        def_bool y
         depends on UNIKERNEL_LINUX
         help
         You can kill init before ukl runs and then create an afterspace to get results etc out.
