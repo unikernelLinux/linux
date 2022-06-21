@@ -756,6 +756,13 @@ struct task_struct {
 	randomized_struct_fields_start
 
 	void				*stack;
+#ifdef CONFIG_UNIKERNEL_LINUX
+	/*
+	 * Indicator used for threads in a UKL application, 0 means non-UKL thread, 1 is UKL thread
+	 * in kernel text, 2 is UKL thread in application text
+	 */
+	int				ukl_thread;
+#endif
 	refcount_t			usage;
 	/* Per task flags (PF_*), defined further below: */
 	unsigned int			flags;
@@ -1544,6 +1551,25 @@ struct task_struct {
 	 * Do not put anything below here!
 	 */
 };
+
+/*
+ * 0 = Non UKL thread
+ * 1 = UKL thread - in kernel code
+ * 2 = UKL thread - in application code
+ */
+#define NON_UKL_THREAD 0
+#define UKL_KERNEL 1
+#define UKL_APPLICATION 2
+
+#ifdef CONFIG_UNIKERNEL_LINUX
+int is_ukl_thread(void);
+void enter_ukl_user(void);
+void enter_ukl_kernel(void);
+#else
+static inline int is_ukl_thread(void) { return NON_UKL_THREAD; }
+static inline void enter_ukl_user(void) {}
+static inline void enter_ukl_kernel(void) {}
+#endif
 
 static inline struct pid *task_pid(struct task_struct *task)
 {
