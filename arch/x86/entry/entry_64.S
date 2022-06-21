@@ -229,6 +229,80 @@ SYM_INNER_LABEL(entry_SYSRETQ_end, SYM_L_GLOBAL)
 	int3
 SYM_CODE_END(entry_SYSCALL_64)
 
+#ifdef CONFIG_UNIKERNEL_LINUX
+SYM_CODE_START(ukl_entry_SYSCALL_64)
+	/*
+	 * syscalls will always come from user code so we dont need to
+	 * check stack cs value. We will leave that as 0x10, because
+	 * kernel entry and exit code will always run on syscall path,
+	 * no need to check cs on stack
+	 */
+	UNWIND_HINT_EMPTY
+
+	pushq	%rax
+	call	enter_ukl_kernel
+	popq	%rax
+
+	/* tss.sp2 is scratch space. */
+	movq	%rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+	SWITCH_TO_KERNEL_CR3 scratch_reg=%rsp
+	movq	PER_CPU_VAR(pcpu_hot + X86_top_of_stack), %rsp
+
+	/* Construct struct pt_regs on stack */
+	pushq	$__KERNEL_DS				/* pt_regs->ss */
+	pushq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2)	/* pt_regs->sp */
+	/*
+	 * pushfq has correct flags because all instructions before it
+	 * don't touch the flags
+	 */
+	pushfq						/* pt_regs->flags */
+	pushq	$__KERNEL_CS				/* pt_regs->cs */
+	pushq	%rcx					/* pt_regs->ip */
+
+	pushq	%rax					/* pt_regs->orig_ax */
+
+	PUSH_AND_CLEAR_REGS rax=$-ENOSYS
+
+	/*
+	 * Fixing up user rip because rcx contains garbage. That's
+	 * because we didn't come here through a syscall instruction,
+	 * we used call
+	 */
+	movq	RSP(%rsp), %rdi
+	movq	(%rdi), %rsi
+	movq	%rsi, RIP(%rsp)
+	subq	$8, %rdi
+	movq	EFLAGS(%rsp), %rsi	/* EFLAGS in rsi */
+	movq	%rsi, (%rdi)
+	movq	%rdi, RSP(%rsp)
+
+	/* IRQs are off. */
+	movq	%rsp, %rdi
+	/*
+	 * Sign extend the lower 32bit as syscall numbers are treated
+	 * as int
+	 */
+	movslq	%eax, %rsi
+	call	do_syscall_64		/* returns with IRQs disabled */
+
+	POP_REGS
+	/*
+	 * The stack is now user orig_ax, RIP, CS, EFLAGS, RSP, SS.
+	 * Save old stack pointer and switch to trampoline stack.
+	 */
+	addq	$8, %rsp
+
+	pushq	%rax
+	call	enter_ukl_user
+	popq	%rax
+
+	/* Swing to user stack and pop flags */
+	movq 	0x18(%rsp), %rsp
+	popfq
+	retq
+SYM_CODE_END(ukl_entry_SYSCALL_64)
+#endif
+
 /*
  * %rdi: prev task
  * %rsi: next task
@@ -475,6 +549,14 @@ SYM_CODE_START(\asmsym)
 	testb	$3, CS-ORIG_RAX(%rsp)
 	jnz	.Lfrom_usermode_switch_stack_\@
 
+#ifdef CONFIG_UNIKERNEL_LINUX
+	pushq	%rax		/* save RAX so its not overwritten on return */
+	call	is_ukl_thread	/* Check our execution context */
+	cmpq	$2, %rax
+	popq	%rax
+	je	.Lfrom_usermode_switch_stack_\@
+#endif
+
 	/* paranoid_entry returns GS information for paranoid_exit in EBX. */
 	call	paranoid_entry
 
@@ -529,6 +611,14 @@ SYM_CODE_START(\asmsym)
 	 */
 	testb	$3, CS-ORIG_RAX(%rsp)
 	jnz	.Lfrom_usermode_switch_stack_\@
+
+#ifdef CONFIG_UNIKERNEL_LINUX
+	pushq %rax		/* save RAX so its not overwritten on return */
+	call	is_ukl_thread	/* Check execution context */
+	cmpq	$2, %rax
+	popq	%rax
+	je	.Lfrom_usermode_switch_stack_\@
+#endif
 
 	/*
 	 * paranoid_entry returns SWAPGS flag for paranoid_exit in EBX.
@@ -586,6 +676,11 @@ SYM_CODE_START(\asmsym)
 	ENDBR
 	ASM_CLAC
 	cld
+
+#ifdef CONFIG_UNIKERNEL_LINUX
+	movq	$0x2, (%rsp)
+	jmp	asm_exc_page_fault
+#endif
 
 	/* paranoid_entry returns GS information for paranoid_exit in EBX. */
 	call	paranoid_entry
@@ -665,6 +760,19 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
 
 	/* Restore RDI. */
 	popq	%rdi
+
+#ifdef CONFIG_UNIKERNEL_LINUX
+	cmpq	$0x33, 8(%rsp)
+	je	1f
+
+	pushq	%rax
+	call	enter_ukl_user
+	popq	%rax
+
+	jmp	.Lnative_iret
+1:
+#endif
+
 	swapgs
 	jmp	.Lnative_iret
 
@@ -1058,15 +1166,34 @@ SYM_CODE_START(error_entry)
 	PUSH_AND_CLEAR_REGS save_ret=1
 	ENCODE_FRAME_POINTER 8
 
+#ifdef CONFIG_UNIKERNEL_LINUX
+	testb	$3, CS+8(%rsp)
+	jnz	1f /* user threads */
+
+	pushq	%rax
+	call	is_ukl_thread
+	cmpq	$2, %rax
+	popq	%rax
+	jb	.Lerror_kernelspace
+
+	movq	$0xC3, CS+8(%rsp)
+	pushq	%rax
+	call	enter_ukl_kernel
+	popq	%rax
+	jmp	2f
+#else
 	testb	$3, CS+8(%rsp)
 	jz	.Lerror_kernelspace
+#endif
 
 	/*
 	 * We entered from user mode or we're pretending to have entered
 	 * from user mode due to an IRET fault.
 	 */
+1:
 	swapgs
 	FENCE_SWAPGS_USER_ENTRY
+2:
 	/* We have user CR3.  Change to kernel CR3. */
 	SWITCH_TO_KERNEL_CR3 scratch_reg=%rax
 	IBRS_ENTER
@@ -1141,6 +1268,12 @@ SYM_CODE_START_LOCAL(error_return)
 	DEBUG_ENTRY_ASSERT_IRQS_OFF
 	testb	$3, CS(%rsp)
 	jz	restore_regs_and_return_to_kernel
+
+	cmpq	$0xC3, CS(%rsp)
+	jne	1f
+	movq	$0x10, CS(%rsp)
+1:
+
 	jmp	swapgs_restore_regs_and_return_to_usermode
 SYM_CODE_END(error_return)
 
