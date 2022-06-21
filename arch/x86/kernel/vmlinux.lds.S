@@ -101,6 +101,9 @@ jiffies = jiffies_64;
 
 PHDRS {
 	text PT_LOAD FLAGS(5);          /* R_E */
+#if defined(CONFIG_UNIKERNEL_LINUX) && defined(CONFIG_UKL_TLS)
+	tls PT_TLS FLAGS(6);            /* RW_ */
+#endif
 	data PT_LOAD FLAGS(6);          /* RW_ */
 #ifdef CONFIG_X86_64
 #ifdef CONFIG_SMP
@@ -145,6 +148,71 @@ SECTIONS
 		__indirect_thunk_end = .;
 #endif
 	} :text =0xcccc
+
+#ifdef CONFIG_UNIKERNEL_LINUX
+	/* Added to preserve page alignment */
+	. = ALIGN(PAGE_SIZE);
+
+	/*  */
+	.rela.plt	:
+	{
+		*(.rela.plt)
+		PROVIDE_HIDDEN (__rela_iplt_start = .);
+		*(.rela.iplt)
+		PROVIDE_HIDDEN (__rela_iplt_end = .);
+	} :text =0xcccc
+	.preinit_array	:
+	{
+		PROVIDE_HIDDEN (__preinit_array_start = .);
+		KEEP (*(.preinit_array))
+		PROVIDE_HIDDEN (__preinit_array_end = .);
+	} :text =0xcccc
+	.init_array	:
+	{
+		PROVIDE_HIDDEN (__init_array_start = .);
+		KEEP (*(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*)))
+		KEEP (*(.init_array EXCLUDE_FILE (*crtbegin.o *crtbegin?.o
+			*crtend.o *crtend?.o ) .ctors))
+		PROVIDE_HIDDEN (__init_array_end = .);
+	} :text =0xcccc
+	.fini_array	:
+	{
+		PROVIDE_HIDDEN (__fini_array_start = .);
+		KEEP (*(SORT_BY_INIT_PRIORITY(.fini_array.*) SORT_BY_INIT_PRIORITY(.dtors.*)))
+		KEEP (*(.fini_array EXCLUDE_FILE (*crtbegin.o *crtbegin?.o
+			*crtend.o *crtend?.o ) .dtors))
+		PROVIDE_HIDDEN (__fini_array_end = .);
+	} :text =0xcccc
+	.ctors		:
+	{
+		/* gcc uses crtbegin.o to find the start of
+		   the constructors, so we make sure it is
+		   first.  Because this is a wildcard, it
+		   doesn't matter if the user does not
+		   actually link against crtbegin.o; the
+		   linker won't look for a file to match a
+		   wildcard.  The wildcard also means that it
+		   doesn't matter which directory crtbegin.o
+		   is in.  */
+		KEEP (*crtbegin.o(.ctors))
+		KEEP (*crtbegin?.o(.ctors))
+		/* We don't want to include the .ctor section from
+		   the crtend.o file until after the sorted ctors.
+		   The .ctor section from the crtend file contains the
+		   end of ctors marker and it must be last */
+		KEEP (*(EXCLUDE_FILE (*crtend.o *crtend?.o ) .ctors))
+		KEEP (*(SORT(.ctors.*)))
+		KEEP (*(.ctors))
+	} :text =0xcccc
+	.dtors		:
+	{
+		KEEP (*crtbegin.o(.dtors))
+		KEEP (*crtbegin?.o(.dtors))
+		KEEP (*(EXCLUDE_FILE (*crtend.o *crtend?.o ) .dtors))
+		KEEP (*(SORT(.dtors.*)))
+		KEEP (*(.dtors))
+	} :text =0xcccc
+#endif
 
 	/* End of text section, which should occupy whole number of pages */
 	_etext = .;
@@ -207,6 +275,29 @@ SECTIONS
 	} :data
 
 	. = ALIGN(__vvar_page + PAGE_SIZE, PAGE_SIZE);
+
+#ifdef CONFIG_UNIKERNEL_LINUX
+#ifdef CONFIG_UKL_TLS
+	/* Thread Local Storage sections */
+	. = ALIGN(PAGE_SIZE);
+	.tdata : ALIGN(0x200000){
+		__tls_data_start = .;
+		*(.tdata .tdata.* .gnu.linkonce.td.*)
+		__tls_data_end = .;
+	} :tls
+	.tbss : {
+		__tls_bss_start = .;
+		*(.tbss .tbss.* .gnu.linkonce.tb.*) *(.tcommon)
+		__tls_bss_end = .;
+	} :tls
+#else
+	. = ALIGN(PAGE_SIZE);
+	__tls_data_start = .;
+	__tls_data_end = .;
+	__tls_bss_start = .;
+	__tls_bss_end = .;
+#endif
+#endif
 
 	/* Init code and data - will be freed after init */
 	. = ALIGN(PAGE_SIZE);
@@ -380,8 +471,13 @@ SECTIONS
 		*(BSS_MAIN)
 		BSS_DECRYPTED
 		. = ALIGN(PAGE_SIZE);
+#ifdef CONFIG_UNIKERNEL_LINUX
+	}
+	__bss_stop = .;
+#else
 		__bss_stop = .;
 	}
+#endif
 
 	/*
 	 * The memory occupied from _text to here, __end_of_kernel_reserve, is
@@ -446,6 +542,7 @@ SECTIONS
 #endif
 	       "Unexpected GOT/PLT entries detected!")
 
+#ifndef CONFIG_UNIKERNEL_LINUX
 	/*
 	 * Sections that should stay zero sized, which is safer to
 	 * explicitly check instead of blindly discarding.
@@ -469,6 +566,7 @@ SECTIONS
 		*(.rela.*) *(.rela_*)
 	}
 	ASSERT(SIZEOF(.rela.dyn) == 0, "Unexpected run-time relocations (.rela) detected!")
+#endif
 }
 
 /*

@@ -35,6 +35,10 @@
 extern char _text[], _stext[], _etext[];
 extern char _data[], _sdata[], _edata[];
 extern char __bss_start[], __bss_stop[];
+#ifdef CONFIG_UNIKERNEL_LINUX
+extern char __tls_data_start[], __tls_data_end[];
+extern char __tls_bss_start[], __tls_bss_end[];
+#endif
 extern char __init_begin[], __init_end[];
 extern char _sinittext[], _einittext[];
 extern char __start_ro_after_init[], __end_ro_after_init[];
