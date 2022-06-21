@@ -501,6 +501,28 @@ void x86_gsbase_write_task(struct task_struct *task, unsigned long gsbase)
 	task->thread.gsbase = gsbase;
 }
 
+#ifdef CONFIG_UNIKERNEL_LINUX
+/*
+ * 0 = Non UKL thread
+ * 1 = UKL thread - in kernel code
+ * 2 = UKL thread - in application code
+ */
+int is_ukl_thread(void)
+{
+	return current->ukl_thread;
+}
+
+void enter_ukl_user(void)
+{
+	current->ukl_thread = UKL_APPLICATION;
+}
+
+void enter_ukl_kernel(void)
+{
+	current->ukl_thread = UKL_KERNEL;
+}
+#endif
+
 static void
 start_thread_common(struct pt_regs *regs, unsigned long new_ip,
 		    unsigned long new_sp,
