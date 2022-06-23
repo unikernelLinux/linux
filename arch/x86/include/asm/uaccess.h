@@ -37,11 +37,19 @@ static inline bool pagefault_disabled(void);
  * Return: true (nonzero) if the memory block may be valid, false (zero)
  * if it is definitely invalid.
  */
+#ifdef CONFIG_UNIKERNEL_LINUX
+#define access_ok(addr, size)					\
+({									\
+	WARN_ON_IN_IRQ();						\
+	(is_ukl_thread() ? 1 : likely(__access_ok(addr, size)));	\
+})
+#else
 #define access_ok(addr, size)					\
 ({									\
 	WARN_ON_IN_IRQ();						\
 	likely(__access_ok(addr, size));				\
 })
+#endif
 
 #include <asm-generic/access_ok.h>
 
