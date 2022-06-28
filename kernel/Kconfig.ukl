@@ -1,0 +1,41 @@
+menuconfig UNIKERNEL_LINUX
+	bool "Unikernel Linux"
+	depends on X86_64 && !RANDOMIZE_BASE && !PAGE_TABLE_ISOLATION
+	help
+	    Unikernel Linux allows for a single, privileged process to be
+	    linked with the kernel binary and be executed inplace of or
+	    along side a more traditional user space.
+
+	    If you don't know what this is, say N.
+
+config UKL_TLS
+	bool "Enable TLS for UKL application"
+	depends on UNIKERNEL_LINUX
+	default Y
+	help
+	    Not all applications will make use of thread local storage,
+	    but we need to account for it in the linker script if used.
+	    For the application in samples/ this should be disabled, but
+	    if you are working with glibc this should be 'Y'.
+
+	    If unsure say 'Y' here
+
+config UKL_NAME
+	string "UKL Exec target"
+	depends on UNIKERNEL_LINUX
+	default "/UKL"
+	help
+	    We need a way to trigger the start of the UKL application,
+	    either by the kernel inplace of init or userspace when setup
+	    is finished. The value given here is compared against the
+	    filename passed to exec and if they match UKL is started.
+	    For a more 'traditional' unikernel model, the value set here
+	    should be given to the init= boot parameter.
+
+config UKL_ARCHIVE_PATH
+	string "Path static application archive"
+	depends on UNIKERNEL_LINUX
+	default "../UKL.a"
+	help
+	    Where the linker should look for the statically linked application
+	    and dependency archive.
