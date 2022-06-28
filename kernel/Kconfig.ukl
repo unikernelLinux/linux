@@ -1,0 +1,22 @@
+menuconfig UNIKERNEL_LINUX
+	bool "Unikernel Linux"
+	depends on X86_64 && !RANDOMIZE_BASE && !PAGE_TABLE_ISOLATION
+	help
+	    Unikernel Linux allows for a single, privileged process to be
+	    linked with the kernel binary and be executed inplace of or
+	    along side a more traditional user space.
+
+	    If you don't know what this is, say N.
+
+config UKL_NAME
+	string "UKL Exec target"
+	depends on UNIKERNEL_LINUX
+	default "/UKL"
+	help
+	    We need a way to specify that an application is to be run as
+	    a UKL application. This option specifies a path under which any
+	    application should be executed in supervisor mode.  The value
+	    given here is compared against the filename passed to exec and
+	    that file is in the appropriate place on the filesystem it is
+	    started as a UKL process.
+
