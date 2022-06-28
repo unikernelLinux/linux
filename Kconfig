@@ -29,4 +29,6 @@ source "lib/Kconfig"
 
 source "lib/Kconfig.debug"
 
+source "kernel/Kconfig.ukl"
+
 source "Documentation/Kconfig"
