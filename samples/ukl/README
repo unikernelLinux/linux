@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+UKL test program
+================
+
+tcp_server.c is a epoll based TCP echo server written in C which uses port
+no. 5555 by default. syscall.S translates syscall() function to a call
+instruction in assembly. Normally, C libraries provide syscall() function
+that translate into syscall assembly instruction. Run `make` and it will
+create a UKL.a and a tcp_server. UKL.a can then be copied to where UKL
+Linux build expects it to be present. This can be changed through the Linux
+config options (by running `make menuconfig` etc.) The resulting Linux
+kernel can be run, and once the userspace comes up, the echo server can be
+started by running the UKL exec command, again chosen through the Linux
+config options. tcp_server is a userspace binary of the same echo server
+which can be run normally. This is meant to show that UKL can run code
+which can also be run as a userspace binary without modification.
