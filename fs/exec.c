@@ -1906,6 +1906,22 @@ out_unmark:
 	return retval;
 }
 
+#ifdef CONFIG_UNIKERNEL_LINUX
+static void check_ukl_exec(const char *name)
+{
+	if (!strcmp(name, CONFIG_UKL_NAME)) {
+		pr_debug("In PID %d and current->ukl_thread is %d\nGoing to create UKL here.\n",
+				current->pid, is_ukl_thread());
+		enter_ukl_kernel();
+	}
+}
+#else
+static void check_ukl_exec(const char *name)
+{
+	(void)name;
+}
+#endif
+
 static int do_execveat_common(int fd, struct filename *filename,
 			      struct user_arg_ptr argv,
 			      struct user_arg_ptr envp,
@@ -1916,6 +1932,8 @@ static int do_execveat_common(int fd, struct filename *filename,
 
 	if (IS_ERR(filename))
 		return PTR_ERR(filename);
+
+	check_ukl_exec(filename->name);
 
 	/*
 	 * We move the actual failure in case of RLIMIT_NPROC excess from
@@ -2002,6 +2020,8 @@ int kernel_execve(const char *kernel_filename,
 	/* It is non-sense for kernel threads to call execve */
 	if (WARN_ON_ONCE(current->flags & PF_KTHREAD))
 		return -EINVAL;
+
+	check_ukl_exec(kernel_filename);
 
 	filename = getname_kernel(kernel_filename);
 	if (IS_ERR(filename))
