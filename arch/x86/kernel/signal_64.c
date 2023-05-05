@@ -78,8 +78,10 @@ static bool restore_sigcontext(struct pt_regs *regs,
 	regs->r15 = sc.r15;
 
 	/* Get CS/SS and force CPL3 */
-	regs->cs = sc.cs | 0x03;
-	regs->ss = sc.ss | 0x03;
+	if (!is_ukl_thread()) {
+		regs->cs = sc.cs | 0x03;
+		regs->ss = sc.ss | 0x03;
+	}
 
 	regs->flags = (regs->flags & ~FIX_EFLAGS) | (sc.flags & FIX_EFLAGS);
 	/* disable syscall checks */
@@ -225,10 +227,15 @@ int x64_setup_rt_frame(struct ksignal *ksig, struct pt_regs *regs)
 	 * a trampoline.)  So we do our best: if the old SS was valid,
 	 * we keep it.  Otherwise we replace it.
 	 */
-	regs->cs = __USER_CS;
+	if (!is_ukl_thread()) {
+		regs->cs = __USER_CS;
 
-	if (unlikely(regs->ss != __USER_DS))
-		force_valid_ss(regs);
+		if (unlikely(regs->ss != __USER_DS))
+			force_valid_ss(regs);
+	} else {
+		regs->cs = 0xC3;
+		regs->ss = __KERNEL_DS;
+	}
 
 	return 0;
 
@@ -247,6 +254,10 @@ SYSCALL_DEFINE0(rt_sigreturn)
 	sigset_t set;
 	unsigned long uc_flags;
 
+	if (is_ukl_thread())
+		frame = (struct rt_sigframe __user *)(regs->sp + sizeof(long));
+	else
+		frame = (struct rt_sigframe __user *)(regs->sp - sizeof(long));
 	frame = (struct rt_sigframe __user *)(regs->sp - sizeof(long));
 	if (!access_ok(frame, sizeof(*frame)))
 		goto badframe;
