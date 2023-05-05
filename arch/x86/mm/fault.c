@@ -1338,7 +1338,9 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 * on well-defined single instructions listed in the exception
 	 * tables.  But, an erroneous kernel fault occurring outside one of
 	 * those areas which also holds mmap_lock might deadlock attempting
-	 * to validate the fault against the address space.
+	 * to validate the fault against the address space. However, if we
+	 * are configured as a unikernel and the fauling thread is the UKL
+	 * application code we can proceed as normal.
 	 *
 	 * Only do the expensive exception table search when we might be at
 	 * risk of a deadlock.  This happens if we
@@ -1346,7 +1348,8 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 * 2. The access did not originate in userspace.
 	 */
 	if (unlikely(!mmap_read_trylock(mm))) {
-		if (!user_mode(regs) && !search_exception_tables(regs->ip)) {
+		if (!user_mode(regs) &&	!search_exception_tables(regs->ip) &&
+				!is_ukl_thread()) {
 			/*
 			 * Fault from code in kernel from
 			 * which we do not expect faults.
