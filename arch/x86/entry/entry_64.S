@@ -230,6 +230,33 @@ SYM_INNER_LABEL(entry_SYSRETQ_end, SYM_L_GLOBAL)
 SYM_CODE_END(entry_SYSCALL_64)
 
 #ifdef CONFIG_UNIKERNEL_LINUX
+
+SYM_CODE_START(ukl_ss_u2k)
+	pushq	%rax
+	call	enter_ukl_kernel
+	movq	%rsp, %rax
+	addq	$0x10, %rax
+	movq	PER_CPU_VAR(pcpu_hot + X86_top_of_stack), %rsp
+	pushq	%rax
+	subq	$0x10, %rax
+	pushq	8(%rax)
+	movq	(%rax), %rax
+	retq
+SYM_CODE_END(ukl_ss_u2k)
+
+SYM_CODE_START(ukl_ss_k2u)
+	pushq	%rax
+	movq	%rsp, %rax
+	movq	0x10(%rax), %rsp
+	pushq	8(%rax)
+	movq	(%rax), %rax
+
+	pushq	%rax
+	call	enter_ukl_user
+	popq	%rax
+	retq
+SYM_CODE_END(ukl_ss_k2u)
+
 SYM_CODE_START(ukl_entry_SYSCALL_64)
 	/*
 	 * syscalls will always come from user code so we dont need to

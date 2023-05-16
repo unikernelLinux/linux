@@ -762,6 +762,9 @@ struct task_struct {
 	 * in kernel text, 2 is UKL thread in application text
 	 */
 	int				ukl_thread;
+	unsigned int			ukl_bypass_syscall;
+	unsigned int			ukl_bypass_limit;
+	unsigned int			ukl_bypass_current;
 #endif
 	refcount_t			usage;
 	/* Per task flags (PF_*), defined further below: */
@@ -1565,10 +1568,12 @@ struct task_struct {
 int is_ukl_thread(void);
 void enter_ukl_user(void);
 void enter_ukl_kernel(void);
+static inline unsigned int is_ukl_bypass(void) { return current->ukl_bypass_syscall; }
 #else
 static inline int is_ukl_thread(void) { return NON_UKL_THREAD; }
 static inline void enter_ukl_user(void) {}
 static inline void enter_ukl_kernel(void) {}
+static inline unsigned int is_ukl_bypass(void) { return 0; }
 #endif
 
 static inline struct pid *task_pid(struct task_struct *task)
