@@ -70,6 +70,47 @@ static __always_inline bool do_syscall_x32(struct pt_regs *regs, int nr)
 	return false;
 }
 
+void ukl_set_bypass_limit(unsigned int val)
+{
+	if (val == 0) {
+		printk("Syscall bypass limit must be greater than 0\n");
+		return;
+	}
+
+	current->ukl_bypass_limit = val;
+	printk("Setting bypass limit to %d\n", val);
+}
+
+void ukl_set_bypass_syscall(unsigned int val)
+{
+	current->ukl_bypass_syscall = !!val;
+	if (current->ukl_bypass_limit == 0) {
+		current->ukl_bypass_limit = 10;
+		printk("Setting bypass limit to 10 (DEFAULT)\n");
+	}
+}
+
+unsigned int ukl_get_bypass_syscall(void)
+{
+	struct thread_info *ti;
+	unsigned int ret = current->ukl_bypass_syscall;
+
+	if (ret == 0)
+		return ret;
+
+	ti = current_thread_info();
+	if (READ_ONCE(ti->flags) & _TIF_SIGPENDING)
+		return 0;
+
+	current->ukl_bypass_current++;
+	if (current->ukl_bypass_current >= current->ukl_bypass_limit) {
+		current->ukl_bypass_current = 0;
+		ret = 0;
+	}
+
+	return ret;
+}
+
 __visible noinstr void do_syscall_64(struct pt_regs *regs, int nr)
 {
 	add_random_kstack_offset();
