@@ -746,6 +746,18 @@ __irqentry_text_end:
 SYM_CODE_START_LOCAL(common_interrupt_return)
 SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
 	IBRS_EXIT
+#ifdef CONFIG_UKL_USE_RET
+	cmpq	$0x33, CS(%rsp)
+	je	iret_return
+	movq	RIP(%rsp), %r15 /* return address in r15 */
+	movq	RSP(%rsp), %r14  /* user stack in r14 */
+	subq	$0x10, %r14
+	movq	%r15, 8(%r14)
+	movq	EFLAGS(%rsp), %r15 /* EFLAGS in r15 */
+	movq	%r15, (%r14)
+	movq	%r14, RSP(%rsp)
+iret_return:
+#endif
 #ifdef CONFIG_DEBUG_ENTRY
 	/* Assert that pt_regs indicates user mode. */
 	testb	$3, CS(%rsp)
@@ -796,7 +808,14 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
 	call	enter_ukl_user
 	popq	%rax
 
+#ifdef CONFIG_UKL_USE_RET
+	/* Swing to user stack and pop flags */
+	movq	0x18(%rsp), %rsp
+	popfq
+	retq
+#else
 	jmp	.Lnative_iret
+#endif
 1:
 #endif
 

@@ -39,3 +39,10 @@ config UKL_ARCHIVE_PATH
 	help
 	    Where the linker should look for the statically linked application
 	    and dependency archive.
+
+config UKL_USE_RET
+	bool "UKL use RET instead of IRET"
+	depends on UNIKERNEL_LINUX
+	help
+	    Use a RET instruction to return to the UKL user code after a fault
+	    or an interrupt.
