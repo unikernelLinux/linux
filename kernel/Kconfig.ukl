@@ -20,3 +20,9 @@ config UKL_NAME
 	    that file is in the appropriate place on the filesystem it is
 	    started as a UKL process.
 
+config UKL_USE_RET
+	bool "UKL use RET instead of IRET"
+	depends on UNIKERNEL_LINUX
+	help
+	    Use a RET instruction to return to the UKL user code after a fault
+	    or an interrupt.
