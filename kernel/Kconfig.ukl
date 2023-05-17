@@ -46,3 +46,13 @@ config UKL_USE_RET
 	help
 	    Use a RET instruction to return to the UKL user code after a fault
 	    or an interrupt.
+
+config UKL_DEEP_SHORTCUT
+	bool "Enable the UKL deep shortcutting library"
+	depends on UNIKERNEL_LINUX && INET
+	help
+	    The UKL deep shortcutting library adds glue code for calling deep
+	    into kernel subsystems, skipping kernel polymorphism. We have
+	    implemented functions to call TCP send and receive using the same
+	    arguments as write and read from userspace (our funcitons simply
+	    do the transformations needed) but others could be added.
