@@ -120,7 +120,7 @@ long strncpy_from_user(char *dst, const char __user *src, long count)
 	if (unlikely(count <= 0))
 		return 0;
 
-	max_addr = TASK_SIZE_MAX;
+	max_addr = (is_ukl_thread() ? (unsigned long)0 - 1 : TASK_SIZE_MAX);
 	src_addr = (unsigned long)untagged_addr(src);
 	if (likely(src_addr < max_addr)) {
 		unsigned long max = max_addr - src_addr;
