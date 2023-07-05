@@ -1755,10 +1755,19 @@ static struct timespec64 *ep_timeout_to_timespec(struct timespec64 *to, long ms)
  * woken, and in that case the ep_poll loop will remove the entry anyways, not
  * try to reuse it.
  */
+
+size_t redis_wake_count;
+size_t redis_wake_time;
+
 static int ep_autoremove_wake_function(struct wait_queue_entry *wq_entry,
 				       unsigned int mode, int sync, void *key)
 {
+	struct task_struct *tsk = (struct task_struct *)wq_entry->private;
+	if (tsk->ukl_thread)
+		redis_wake_time = ktime_get_ns();
 	int ret = default_wake_function(wq_entry, mode, sync, key);
+	if (tsk->ukl_thread && ret)
+		redis_wake_count++;
 
 	list_del_init(&wq_entry->entry);
 	return ret;
