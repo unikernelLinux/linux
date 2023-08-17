@@ -373,6 +373,11 @@ static inline void squash_the_stupid_serial_number(struct cpuinfo_x86 *c)
 
 static __always_inline void setup_smep(struct cpuinfo_x86 *c)
 {
+#ifdef CONFIG_UNIKERNEL_LINUX
+	clear_cpu_cap(c, X86_FEATURE_SMEP);
+	pr_warn("Clearing SMEP for %d\n", c->phys_proc_id);
+#endif
+
 	if (cpu_has(c, X86_FEATURE_SMEP))
 		cr4_set_bits(X86_CR4_SMEP);
 }
@@ -383,6 +388,11 @@ static __always_inline void setup_smap(struct cpuinfo_x86 *c)
 
 	/* This should have been cleared long ago */
 	BUG_ON(eflags & X86_EFLAGS_AC);
+
+#ifdef CONFIG_UNIKERNEL_LINUX
+	clear_cpu_cap(c, X86_FEATURE_SMAP);
+	pr_warn("Clearing SMAP for %d\n", c->phys_proc_id);
+#endif
 
 	if (cpu_has(c, X86_FEATURE_SMAP))
 		cr4_set_bits(X86_CR4_SMAP);
@@ -1959,6 +1969,11 @@ void enable_sep_cpu(void)
 
 void __init identify_boot_cpu(void)
 {
+#ifdef CONFIG_UNIKERNEL_LINUX
+	setup_clear_cpu_cap(X86_FEATURE_SMAP);
+	setup_clear_cpu_cap(X86_FEATURE_SMEP);
+#endif
+
 	identify_cpu(&boot_cpu_data);
 	if (HAS_KERNEL_IBT && cpu_feature_enabled(X86_FEATURE_IBT))
 		pr_info("CET detected: Indirect Branch Tracking enabled\n");
