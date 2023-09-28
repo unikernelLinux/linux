@@ -39,6 +39,35 @@
 #include <linux/rculist.h>
 #include <net/busy_poll.h>
 
+int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
+{
+	/*
+	 * When we get here we should be executing as a napi thread
+	 * and we know that there is data to be processed by our target
+	 * application. We will swap the mm_struct in use by the napi thread
+	 * with the one from the UKL task, execute the handler, and then swap
+	 * back to the original mm_struct and return.
+	 */
+
+	struct mm_struct *cached;
+	int ret;
+	unsigned long flags;
+	struct task_struct *ukl_task = (struct task_struct*)wq_entry->private;
+
+	cached = current->mm;
+	local_irq_save(flags);
+	switch_mm_irqs_off(current->mm, ukl_task->mm, current);
+	local_irq_restore(flags);
+
+	// ret = ukl_redis_event_handler(stuff we need to do the work);
+
+	local_irq_save(flags);
+	switch_mm_irqs_off(ukl_task->mm, cached, current);
+	local_irq_restore(flags);
+
+	return ret;
+}
+
 /*
  * LOCKING:
  * There are three level of locking required by epoll :
