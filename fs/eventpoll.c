@@ -274,10 +274,9 @@ static long max_user_watches __read_mostly;
  */
 
 struct ukl_event{
-	void *eventloop;
+	void *private;
 	int fd;
 	wait_queue_entry_t wait;
-	void *conn;
 }
 /*
  * This mutex is used to serialize ep_free() and eventpoll_release_file().
