@@ -38,6 +38,7 @@
 #include <linux/compat.h>
 #include <linux/rculist.h>
 #include <net/busy_poll.h>
+#include <asm/mmu_context.h>
 
 int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
 {
@@ -50,20 +51,20 @@ int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, v
 	 */
 
 	struct mm_struct *cached;
-	int ret;
-	unsigned long flags;
+	int ret = 0;
+	unsigned long irq;
 	struct task_struct *ukl_task = (struct task_struct*)wq_entry->private;
 
 	cached = current->mm;
-	local_irq_save(flags);
+	local_irq_save(irq);
 	switch_mm_irqs_off(current->mm, ukl_task->mm, current);
-	local_irq_restore(flags);
-
+	local_irq_restore(irq);
+        pr_warn("INVOKED REDIS HANDLER\n");
 	// ret = ukl_redis_event_handler(stuff we need to do the work);
 
-	local_irq_save(flags);
+	local_irq_save(irq);
 	switch_mm_irqs_off(ukl_task->mm, cached, current);
-	local_irq_restore(flags);
+	local_irq_restore(irq);
 
 	return ret;
 }
@@ -268,7 +269,16 @@ struct ep_pqueue {
  */
 /* Maximum number of epoll watched descriptors, per user */
 static long max_user_watches __read_mostly;
+/*
+ *This is management structure used by the event_handling API and the UKL application
+ */
 
+struct ukl_event{
+	void *eventloop;
+	int fd;
+	wait_queue_entry_t wait;
+	void *conn;
+}
 /*
  * This mutex is used to serialize ep_free() and eventpoll_release_file().
  */
@@ -1171,6 +1181,7 @@ static int ep_poll_callback(wait_queue_entry_t *wait, unsigned mode, int sync, v
 	unsigned long flags;
 	int ewake = 0;
 
+	pr_warn("INVOKED EPOLL CALLBACK");
 	read_lock_irqsave(&ep->lock, flags);
 
 	ep_set_busy_poll_napi_id(epi);
