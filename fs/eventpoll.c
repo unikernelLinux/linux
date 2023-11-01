@@ -277,7 +277,14 @@ struct ukl_event{
 	void *private;
 	int fd;
 	wait_queue_entry_t wait;
-}
+	__poll_t events;
+	wait_queue_head_t *whead;
+};
+struct event_pqueue
+{
+	poll_table pt;
+	struct ukl_event *event;
+};
 /*
  * This mutex is used to serialize ep_free() and eventpoll_release_file().
  */
@@ -838,7 +845,7 @@ static int ep_eventpoll_release(struct inode *inode, struct file *file)
 }
 
 static __poll_t ep_item_poll(const struct epitem *epi, poll_table *pt, int depth);
-
+static __poll_t event_item_poll(const struct ukl_event *event, poll_table *pt, struct file *tfile);
 static __poll_t __ep_eventpoll_poll(struct file *file, poll_table *wait, int depth)
 {
 	struct eventpoll *ep = file->private_data;
@@ -896,6 +903,13 @@ static __poll_t ep_item_poll(const struct epitem *epi, poll_table *pt,
 	return res & epi->event.events;
 }
 
+static __poll_t event_item_poll(const struct ukl_event *event, poll_table *pt, struct file *tfile)
+{
+	__poll_t res;
+	pt->_key = event->events;
+	res = vfs_poll(tfile, pt);
+	return res & event->events;
+}
 static __poll_t ep_eventpoll_poll(struct file *file, poll_table *wait)
 {
 	return __ep_eventpoll_poll(file, wait, 0);
@@ -1280,28 +1294,13 @@ out_unlock:
 static void event_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 				 poll_table *pt)
 {
-	struct ep_pqueue *epq = container_of(pt, struct ep_pqueue, pt);
-	struct epitem *epi = epq->epi;
-	struct eppoll_entry *pwq;
+	struct event_pqueue *epq = container_of(pt, struct event_pqueue, pt);
+	struct ukl_event *event = epq->event;
+	event->whead = whead;
+	init_waitqueue_func_entry(&event->wait, redis_handler);
 
-	if (unlikely(!epi))	// an earlier allocation has failed
-		return;
+	return;
 
-	pwq = kmem_cache_alloc(pwq_cache, GFP_KERNEL);
-	if (unlikely(!pwq)) {
-		epq->epi = NULL;
-		return;
-	}
-
-	init_waitqueue_func_entry(&pwq->wait, redis_handler);
-	pwq->whead = whead;
-	pwq->base = epi;
-	if (epi->event.events & EPOLLEXCLUSIVE)
-		add_wait_queue_exclusive(whead, &pwq->wait);
-	else
-		add_wait_queue(whead, &pwq->wait);
-	pwq->next = epi->pwqlist;
-	epi->pwqlist = pwq;
 }
 
 
@@ -1511,121 +1510,29 @@ allocate:
 /*
  * Must be called with "mtx" held.
  */
-static int event_insert(struct eventpoll *ep, const struct epoll_event *event,
-		     struct file *tfile, int fd, int full_check)
+static int event_insert(int fd, struct file *tfile, struct ukl_event *event)
 {
-	int error, pwake = 0;
 	__poll_t revents;
-	struct epitem *epi;
-	struct ep_pqueue epq;
-	struct eventpoll *tep = NULL;
+	struct event_pqueue epq;
 
-	if (is_file_epoll(tfile))
-		tep = tfile->private_data;
-
-	lockdep_assert_irqs_enabled();
-
-	if (unlikely(percpu_counter_compare(&ep->user->epoll_watches,
-					    max_user_watches) >= 0))
-		return -ENOSPC;
-	percpu_counter_inc(&ep->user->epoll_watches);
-
-	if (!(epi = kmem_cache_zalloc(epi_cache, GFP_KERNEL))) {
-		percpu_counter_dec(&ep->user->epoll_watches);
-		return -ENOMEM;
-	}
-
-	/* Item initialization follow here ... */
-	INIT_LIST_HEAD(&epi->rdllink);
-	epi->ep = ep;
-	ep_set_ffd(&epi->ffd, tfile, fd);
-	epi->event = *event;
-	epi->next = EP_UNACTIVE_PTR;
-
-	if (tep)
-		mutex_lock_nested(&tep->mtx, 1);
-	/* Add the current item to the list of active epoll hook for this file */
-	if (unlikely(attach_epitem(tfile, epi) < 0)) {
-		if (tep)
-			mutex_unlock(&tep->mtx);
-		kmem_cache_free(epi_cache, epi);
-		percpu_counter_dec(&ep->user->epoll_watches);
-		return -ENOMEM;
-	}
-
-	if (full_check && !tep)
-		list_file(tfile);
-
-	/*
-	 * Add the current item to the RB tree. All RB tree operations are
-	 * protected by "mtx", and ep_insert() is called with "mtx" held.
+	/* We may need to do something like "attach_epitem()" which attaches a pointer in epitem to
+	 * the list in file->fep
 	 */
-	ep_rbtree_insert(ep, epi);
-	if (tep)
-		mutex_unlock(&tep->mtx);
 
-	/* now check if we've created too many backpaths */
-	if (unlikely(full_check && reverse_path_check())) {
-		ep_remove(ep, epi);
-		return -EINVAL;
-	}
+	/* create struct event_pqueue { struct ukl_event * event, struct poll_table pt;}
+	 */
 
-	if (epi->event.events & EPOLLWAKEUP) {
-		error = ep_create_wakeup_source(epi);
-		if (error) {
-			ep_remove(ep, epi);
-			return error;
-		}
-	}
-
-	/* Initialize the poll table using the queue callback */
-	epq.epi = epi;
+	epq.event = event;
 	init_poll_funcptr(&epq.pt, event_ptable_queue_proc);
 
-	/*
-	 * Attach the item to the poll hooks and get current event bits.
-	 * We can safely use the file* here because its usage count has
-	 * been increased by the caller of this function. Note that after
-	 * this operation completes, the poll callback can start hitting
-	 * the new item.
-	 */
-	revents = ep_item_poll(epi, &epq.pt, 1);
-
-	/*
-	 * We have to check if something went wrong during the poll wait queue
-	 * install process. Namely an allocation for a wait queue failed due
-	 * high memory pressure.
-	 */
-	if (unlikely(!epq.epi)) {
-		ep_remove(ep, epi);
-		return -ENOMEM;
-	}
-
-	/* We have to drop the new item inside our item list to keep track of it */
-	write_lock_irq(&ep->lock);
-
-	/* record NAPI ID of new item if present */
-	ep_set_busy_poll_napi_id(epi);
-
-	/* If the file is already "ready" we drop it inside the ready list */
-	if (revents && !ep_is_linked(epi)) {
-		list_add_tail(&epi->rdllink, &ep->rdllist);
-		ep_pm_stay_awake(epi);
-
-		/* Notify waiting tasks that events are available */
-		if (waitqueue_active(&ep->wq))
-			wake_up(&ep->wq);
-		if (waitqueue_active(&ep->poll_wait))
-			pwake++;
-	}
-
-	write_unlock_irq(&ep->lock);
-
-	/* We have to call this outside the lock */
-	if (pwake)
-		ep_poll_safewake(ep, NULL, 0);
+	revents = event_item_poll(event, &epq.pt, tfile);
 
 	return 0;
+
+
+
+
+
 }
 
 static int ep_insert(struct eventpoll *ep, const struct epoll_event *event,
@@ -2238,150 +2145,40 @@ static inline int epoll_mutex_lock(struct mutex *mutex, int depth,
 		return 0;
 	return -EAGAIN;
 }
-
-int do_event_ctl(int epfd, int op, int fd, struct epoll_event *epds,
-		 bool nonblock)
+/*
+ * Entry point into kernel for event handling for the ukl application. Later
+ * we may need to add a pointer to event handler and/or events field in the argument.
+ * We are only adding the events at this point, not deleting it or modifying it
+ */
+int do_event_ctl(int fd, void *private)
 {
 	int error;
-	int full_check = 0;
-	struct fd f, tf;
-	struct eventpoll *ep;
-	struct epitem *epi;
-	struct eventpoll *tep = NULL;
+	struct ukl_event *event;
+	struct fd tf;
+	if(!(event = kmalloc(sizeof(struct ukl_event), GFP_KERNEL))){
+		return -ENOMEM;
+	}
+	event->fd = fd;
+	event->private = private;
 
-	error = -EBADF;
-	f = fdget(epfd);
-	if (!f.file)
-		goto error_return;
-
-	/* Get the "struct file *" for the target file */
+	/*  Get the "struct file *" for the target file */
 	tf = fdget(fd);
 	if (!tf.file)
-		goto error_fput;
+		return -EBADF;
 
-	/* The target file descriptor must support poll */
-	error = -EPERM;
-	if (!file_can_poll(tf.file))
-		goto error_tgt_fput;
-
-	/* Check if EPOLLWAKEUP is allowed */
-	if (ep_op_has_event(op))
-		ep_take_care_of_epollwakeup(epds);
-
-	/*
-	 * We have to check that the file structure underneath the file descriptor
-	 * the user passed to us _is_ an eventpoll file. And also we do not permit
-	 * adding an epoll file descriptor inside itself.
-	 */
-	error = -EINVAL;
-	if (f.file == tf.file || !is_file_epoll(f.file))
-		goto error_tgt_fput;
-
-	/*
-	 * epoll adds to the wakeup queue at EPOLL_CTL_ADD time only,
-	 * so EPOLLEXCLUSIVE is not allowed for a EPOLL_CTL_MOD operation.
-	 * Also, we do not currently supported nested exclusive wakeups.
-	 */
-	if (ep_op_has_event(op) && (epds->events & EPOLLEXCLUSIVE)) {
-		if (op == EPOLL_CTL_MOD)
-			goto error_tgt_fput;
-		if (op == EPOLL_CTL_ADD && (is_file_epoll(tf.file) ||
-				(epds->events & ~EPOLLEXCLUSIVE_OK_BITS)))
-			goto error_tgt_fput;
+	if(!file_can_poll(tf.file))
+	{
+		fdput(tf);
+		return -EPERM;
 	}
+	/*We may need to manipulate locks at this point*/
 
-	/*
-	 * At this point it is safe to assume that the "private_data" contains
-	 * our own data structure.
-	 */
-	ep = f.file->private_data;
+	error = event_insert(fd, tf.file, event);
 
-	/*
-	 * When we insert an epoll file descriptor inside another epoll file
-	 * descriptor, there is the chance of creating closed loops, which are
-	 * better be handled here, than in more critical paths. While we are
-	 * checking for loops we also determine the list of files reachable
-	 * and hang them on the tfile_check_list, so we can check that we
-	 * haven't created too many possible wakeup paths.
-	 *
-	 * We do not need to take the global 'epumutex' on EPOLL_CTL_ADD when
-	 * the epoll file descriptor is attaching directly to a wakeup source,
-	 * unless the epoll file descriptor is nested. The purpose of taking the
-	 * 'epmutex' on add is to prevent complex toplogies such as loops and
-	 * deep wakeup paths from forming in parallel through multiple
-	 * EPOLL_CTL_ADD operations.
-	 */
-	error = epoll_mutex_lock(&ep->mtx, 0, nonblock);
-	if (error)
-		goto error_tgt_fput;
-	if (op == EPOLL_CTL_ADD) {
-		if (READ_ONCE(f.file->f_ep) || ep->gen == loop_check_gen ||
-		    is_file_epoll(tf.file)) {
-			mutex_unlock(&ep->mtx);
-			error = epoll_mutex_lock(&epmutex, 0, nonblock);
-			if (error)
-				goto error_tgt_fput;
-			loop_check_gen++;
-			full_check = 1;
-			if (is_file_epoll(tf.file)) {
-				tep = tf.file->private_data;
-				error = -ELOOP;
-				if (ep_loop_check(ep, tep) != 0)
-					goto error_tgt_fput;
-			}
-			error = epoll_mutex_lock(&ep->mtx, 0, nonblock);
-			if (error)
-				goto error_tgt_fput;
-		}
-	}
-
-	/*
-	 * Try to lookup the file inside our RB tree. Since we grabbed "mtx"
-	 * above, we can be sure to be able to use the item looked up by
-	 * ep_find() till we release the mutex.
-	 */
-	epi = ep_find(ep, tf.file, fd);
-
-	error = -EINVAL;
-	switch (op) {
-	case EPOLL_CTL_ADD:
-		if (!epi) {
-			epds->events |= EPOLLERR | EPOLLHUP;
-			error = event_insert(ep, epds, tf.file, fd, full_check);
-		} else
-			error = -EEXIST;
-		break;
-	case EPOLL_CTL_DEL:
-		if (epi)
-			error = ep_remove(ep, epi);
-		else
-			error = -ENOENT;
-		break;
-	case EPOLL_CTL_MOD:
-		if (epi) {
-			if (!(epi->event.events & EPOLLEXCLUSIVE)) {
-				epds->events |= EPOLLERR | EPOLLHUP;
-				error = ep_modify(ep, epi, epds);
-			}
-		} else
-			error = -ENOENT;
-		break;
-	}
-	mutex_unlock(&ep->mtx);
-
-error_tgt_fput:
-	if (full_check) {
-		clear_tfile_check_list();
-		loop_check_gen++;
-		mutex_unlock(&epmutex);
-	}
-
-	fdput(tf);
-error_fput:
-	fdput(f);
-error_return:
-
+	/*We may need to release locks here*/
 	return error;
+
+
 }
 int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *epds,
 		 bool nonblock)
