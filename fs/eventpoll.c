@@ -1298,6 +1298,7 @@ static void event_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 	struct ukl_event *event = epq->event;
 	event->whead = whead;
 	init_waitqueue_func_entry(&event->wait, redis_handler);
+	add_wait_queue(whead, &event->wait);
 
 	return;
 
