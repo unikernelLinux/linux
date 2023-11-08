@@ -50,20 +50,16 @@ int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, v
 	 * back to the original mm_struct and return.
 	 */
 
-	struct mm_struct *cached;
+	
 	int ret = 0;
 	unsigned long irq;
 	struct task_struct *ukl_task = (struct task_struct*)wq_entry->private;
-
-	cached = current->mm;
 	local_irq_save(irq);
 	switch_mm_irqs_off(current->mm, ukl_task->mm, current);
 	local_irq_restore(irq);
         pr_warn("INVOKED REDIS HANDLER\n");
-	// ret = ukl_redis_event_handler(stuff we need to do the work);
-
 	local_irq_save(irq);
-	switch_mm_irqs_off(ukl_task->mm, cached, current);
+	switch_mm_irqs_off(ukl_task->mm, &init_mm, current);
 	local_irq_restore(irq);
 
 	return ret;
@@ -1297,7 +1293,7 @@ static void event_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 	struct event_pqueue *epq = container_of(pt, struct event_pqueue, pt);
 	struct ukl_event *event = epq->event;
 	event->whead = whead;
-	init_waitqueue_func_entry(&event->wait, redis_handler);
+	init_waitqueue_func_task_entry(&event->wait, redis_handler, current);
 	add_wait_queue(whead, &event->wait);
 
 	return;
@@ -1515,7 +1511,7 @@ static int event_insert(int fd, struct file *tfile, struct ukl_event *event)
 {
 	__poll_t revents;
 	struct event_pqueue epq;
-
+	//pr_warn("INVOKING EVENT_INSERT\n");
 	/* We may need to do something like "attach_epitem()" which attaches a pointer in epitem to
 	 * the list in file->fep
 	 */
@@ -2156,6 +2152,7 @@ int do_event_ctl(int fd, void *private)
 	int error;
 	struct ukl_event *event;
 	struct fd tf;
+	//pr_warn("INVOKING EVENT_CTL\n");
 	if(!(event = kmalloc(sizeof(struct ukl_event), GFP_KERNEL))){
 		return -ENOMEM;
 	}

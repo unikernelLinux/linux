@@ -94,6 +94,14 @@ init_waitqueue_func_entry(struct wait_queue_entry *wq_entry, wait_queue_func_t f
 	wq_entry->func		= func;
 }
 
+static inline void
+init_waitqueue_func_task_entry(struct wait_queue_entry *wq_entry, wait_queue_func_t func, struct task_struct *p)
+{
+	wq_entry->flags		= 0;
+	wq_entry->private	= p;
+	wq_entry->func		= func;
+}
+
 /**
  * waitqueue_active -- locklessly test for waiters on the queue
  * @wq_head: the waitqueue to test for waiters
