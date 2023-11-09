@@ -40,6 +40,16 @@
 #include <net/busy_poll.h>
 #include <asm/mmu_context.h>
 
+struct ukl_event{
+	void *private;
+	int fd;
+	wait_queue_entry_t wait;
+	__poll_t events;
+	wait_queue_head_t *whead;
+};
+
+int ukl_redis_event_handler(void *data);
+
 int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
 {
 	/*
@@ -54,10 +64,11 @@ int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, v
 	int ret = 0;
 	unsigned long irq;
 	struct task_struct *ukl_task = (struct task_struct*)wq_entry->private;
+	struct ukl_event *ukl_handler = container_of(wq_entry, struct ukl_event, wait);
 	local_irq_save(irq);
 	switch_mm_irqs_off(current->mm, ukl_task->mm, current);
 	local_irq_restore(irq);
-        pr_warn("INVOKED REDIS HANDLER\n");
+        ret = ukl_redis_event_handler(ukl_handler->private);
 	local_irq_save(irq);
 	switch_mm_irqs_off(ukl_task->mm, &init_mm, current);
 	local_irq_restore(irq);
@@ -269,13 +280,6 @@ static long max_user_watches __read_mostly;
  *This is management structure used by the event_handling API and the UKL application
  */
 
-struct ukl_event{
-	void *private;
-	int fd;
-	wait_queue_entry_t wait;
-	__poll_t events;
-	wait_queue_head_t *whead;
-};
 struct event_pqueue
 {
 	poll_table pt;
@@ -2142,19 +2146,20 @@ static inline int epoll_mutex_lock(struct mutex *mutex, int depth,
 		return 0;
 	return -EAGAIN;
 }
+
 /*
  * Entry point into kernel for event handling for the ukl application. Later
  * we may need to add a pointer to event handler and/or events field in the argument.
  * We are only adding the events at this point, not deleting it or modifying it
  */
-int do_event_ctl(int fd, void *private)
+void *do_event_ctl(int fd, void *private)
 {
 	int error;
 	struct ukl_event *event;
 	struct fd tf;
 	//pr_warn("INVOKING EVENT_CTL\n");
 	if(!(event = kmalloc(sizeof(struct ukl_event), GFP_KERNEL))){
-		return -ENOMEM;
+		return NULL;
 	}
 	event->fd = fd;
 	event->private = private;
@@ -2162,22 +2167,31 @@ int do_event_ctl(int fd, void *private)
 	/*  Get the "struct file *" for the target file */
 	tf = fdget(fd);
 	if (!tf.file)
-		return -EBADF;
+		return NULL;
 
 	if(!file_can_poll(tf.file))
 	{
 		fdput(tf);
-		return -EPERM;
+		return NULL;
 	}
 	/*We may need to manipulate locks at this point*/
 
 	error = event_insert(fd, tf.file, event);
 
 	/*We may need to release locks here*/
-	return error;
+	fdput(tf);
+	return (void*)event;
 
 
 }
+
+void release_ukl_event(void *private)
+{
+	struct ukl_event *event = (struct ukl_event*)private;
+	remove_wait_queue(event->whead, &event->wait);
+	kfree(event);
+}
+
 int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *epds,
 		 bool nonblock)
 {
