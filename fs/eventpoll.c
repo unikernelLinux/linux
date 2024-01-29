@@ -50,32 +50,79 @@ struct ukl_event{
 
 int ukl_redis_event_handler(void *data);
 
-int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
+struct event_work_item{
+        struct list_head work_item_head;
+        void *data;
+};
+struct event_workitem_queue{
+        spinlock_t queue_lock;
+        struct list_head work_item_head;
+};
+
+struct event_workitem_queue *ewq;
+
+void init_event_workitem_queue(void)
 {
-	/*
-	 * When we get here we should be executing as a napi thread
-	 * and we know that there is data to be processed by our target
-	 * application. We will swap the mm_struct in use by the napi thread
-	 * with the one from the UKL task, execute the handler, and then swap
-	 * back to the original mm_struct and return.
-	 */
-
-	
-	int ret = 0;
-	unsigned long irq;
-	struct task_struct *ukl_task = (struct task_struct*)wq_entry->private;
-	struct ukl_event *ukl_handler = container_of(wq_entry, struct ukl_event, wait);
-	local_irq_save(irq);
-	switch_mm_irqs_off(current->mm, ukl_task->mm, current);
-	local_irq_restore(irq);
-        ret = ukl_redis_event_handler(ukl_handler->private);
-	local_irq_save(irq);
-	switch_mm_irqs_off(ukl_task->mm, &init_mm, current);
-	local_irq_restore(irq);
-
-	return ret;
+        ewq = kmalloc(sizeof(struct event_workitem_queue), GFP_KERNEL);
+        INIT_LIST_HEAD(&ewq->work_item_head);
+}
+void workitem_queue_add_event(void *private)
+{
+        struct event_work_item *evi = kmalloc(sizeof(struct event_work_item), GFP_KERNEL);
+        evi->data = private;
+        spin_lock(&ewq->queue_lock);
+        list_add_tail(&evi->work_item_head, &ewq->work_item_head);
+        spin_unlock(&ewq->queue_lock);
 }
 
+struct event_work_item* workitem_queue_consume_event(void)
+{
+        struct event_work_item *evi = list_first_entry_or_null(&ewq->work_item_head, struct event_work_item,
+                work_item_head);
+        spin_lock(&ewq->queue_lock);
+        __list_del_entry(&evi->work_item_head);
+        spin_unlock(&ewq->queue_lock);
+        return evi;
+}
+
+void free_event_work_item(struct event_work_item *evi)
+{
+        kfree(evi);
+}
+
+int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
+{
+        /*
+         * When we get here we should be executing as a napi thread
+         * and we know that there is data to be processed by our target
+         * application. We will swap the mm_struct in use by the napi thread
+         * with the one from the UKL task, execute the handler, and then swap
+         * back to the original mm_struct and return.
+         */
+
+        int ret = 0;
+        struct ukl_event *ukl_handler = container_of(wq_entry, struct ukl_event, wait);
+
+        /* Assuming the event_workitem_queue is already initialized*/
+        workitem_queue_add_event(ukl_handler->private);
+        /* Pick a worker thread*/
+
+        /*schedule thread with high priority*/
+
+        /*thread consumes event from the event_workitem_queue*/
+
+        /*thread removes event from the event_work_item_queue*/
+
+        /*local_irq_save(irq);
+        switch_mm_irqs_off(current->mm, ukl_task->mm, current);
+        local_irq_restore(irq);
+        ret = ukl_redis_event_handler(ukl_handler->private);
+        local_irq_save(irq);
+        switch_mm_irqs_off(ukl_task->mm, &init_mm, current);
+        local_irq_restore(irq);
+        */
+        return ret;
+}
 /*
  * LOCKING:
  * There are three level of locking required by epoll :
