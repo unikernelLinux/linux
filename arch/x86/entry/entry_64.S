@@ -257,6 +257,72 @@ SYM_CODE_START(ukl_ss_k2u)
 	retq
 SYM_CODE_END(ukl_ss_k2u)
 
+SYM_CODE_START(ukl_state_u2k)
+	/* This function will only be called on a transition from UKL user
+	 * code to kernel code so we don't need setup a return frame like
+	 * we do for system calls (RIP can stay on the stack instead of being
+	 * moved to RCX). We will swap to a kernel stack and move to kernel
+	 * CR3. The only tricky bit is to copy the RIP from the user stack to
+	 * the kernel stack for the return.
+	 */
+	UNWIND_HINT_EMPTY
+
+	// cache rax and use is as scratch space
+	pushq	%rax
+	call	enter_ukl_kernel
+
+	// The return address from our caller should be 16 bytes higher than rsp
+	movq	16(%rsp), %rax
+	// Now use tss.sp2 as scratch to swap stacks
+	movq	%rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+	SWITCH_TO_KERNEL_CR3 scratch_reg=%rsp
+	movq	PER_CPU_VAR(pcpu_hot + X86_top_of_stack), %rsp
+
+	/* We need to stash the user stack pointer somewhere we can recover it
+	 * when we switch back to user code, place it on the kernel stack before
+	 * our return address
+	 */
+	pushq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+	pushq	%rax		// top of stack is now the return address.
+	pushfq
+	// restore %rax from the user stack
+	pushq	%rdx
+	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2), %rdx
+	movq	8(%rdx), %rax
+	popq	%rdx
+	// We need to remove the cached %rax and return address from the user stack,
+	// %rax has been restored and we will patch in a new return address in
+	// ukl_state_k2u
+	addq	24(%rsp), 16
+	popfq
+	retq
+SYM_CODE_END(ukl_state_u2k)
+
+SYM_CODE_START(ukl_state_k2u)
+	/*
+	 * When we get here, the ret address is at %rsp + 8 and the user stack
+	 * address is %rsp + 16 otherwise we have problems.
+	 */
+	pushq %rax
+	call enter_ukl_user
+
+	// Recover the user stack address
+	movq	24(%rsp), %rax
+	movq	%rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+	movq	%rax, %rsp
+	pushq	%rdi
+	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2), %rdi
+	// Restore rax
+	movq	8(%rdi) %rax
+	// Write return address to scratch space
+	movq	16(%rdi), PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+	SWITCH_TO_USER_CR3 scratch_reg=%rdi
+	popq	%rdi
+	// Put the correct return address on the stack and return
+	pushq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+	retq
+SYM_CODE_END(ukl_state_k2u)
+
 SYM_CODE_START(ukl_entry_SYSCALL_64)
 	/*
 	 * syscalls will always come from user code so we dont need to

@@ -42,17 +42,49 @@
 
 struct ukl_event{
 	void *private;
-	int fd;
+	void *work_data;
 	wait_queue_entry_t wait;
 	__poll_t events;
 	wait_queue_head_t *whead;
 };
 
-int ukl_redis_event_handler(void *data);
+struct task_struct *ukl_task;
+
+void register_ukl_handler_task(void)
+{
+	ukl_task = current;
+}
+
+void ukl_worker_sleep(void)
+{
+	// This function is intended to be called from a user space thread that
+	// was created to handle events. AFAICT this is the most efficient way
+	// for a task to "sleep".
+	
+	ukl_state_u2k();
+
+	// The block here is for the stack allocation of flags and to ensure
+	// that it is popped before we call ukl_state_k2u
+	{
+		// There are no events to handle at the moment, mark ourselves
+		// idle and go to sleep
+		unsigned long flags;
+		local_irq_save(flags);
+		set_current_state(TASK_IDLE);
+		local_irq_restore(flags);
+	}
+
+	// Schedule is outside the block with flags because we don't know where
+	// we will be running when we return
+	schedule();
+
+	ukl_state_k2u();
+}
+
 
 struct event_work_item{
-        struct list_head work_item_head;
         void *data;
+        struct list_head work_item_head;
 };
 struct event_workitem_queue{
         spinlock_t queue_lock;
@@ -79,15 +111,15 @@ struct event_work_item* workitem_queue_consume_event(void)
 {
         struct event_work_item *evi = list_first_entry_or_null(&ewq->work_item_head, struct event_work_item,
                 work_item_head);
+	if (!evi)
+		return NULL;
+
+	void *value = evi->data;
         spin_lock(&ewq->queue_lock);
         __list_del_entry(&evi->work_item_head);
         spin_unlock(&ewq->queue_lock);
-        return evi;
-}
-
-void free_event_work_item(struct event_work_item *evi)
-{
-        kfree(evi);
+	kfree(evi);
+        return value;
 }
 
 int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
@@ -106,21 +138,8 @@ int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, v
         /* Assuming the event_workitem_queue is already initialized*/
         workitem_queue_add_event(ukl_handler->private);
         /* Pick a worker thread*/
+	wake_up_process(ukl_task);
 
-        /*schedule thread with high priority*/
-
-        /*thread consumes event from the event_workitem_queue*/
-
-        /*thread removes event from the event_work_item_queue*/
-
-        /*local_irq_save(irq);
-        switch_mm_irqs_off(current->mm, ukl_task->mm, current);
-        local_irq_restore(irq);
-        ret = ukl_redis_event_handler(ukl_handler->private);
-        local_irq_save(irq);
-        switch_mm_irqs_off(ukl_task->mm, &init_mm, current);
-        local_irq_restore(irq);
-        */
         return ret;
 }
 /*
