@@ -289,11 +289,12 @@ SYM_CODE_START(ukl_state_u2k)
 	pushq	%rdx
 	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2), %rdx
 	movq	8(%rdx), %rax
-	popq	%rdx
 	// We need to remove the cached %rax and return address from the user stack,
 	// %rax has been restored and we will patch in a new return address in
 	// ukl_state_k2u
-	addq	24(%rsp), 16
+	addq	$16, %rdx
+	movq	%rdx, 32(%rsp)
+	popq	%rdx
 	popfq
 	retq
 SYM_CODE_END(ukl_state_u2k)
@@ -312,11 +313,12 @@ SYM_CODE_START(ukl_state_k2u)
 	movq	%rax, %rsp
 	pushq	%rdi
 	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2), %rdi
-	// Restore rax
-	movq	8(%rdi) %rax
 	// Write return address to scratch space
-	movq	16(%rdi), PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
-	SWITCH_TO_USER_CR3 scratch_reg=%rdi
+	movq	16(%rdi), %rax
+	movq	%rax, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+	// Restore rax
+	movq	8(%rdi), %rax
+	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi
 	popq	%rdi
 	// Put the correct return address on the stack and return
 	pushq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2)

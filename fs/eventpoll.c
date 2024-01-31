@@ -55,13 +55,16 @@ void register_ukl_handler_task(void)
 	ukl_task = current;
 }
 
+extern void ukl_state_u2k(void);
+extern void ukl_state_k2u(void);
+
 void ukl_worker_sleep(void)
 {
 	// This function is intended to be called from a user space thread that
 	// was created to handle events. AFAICT this is the most efficient way
 	// for a task to "sleep".
 	
-	ukl_state_u2k();
+	//ukl_state_u2k();
 
 	// The block here is for the stack allocation of flags and to ensure
 	// that it is popped before we call ukl_state_k2u
@@ -78,7 +81,7 @@ void ukl_worker_sleep(void)
 	// we will be running when we return
 	schedule();
 
-	ukl_state_k2u();
+	//ukl_state_k2u();
 }
 
 
@@ -109,12 +112,13 @@ void workitem_queue_add_event(void *private)
 
 struct event_work_item* workitem_queue_consume_event(void)
 {
+	void *value;
         struct event_work_item *evi = list_first_entry_or_null(&ewq->work_item_head, struct event_work_item,
                 work_item_head);
 	if (!evi)
 		return NULL;
 
-	void *value = evi->data;
+	value = evi->data;
         spin_lock(&ewq->queue_lock);
         __list_del_entry(&evi->work_item_head);
         spin_unlock(&ewq->queue_lock);
@@ -2227,7 +2231,6 @@ void *do_event_ctl(int fd, void *private)
 	if(!(event = kmalloc(sizeof(struct ukl_event), GFP_KERNEL))){
 		return NULL;
 	}
-	event->fd = fd;
 	event->private = private;
 
 	/*  Get the "struct file *" for the target file */
