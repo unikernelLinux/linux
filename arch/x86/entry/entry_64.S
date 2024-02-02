@@ -334,6 +334,10 @@ SYM_CODE_START(ukl_entry_SYSCALL_64)
 	 */
 	UNWIND_HINT_EMPTY
 
+	// We need to disable IRQs, they are disabled as part of the SYSCALL
+	// instruction, but we got here through call so disable them explicitly
+	cli
+
 	pushq	%rax
 	call	enter_ukl_kernel
 	popq	%rax
@@ -394,6 +398,9 @@ SYM_CODE_START(ukl_entry_SYSCALL_64)
 	/* Swing to user stack and pop flags */
 	movq 	0x18(%rsp), %rsp
 	popfq
+	// We need to explicitly re-enable interrupts becuase this would be
+	// handled by SYSRET
+	sti
 	retq
 SYM_CODE_END(ukl_entry_SYSCALL_64)
 #endif
