@@ -99,29 +99,32 @@ struct event_workitem_queue *ewq;
 void init_event_workitem_queue(void)
 {
         ewq = kmalloc(sizeof(struct event_workitem_queue), GFP_KERNEL);
+	spin_lock_init(&ewq->queue_lock);
         INIT_LIST_HEAD(&ewq->work_item_head);
 }
 void workitem_queue_add_event(void *private)
 {
-        struct event_work_item *evi = kmalloc(sizeof(struct event_work_item), GFP_KERNEL);
+	unsigned long flags;
+        struct event_work_item *evi = kmalloc(sizeof(struct event_work_item), GFP_ATOMIC);
         evi->data = private;
-        spin_lock(&ewq->queue_lock);
+        spin_lock_irqsave(&ewq->queue_lock, flags);
         list_add_tail(&evi->work_item_head, &ewq->work_item_head);
-        spin_unlock(&ewq->queue_lock);
+        spin_unlock_irqrestore(&ewq->queue_lock, flags);
 }
 
 struct event_work_item* workitem_queue_consume_event(void)
 {
 	void *value;
+	unsigned long flags;
         struct event_work_item *evi = list_first_entry_or_null(&ewq->work_item_head, struct event_work_item,
                 work_item_head);
 	if (!evi)
 		return NULL;
 
 	value = evi->data;
-        spin_lock(&ewq->queue_lock);
+        spin_lock_irqsave(&ewq->queue_lock, flags);
         __list_del_entry(&evi->work_item_head);
-        spin_unlock(&ewq->queue_lock);
+        spin_unlock_irqrestore(&ewq->queue_lock, flags);
 	kfree(evi);
         return value;
 }
