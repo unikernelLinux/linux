@@ -106,10 +106,12 @@ void workitem_queue_add_event(void *private)
 {
 	unsigned long flags;
         struct event_work_item *evi = kmalloc(sizeof(struct event_work_item), GFP_ATOMIC);
+	pr_warn("Adding UKL event\n");
         evi->data = private;
         spin_lock_irqsave(&ewq->queue_lock, flags);
         list_add_tail(&evi->work_item_head, &ewq->work_item_head);
         spin_unlock_irqrestore(&ewq->queue_lock, flags);
+	pr_warn("Added event\n");
 }
 
 struct event_work_item* workitem_queue_consume_event(void)
@@ -118,6 +120,7 @@ struct event_work_item* workitem_queue_consume_event(void)
 	unsigned long flags;
         struct event_work_item *evi = list_first_entry_or_null(&ewq->work_item_head, struct event_work_item,
                 work_item_head);
+	pr_warn("Retrieving UKL event\n");
 	if (!evi)
 		return NULL;
 
@@ -126,6 +129,7 @@ struct event_work_item* workitem_queue_consume_event(void)
         __list_del_entry(&evi->work_item_head);
         spin_unlock_irqrestore(&ewq->queue_lock, flags);
 	kfree(evi);
+	pr_warn("Returning event\n");
         return value;
 }
 
@@ -145,7 +149,9 @@ int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, v
         /* Assuming the event_workitem_queue is already initialized*/
         workitem_queue_add_event(ukl_handler->private);
         /* Pick a worker thread*/
+	pr_warn("Waking UKL event handler thread\n");
 	wake_up_process(ukl_task);
+	pr_warn("Woken\n");
 
         return ret;
 }
