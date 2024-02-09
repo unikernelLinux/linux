@@ -1189,10 +1189,6 @@ else
 KBUILD_VMLINUX_LIBS := $(patsubst %/,%/lib.a, $(libs-y))
 endif
 
-ifdef CONFIG_UNIKERNEL_LINUX
-KBUILD_VMLINUX_OBJS += $(CONFIG_UKL_ARCHIVE_PATH)
-endif
-
 export KBUILD_VMLINUX_OBJS KBUILD_VMLINUX_LIBS
 export KBUILD_LDS          := arch/$(SRCARCH)/kernel/vmlinux.lds
 

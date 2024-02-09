@@ -32,14 +32,6 @@ config UKL_NAME
 	    For a more 'traditional' unikernel model, the value set here
 	    should be given to the init= boot parameter.
 
-config UKL_ARCHIVE_PATH
-	string "Path static application archive"
-	depends on UNIKERNEL_LINUX
-	default "../UKL.a"
-	help
-	    Where the linker should look for the statically linked application
-	    and dependency archive.
-
 config UKL_USE_RET
 	bool "UKL use RET instead of IRET"
 	depends on UNIKERNEL_LINUX
