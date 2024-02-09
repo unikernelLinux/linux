@@ -1267,7 +1267,7 @@ UKL_SKIP_LOADING_ELF:
 		 * We know that this symbol exists and that it is the entry
 		 * point for the linked application.
 		 */
-		extern void ukl__start(void);
+		void (*ukl__start)(void) = NULL;
 		elf_entry = (unsigned long) ukl__start;
 		goto UKL_SKIP_FINDING_ELF_ENTRY;
 	}
