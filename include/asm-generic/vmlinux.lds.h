@@ -571,23 +571,6 @@
  * code elimination is enabled, so these sections should be converted
  * to use ".." first.
  */
-#ifdef CONFIG_UNIKERNEL_LINUX
-#define TEXT_TEXT							\
-		ALIGN_FUNCTION();					\
-		*(.text.hot .text.hot.*)				\
-		*(TEXT_MAIN .text.fixup)				\
-		*(.stub .text.* .gnu.linkonce.t.*)			\
-		*(.text.unlikely .text.*_unlikely .text.unlikely.*)	\
-		*(.text.exit .text.exit.*)				\
-		*(.text.startup .text.startup.*)			\
-		*(.text.unknown .text.unknown.*)			\
-		NOINSTR_TEXT						\
-		*(.text..refcount)					\
-		*(.ref.text)						\
-		*(.text.asan.* .text.tsan.*)				\
-	MEM_KEEP(init.text*)						\
-	MEM_KEEP(exit.text*)
-#else
 #define TEXT_TEXT							\
 		ALIGN_FUNCTION();					\
 		*(.text.hot .text.hot.*)				\
@@ -599,8 +582,7 @@
 		*(.ref.text)						\
 		*(.text.asan.* .text.tsan.*)				\
 	MEM_KEEP(init.text*)						\
-	MEM_KEEP(exit.text*)
-#endif
+	MEM_KEEP(exit.text*)						\
 
 
 /* sched.text is aling to function alignment to secure we have same
@@ -1028,24 +1010,12 @@
 	/* ld.bfd warns about .gnu.version* even when not emitted */	\
 	*(.gnu.version*)						\
 
-#ifdef CONFIG_UNIKERNEL_LINUX
-#define DISCARDS							\
-	/DISCARD/ : {							\
-	EXIT_DISCARDS							\
-	EXIT_CALL							\
-	COMMON_DISCARDS							\
-	*(.gnu.glibc-stub.*)						\
-	*(.gnu.warning.*)						\
-	*(__libc_subfreeres __libc_atexit)				\
-	}
-#else
 #define DISCARDS							\
 	/DISCARD/ : {							\
 	EXIT_DISCARDS							\
 	EXIT_CALL							\
 	COMMON_DISCARDS							\
 	}
-#endif
 
 /**
  * PERCPU_INPUT - the percpu input sections
