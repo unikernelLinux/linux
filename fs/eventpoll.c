@@ -987,7 +987,7 @@ static __poll_t event_item_poll(const struct ukl_event *event, poll_table *pt, s
 	__poll_t res;
 	pt->_key = event->events;
 	res = vfs_poll(tfile, pt);
-	return res & event->events;
+	return res;
 }
 static __poll_t ep_eventpoll_poll(struct file *file, poll_table *wait)
 {
@@ -1590,7 +1590,7 @@ allocate:
 /*
  * Must be called with "mtx" held.
  */
-static int event_insert(int fd, struct file *tfile, struct ukl_event *event)
+static __poll_t event_insert(int fd, struct file *tfile, struct ukl_event *event)
 {
 	__poll_t revents;
 	struct event_pqueue epq;
@@ -1607,7 +1607,7 @@ static int event_insert(int fd, struct file *tfile, struct ukl_event *event)
 
 	revents = event_item_poll(event, &epq.pt, tfile);
 
-	return 0;
+	return revents;
 
 
 
@@ -2233,33 +2233,41 @@ static inline int epoll_mutex_lock(struct mutex *mutex, int depth,
  */
 void *do_event_ctl(int fd, void *private)
 {
-	int error;
+	__poll_t error;
 	struct ukl_event *event;
 	struct fd tf;
-	//pr_warn("INVOKING EVENT_CTL\n");
+
 	if(!(event = kmalloc(sizeof(struct ukl_event), GFP_KERNEL))){
 		return NULL;
 	}
+
 	event->private = private;
 
 	/*  Get the "struct file *" for the target file */
 	tf = fdget(fd);
 	if (!tf.file)
-		return NULL;
+		goto out_free;
 
 	if(!file_can_poll(tf.file))
 	{
 		fdput(tf);
-		return NULL;
+		goto out_free;
 	}
-	/*We may need to manipulate locks at this point*/
 
+	/*We may need to manipulate locks at this point*/
 	error = event_insert(fd, tf.file, event);
+	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
+		// There was already data present on this socket, create an event for it
+		workitem_queue_add_event(private);
+	}
 
 	/*We may need to release locks here*/
 	fdput(tf);
 	return (void*)event;
 
+out_free:
+	kfree(event);
+	return NULL;
 
 }
 
