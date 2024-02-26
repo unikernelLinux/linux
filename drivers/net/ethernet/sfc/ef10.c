@@ -526,15 +526,11 @@ static int efx_ef10_probe(struct efx_nic *efx)
 {
 	struct efx_ef10_nic_data *nic_data;
 	int i, rc;
-	struct net_device *net_dev = efx->net_dev;
 
 	nic_data = kzalloc(sizeof(*nic_data), GFP_KERNEL);
 	if (!nic_data)
 		return -ENOMEM;
 	efx->nic_data = nic_data;
-
-	/* Use threaded NAPI instead of softIRQ */
-	dev_set_threaded(net_dev, true);
 
 	/* we assume later that we can copy from this buffer in dwords */
 	BUILD_BUG_ON(MCDI_CTL_SDU_LEN_MAX_V2 % 4);
