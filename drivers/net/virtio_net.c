@@ -3909,8 +3909,6 @@ static int virtnet_probe(struct virtio_device *vdev)
 	dev->ethtool_ops = &virtnet_ethtool_ops;
 	SET_NETDEV_DEV(dev, &vdev->dev);
 
-	dev_set_threaded(dev, true);
-
 	/* Do we support "hardware" checksums? */
 	if (virtio_has_feature(vdev, VIRTIO_NET_F_CSUM)) {
 		/* This opens up the world of extra features. */
