@@ -52,7 +52,9 @@ struct task_struct *ukl_task;
 
 void register_ukl_handler_task(void)
 {
+	enter_ukl_kernel();
 	ukl_task = current;
+	enter_ukl_user();
 }
 
 extern void ukl_state_u2k(void);
@@ -65,6 +67,7 @@ void ukl_worker_sleep(void)
 	// for a task to "sleep".
 	
 	//ukl_state_u2k();
+	enter_ukl_kernel();
 
 	// The block here is for the stack allocation of flags and to ensure
 	// that it is popped before we call ukl_state_k2u
@@ -80,6 +83,8 @@ void ukl_worker_sleep(void)
 	// Schedule is outside the block with flags because we don't know where
 	// we will be running when we return
 	schedule();
+
+	enter_ukl_user();
 
 	//ukl_state_k2u();
 }
@@ -98,31 +103,39 @@ struct event_workitem_queue *ewq;
 
 void init_event_workitem_queue(void)
 {
+	enter_ukl_kernel();
+
         ewq = kmalloc(sizeof(struct event_workitem_queue), GFP_KERNEL);
 	spin_lock_init(&ewq->queue_lock);
         INIT_LIST_HEAD(&ewq->work_item_head);
+
+	enter_ukl_user();
 }
 void workitem_queue_add_event(void *private)
 {
 	unsigned long flags;
         struct event_work_item *evi = kmalloc(sizeof(struct event_work_item), GFP_ATOMIC);
-	pr_warn("Adding UKL event\n");
+	//pr_warn("Adding UKL event\n");
         evi->data = private;
         spin_lock_irqsave(&ewq->queue_lock, flags);
         list_add_tail(&evi->work_item_head, &ewq->work_item_head);
         spin_unlock_irqrestore(&ewq->queue_lock, flags);
-	pr_warn("Added event\n");
+	//pr_warn("Added event\n");
 }
 
 struct event_work_item* workitem_queue_consume_event(void)
 {
-	void *value;
+	void *value = NULL;
 	unsigned long flags;
-        struct event_work_item *evi = list_first_entry_or_null(&ewq->work_item_head, struct event_work_item,
+        struct event_work_item *evi;
+
+	enter_ukl_kernel();
+
+        evi = list_first_entry_or_null(&ewq->work_item_head, struct event_work_item,
                 work_item_head);
 	pr_warn("Retrieving UKL event\n");
 	if (!evi)
-		return NULL;
+		goto out;
 
 	value = evi->data;
         spin_lock_irqsave(&ewq->queue_lock, flags);
@@ -130,6 +143,8 @@ struct event_work_item* workitem_queue_consume_event(void)
         spin_unlock_irqrestore(&ewq->queue_lock, flags);
 	kfree(evi);
 	pr_warn("Returning event\n");
+out:
+	enter_ukl_user();
         return value;
 }
 
@@ -144,9 +159,12 @@ int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, v
          */
 
         int ret = 0;
-        struct ukl_event *ukl_handler = container_of(wq_entry, struct ukl_event, wait);
+        struct ukl_event *ukl_handler;
+	pr_warn("In redis_handler\n");
+        ukl_handler = container_of(wq_entry, struct ukl_event, wait);
 
         /* Assuming the event_workitem_queue is already initialized*/
+	pr_warn("Adding Event to queue\n");
         workitem_queue_add_event(ukl_handler->private);
         /* Pick a worker thread*/
 	pr_warn("Waking UKL event handler thread\n");
@@ -1376,7 +1394,7 @@ static void event_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 	struct event_pqueue *epq = container_of(pt, struct event_pqueue, pt);
 	struct ukl_event *event = epq->event;
 	event->whead = whead;
-	init_waitqueue_func_task_entry(&event->wait, redis_handler, current);
+	init_waitqueue_func_entry(&event->wait, redis_handler);
 	add_wait_queue(whead, &event->wait);
 
 	return;
