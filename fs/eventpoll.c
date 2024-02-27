@@ -2277,6 +2277,7 @@ void *do_event_ctl(int fd, void *private)
 	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
 		// There was already data present on this socket, create an event for it
 		workitem_queue_add_event(private);
+		wake_up_process(ukl_task);
 	}
 
 	/*We may need to release locks here*/
