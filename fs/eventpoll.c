@@ -133,7 +133,7 @@ struct event_work_item* workitem_queue_consume_event(void)
 
         evi = list_first_entry_or_null(&ewq->work_item_head, struct event_work_item,
                 work_item_head);
-	pr_warn("Retrieving UKL event\n");
+	//pr_warn("Retrieving UKL event\n");
 	if (!evi)
 		goto out;
 
@@ -142,7 +142,7 @@ struct event_work_item* workitem_queue_consume_event(void)
         __list_del_entry(&evi->work_item_head);
         spin_unlock_irqrestore(&ewq->queue_lock, flags);
 	kfree(evi);
-	pr_warn("Returning event\n");
+	//pr_warn("Returning event\n");
 out:
 	enter_ukl_user();
         return value;
@@ -160,16 +160,16 @@ int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, v
 
         int ret = 0;
         struct ukl_event *ukl_handler;
-	pr_warn("In redis_handler\n");
+	//pr_warn("In redis_handler\n");
         ukl_handler = container_of(wq_entry, struct ukl_event, wait);
 
         /* Assuming the event_workitem_queue is already initialized*/
-	pr_warn("Adding Event to queue\n");
+	//pr_warn("Adding Event to queue\n");
         workitem_queue_add_event(ukl_handler->private);
         /* Pick a worker thread*/
-	pr_warn("Waking UKL event handler thread\n");
+	//pr_warn("Waking UKL event handler thread\n");
 	wake_up_process(ukl_task);
-	pr_warn("Woken\n");
+	//pr_warn("Woken\n");
 
         return ret;
 }
