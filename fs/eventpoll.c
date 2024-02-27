@@ -40,6 +40,9 @@
 #include <net/busy_poll.h>
 #include <asm/mmu_context.h>
 
+#include <linux/sched.h>
+#include <uapi/linux/sched/types.h>
+
 struct ukl_event{
 	void *private;
 	void *work_data;
@@ -52,7 +55,12 @@ struct task_struct *ukl_task;
 
 void register_ukl_handler_task(void)
 {
+	struct sched_param params;
 	enter_ukl_kernel();
+	params.sched_priority = 99;
+	if (sched_setscheduler_nocheck(current, SCHED_RR, &params)) {
+		pr_warn("Failed to change scheduler policy to SCHED_RR.\n");
+	}
 	ukl_task = current;
 	enter_ukl_user();
 }
