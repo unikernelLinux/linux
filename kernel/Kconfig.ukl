@@ -23,7 +23,7 @@ config UKL_TLS
 config UKL_NAME
 	string "UKL Exec target"
 	depends on UNIKERNEL_LINUX
-	default "/UKL"
+	default "/data/UKL"
 	help
 	    We need a way to trigger the start of the UKL application,
 	    either by the kernel inplace of init or userspace when setup

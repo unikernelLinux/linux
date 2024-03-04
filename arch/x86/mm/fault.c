@@ -1239,22 +1239,25 @@ void do_user_addr_fault(struct pt_regs *regs,
 
 	tsk = current;
 	mm = tsk->mm;
-
-	if (unlikely((error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR)) {
-		/*
-		 * Whoops, this is kernel mode code trying to execute from
-		 * user memory.  Unless this is AMD erratum #93, which
-		 * corrupts RIP such that it looks like a user address,
-		 * this is unrecoverable.  Don't even try to look up the
-		 * VMA or look for extable entries.
-		 */
-		if (is_errata93(regs, address))
+	
+	print_ukl("UKL page fault for pid %d at 0x%lx",tsk->pid,address);
+	if (!is_ukl_thread()) {	
+		if (unlikely((error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR)) {
+			print_ukl("\tkernel is running user code");
+			/*
+			 * Whoops, this is kernel mode code trying to execute from
+			 * user memory.  Unless this is AMD erratum #93, which
+			 * corrupts RIP such that it looks like a user address,
+			 * this is unrecoverable.  Don't even try to look up the
+			 * VMA or look for extable entries.
+			 */
+			if (is_errata93(regs, address))
+				return;
+			
+			page_fault_oops(regs, error_code, address);
 			return;
-
-		page_fault_oops(regs, error_code, address);
-		return;
+		}
 	}
-
 	/* kprobes don't want to hook the spurious faults: */
 	if (WARN_ON_ONCE(kprobe_page_fault(regs, X86_TRAP_PF)))
 		return;
@@ -1273,15 +1276,21 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 * SMAP and will have the USER bit set so, in all cases, SMAP
 	 * enforcement appears to be consistent with the USER bit.
 	 */
-	if (unlikely(cpu_feature_enabled(X86_FEATURE_SMAP) &&
-		     !(error_code & X86_PF_USER) &&
-		     !(regs->flags & X86_EFLAGS_AC))) {
-		/*
-		 * No extable entry here.  This was a kernel access to an
-		 * invalid pointer.  get_kernel_nofault() will not get here.
-		 */
-		page_fault_oops(regs, error_code, address);
-		return;
+	if (!is_ukl_thread()) {
+		print_ukl("\tNot recognized as UKL thread");
+		if (cpu_feature_enabled(X86_FEATURE_SMAP) &&
+			     !(error_code & X86_PF_USER) &&
+			     !(regs->flags & X86_EFLAGS_AC)) {
+			/*
+			 * No extable entry here.  This was a kernel access to an
+			 * invalid pointer.  get_kernel_nofault() will not get here.
+			 */
+			print_ukl("\tSMAP triggered");
+			page_fault_oops(regs, error_code, address);
+			return;
+		}
+	} else {
+		print_ukl("\tRecognized as UKL thread");
 	}
 
 	/*
@@ -1328,6 +1337,7 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 * to consider the PF_PK bit.
 	 */
 	if (is_vsyscall_vaddr(address)) {
+		print_ukl("\tEmulating vsyscall");
 		if (emulate_vsyscall(error_code, regs, address))
 			return;
 	}
@@ -1348,16 +1358,19 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 * 2. The access did not originate in userspace.
 	 */
 	if (unlikely(!mmap_read_trylock(mm))) {
+		printk("\tfailed to acquire mm lock");
 		if (!user_mode(regs) &&	!search_exception_tables(regs->ip) &&
 				!is_ukl_thread()) {
 			/*
 			 * Fault from code in kernel from
 			 * which we do not expect faults.
 			 */
+			printk("\tfault from code in kernel from which we do not expect faults");
 			bad_area_nosemaphore(regs, error_code, address);
 			return;
 		}
 retry:
+		printk("\tgonna try this mm lock one more time");
 		mmap_read_lock(mm);
 	} else {
 		/*
@@ -1367,7 +1380,6 @@ retry:
 		 */
 		might_sleep();
 	}
-
 	vma = find_vma(mm, address);
 	if (unlikely(!vma)) {
 		bad_area(regs, error_code, address);
@@ -1389,6 +1401,7 @@ retry:
 	 * we can handle it..
 	 */
 good_area:
+	print_ukl("\thandling the page fault! All is good and great");
 	if (unlikely(access_error(error_code, vma))) {
 		bad_area_access_error(regs, error_code, address, vma);
 		return;

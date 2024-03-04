@@ -602,6 +602,8 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 	unsigned long total_size;
 	int i;
 
+	print_ukl("loading ukl ELF binary");
+
 	/* First of all, some simple consistency checks */
 	if (interp_elf_ex->e_type != ET_EXEC &&
 	    interp_elf_ex->e_type != ET_DYN)
@@ -620,6 +622,7 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 	}
 
 	eppnt = interp_elf_phdata;
+	print_ukl("\tmapping interpreter into mem");
 	for (i = 0; i < interp_elf_ex->e_phnum; i++, eppnt++) {
 		if (eppnt->p_type == PT_LOAD) {
 			int elf_type = MAP_PRIVATE;
@@ -634,6 +637,7 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 			else if (no_base && interp_elf_ex->e_type == ET_DYN)
 				load_addr = -vaddr;
 
+			print_ukl("\t\t(0x%lx:0x%lx): prot 0x%x, type %d, len 0x%lx",load_addr,vaddr,elf_prot,elf_type,total_size);
 			map_addr = elf_map(interpreter, load_addr + vaddr,
 					eppnt, elf_prot, elf_type, total_size);
 			total_size = 0;
@@ -821,7 +825,7 @@ static int parse_elf_properties(struct file *f, const struct elf_phdr *phdr,
 }
 
 static int load_elf_binary(struct linux_binprm *bprm)
-{
+{	
 	struct file *interpreter = NULL; /* to shut gcc up */
 	unsigned long load_bias = 0, phdr_addr = 0;
 	int first_pt_load = 1;
@@ -844,10 +848,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	struct pt_regs *regs;
 
 	retval = -ENOEXEC;
-
-	if (is_ukl_thread())
-		goto UKL_SKIP_READING_ELF;
-
+	
 	/* First of all, some simple consistency checks */
 	if (memcmp(elf_ex->e_ident, ELFMAG, SELFMAG) != 0)
 		goto out;
@@ -1001,7 +1002,6 @@ out_free_interp:
 	if (retval)
 		goto out_free_dentry;
 
-UKL_SKIP_READING_ELF:
 	/* Flush all traces of the currently running executable */
 	retval = begin_new_exec(bprm);
 	if (retval)
@@ -1033,17 +1033,7 @@ UKL_SKIP_READING_ELF:
 	start_data = 0;
 	end_data = 0;
 
-	if (is_ukl_thread()) {
-		/*
-		 * load_bias needs to ensure that we push the heap start
-		 * past the end of the executable, but in this case, it is
-		 * already mapped with the kernel text.  So we select an
-		 * address that is "high enough"
-		 */
-		load_bias = 0x405000;
-		goto UKL_SKIP_LOADING_ELF;
-	}
-
+	print_ukl("\tmapping ukl app itself into mem");
 	/* Now we do a little grungy work by mmapping the ELF image into
 	   the correct location in memory. */
 	for(i = 0, elf_ppnt = elf_phdata;
@@ -1177,7 +1167,7 @@ UKL_SKIP_READING_ELF:
 				goto out_free_dentry;
 			}
 		}
-
+		print_ukl("\t\t(%lx:%lx): prot %x, type %d",load_bias,vaddr,elf_prot,elf_flags);
 		error = elf_map(bprm->file, load_bias + vaddr, elf_ppnt,
 				elf_prot, elf_flags, total_size);
 		if (BAD_ADDR(error)) {
@@ -1239,7 +1229,6 @@ UKL_SKIP_READING_ELF:
 		}
 	}
 
-UKL_SKIP_LOADING_ELF:
 	e_entry = elf_ex->e_entry + load_bias;
 	phdr_addr += load_bias;
 	elf_bss += load_bias;
@@ -1260,16 +1249,6 @@ UKL_SKIP_LOADING_ELF:
 	if (likely(elf_bss != elf_brk) && unlikely(padzero(elf_bss))) {
 		retval = -EFAULT; /* Nobody gets to see this, but.. */
 		goto out_free_dentry;
-	}
-
-	if (is_ukl_thread()) {
-		/*
-		 * We know that this symbol exists and that it is the entry
-		 * point for the linked application.
-		 */
-		void (*ukl__start)(void) = NULL;
-		elf_entry = (unsigned long) ukl__start;
-		goto UKL_SKIP_FINDING_ELF_ENTRY;
 	}
 
 	if (interpreter) {
@@ -1309,7 +1288,6 @@ UKL_SKIP_LOADING_ELF:
 
 	set_binfmt(&elf_format);
 
-UKL_SKIP_FINDING_ELF_ENTRY:
 #ifdef ARCH_HAS_SETUP_ADDITIONAL_PAGES
 	retval = ARCH_SETUP_ADDITIONAL_PAGES(bprm, elf_ex, !!interpreter);
 	if (retval < 0)
@@ -1372,6 +1350,7 @@ UKL_SKIP_FINDING_ELF_ENTRY:
 #endif
 
 	finalize_exec(bprm);
+	print_ukl("\tUKL thread has entry point %lx",elf_entry);
 	START_THREAD(elf_ex, regs, elf_entry, bprm->p);
 	retval = 0;
 out:
