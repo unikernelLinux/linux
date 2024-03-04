@@ -156,6 +156,9 @@ out:
         return value;
 }
 
+size_t redis_wake_count;
+size_t redis_wake_time;
+
 int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
 {
         /*
@@ -176,7 +179,9 @@ int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, v
         workitem_queue_add_event(ukl_handler->private);
         /* Pick a worker thread*/
 	//pr_warn("Waking UKL event handler thread\n");
+	redis_wake_time = ktime_get_ns();
 	wake_up_process(ukl_task);
+	redis_wake_count++;
 	//pr_warn("Woken\n");
 
         return ret;
