@@ -62,6 +62,7 @@ void register_ukl_handler_task(void)
 		pr_warn("Failed to change scheduler policy to SCHED_RR.\n");
 	}
 	ukl_task = current;
+	pr_warn("Worker pid %d\n", current->pid);
 	enter_ukl_user();
 }
 
