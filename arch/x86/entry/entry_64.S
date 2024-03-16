@@ -266,13 +266,14 @@ SYM_CODE_START(ukl_state_u2k)
 	 * the kernel stack for the return.
 	 */
 	UNWIND_HINT_EMPTY
+	cli
 
-	// cache rax and use is as scratch space
+	// cache rax and use it as scratch space
 	pushq	%rax
 	call	enter_ukl_kernel
 
-	// The return address from our caller should be 16 bytes higher than rsp
-	movq	16(%rsp), %rax
+	// The return address from our caller should be 8 bytes higher than rsp
+	movq	8(%rsp), %rax
 	// Now use tss.sp2 as scratch to swap stacks
 	movq	%rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
 	SWITCH_TO_KERNEL_CR3 scratch_reg=%rsp
@@ -288,18 +289,23 @@ SYM_CODE_START(ukl_state_u2k)
 	// restore %rax from the user stack
 	pushq	%rdx
 	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2), %rdx
-	movq	8(%rdx), %rax
+	movq	(%rdx), %rax
 	// We need to remove the cached %rax and return address from the user stack,
 	// %rax has been restored and we will patch in a new return address in
 	// ukl_state_k2u
 	addq	$16, %rdx
-	movq	%rdx, 32(%rsp)
+	movq	%rdx, 24(%rsp)
 	popq	%rdx
 	popfq
+	sti
 	retq
 SYM_CODE_END(ukl_state_u2k)
 
 SYM_CODE_START(ukl_state_k2u)
+
+	UNWIND_HINT_EMPTY
+	cli
+
 	/*
 	 * When we get here, the ret address is at %rsp + 8 and the user stack
 	 * address is %rsp + 16 otherwise we have problems.
@@ -308,20 +314,21 @@ SYM_CODE_START(ukl_state_k2u)
 	call enter_ukl_user
 
 	// Recover the user stack address
-	movq	24(%rsp), %rax
+	movq	16(%rsp), %rax
 	movq	%rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
 	movq	%rax, %rsp
 	pushq	%rdi
 	movq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2), %rdi
 	// Write return address to scratch space
-	movq	16(%rdi), %rax
+	movq	8(%rdi), %rax
 	movq	%rax, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
 	// Restore rax
-	movq	8(%rdi), %rax
+	movq	(%rdi), %rax
 	SWITCH_TO_USER_CR3_STACK scratch_reg=%rdi
 	popq	%rdi
 	// Put the correct return address on the stack and return
 	pushq	PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+	sti
 	retq
 SYM_CODE_END(ukl_state_k2u)
 
