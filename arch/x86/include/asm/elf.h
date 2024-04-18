@@ -153,6 +153,8 @@ do {						\
 	(elf_check_arch_ia32(x) ||					\
 	 (IS_ENABLED(CONFIG_X86_X32_ABI) && (x)->e_machine == EM_X86_64))
 
+extern void (*ukl_entry_SYSCALL_64)(void);
+
 static inline void elf_common_init(struct thread_struct *t,
 				   struct pt_regs *regs, const u16 ds)
 {
@@ -165,6 +167,11 @@ static inline void elf_common_init(struct thread_struct *t,
 		t->fsbase = t->gsbase = 0;
 		t->fsindex = t->gsindex = 0;
 		t->ds = t->es = ds;
+	} else {
+		/* so ld.so can relocate itself */
+		print_ukl("ukl_entry_SYSCALL_64 == %lx",(unsigned long int)ukl_entry_SYSCALL_64);
+		print_ukl("&ukl_entry_SYSCALL_64 == %lx",(unsigned long int)&ukl_entry_SYSCALL_64);
+		regs->r15 = (unsigned long int) &ukl_entry_SYSCALL_64;
 	}
 }
 
