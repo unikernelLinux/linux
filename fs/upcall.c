@@ -103,7 +103,6 @@ void register_ukl_handler_task(void)
 	enter_ukl_kernel();
 	local_irq_save(flags);
 	handler = this_cpu_ptr(&pcpu_upcall);
-	pr_warn("Setting up handler for cpu %u\n", smp_processor_id());
 
 	// Setup the work queue and lock
 	INIT_LIST_HEAD(&handler->work_item_head);
