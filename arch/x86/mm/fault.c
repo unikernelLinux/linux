@@ -1240,10 +1240,8 @@ void do_user_addr_fault(struct pt_regs *regs,
 	tsk = current;
 	mm = tsk->mm;
 	
-	print_ukl("UKL page fault for pid %d at 0x%lx",tsk->pid,address);
 	if (!is_ukl_thread()) {	
 		if (unlikely((error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR)) {
-			print_ukl("\tkernel is running user code");
 			/*
 			 * Whoops, this is kernel mode code trying to execute from
 			 * user memory.  Unless this is AMD erratum #93, which
@@ -1277,7 +1275,6 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 * enforcement appears to be consistent with the USER bit.
 	 */
 	if (!is_ukl_thread()) {
-		print_ukl("\tNot recognized as UKL thread");
 		if (cpu_feature_enabled(X86_FEATURE_SMAP) &&
 			     !(error_code & X86_PF_USER) &&
 			     !(regs->flags & X86_EFLAGS_AC)) {
@@ -1285,12 +1282,10 @@ void do_user_addr_fault(struct pt_regs *regs,
 			 * No extable entry here.  This was a kernel access to an
 			 * invalid pointer.  get_kernel_nofault() will not get here.
 			 */
-			print_ukl("\tSMAP triggered");
 			page_fault_oops(regs, error_code, address);
 			return;
 		}
 	} else {
-		print_ukl("\tRecognized as UKL thread");
 	}
 
 	/*
@@ -1337,7 +1332,6 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 * to consider the PF_PK bit.
 	 */
 	if (is_vsyscall_vaddr(address)) {
-		print_ukl("\tEmulating vsyscall");
 		if (emulate_vsyscall(error_code, regs, address))
 			return;
 	}
@@ -1401,7 +1395,6 @@ retry:
 	 * we can handle it..
 	 */
 good_area:
-	print_ukl("\thandling the page fault! All is good and great");
 	if (unlikely(access_error(error_code, vma))) {
 		bad_area_access_error(regs, error_code, address, vma);
 		return;

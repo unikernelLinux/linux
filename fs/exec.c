@@ -1885,7 +1885,7 @@ out_unmark:
 #ifdef CONFIG_UNIKERNEL_LINUX
 static void check_ukl_exec(const char *name)
 {
-	if (!strcmp(name, CONFIG_UKL_NAME)) {
+	if (!strncmp(name,"/data",5)) {
 		pr_debug("In PID %d and current->ukl_thread is %d\nGoing to create UKL here.\n",
 				current->pid, is_ukl_thread());
 		enter_ukl_kernel();

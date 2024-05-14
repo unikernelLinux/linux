@@ -169,8 +169,6 @@ static inline void elf_common_init(struct thread_struct *t,
 		t->ds = t->es = ds;
 	} else {
 		/* so ld.so can relocate itself */
-		print_ukl("ukl_entry_SYSCALL_64 == %lx",(unsigned long int)ukl_entry_SYSCALL_64);
-		print_ukl("&ukl_entry_SYSCALL_64 == %lx",(unsigned long int)&ukl_entry_SYSCALL_64);
 		regs->r15 = (unsigned long int) &ukl_entry_SYSCALL_64;
 	}
 }
