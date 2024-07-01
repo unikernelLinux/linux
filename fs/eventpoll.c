@@ -1762,10 +1762,11 @@ size_t redis_wake_time;
 static int ep_autoremove_wake_function(struct wait_queue_entry *wq_entry,
 				       unsigned int mode, int sync, void *key)
 {
+	int ret;
 	struct task_struct *tsk = (struct task_struct *)wq_entry->private;
 	if (tsk->ukl_thread)
 		redis_wake_time = ktime_get_ns();
-	int ret = default_wake_function(wq_entry, mode, sync, key);
+	ret = default_wake_function(wq_entry, mode, sync, key);
 	if (tsk->ukl_thread && ret)
 		redis_wake_count++;
 
