@@ -236,9 +236,7 @@ extern void ukl_ss_k2u(void);
 	long ukl_bp##name(__MAP(x,__SC_DECL,__VA_ARGS__))		\
 	{								\
 		long ret;						\
-		ukl_ss_u2k();						\
 		ret = __do_sys##name(__MAP(x,__SC_CAST,__VA_ARGS__));	\
-		ukl_ss_k2u();						\
 		return ret;						\
 	}								\
 	static long __se_sys##name(__MAP(x,__SC_LONG,__VA_ARGS__))	\
@@ -265,9 +263,7 @@ extern void ukl_ss_k2u(void);
 	long ukl_bp_##sname(void)					\
 	{								\
 		long ret;						\
-		ukl_ss_u2k();						\
 		ret = __do_sys_##sname(NULL);				\
-		ukl_ss_k2u();						\
 		return ret;						\
 	}								\
 	static long __do_sys_##sname(const struct pt_regs *__unused)

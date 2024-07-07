@@ -153,6 +153,7 @@ do {						\
 	(elf_check_arch_ia32(x) ||					\
 	 (IS_ENABLED(CONFIG_X86_X32_ABI) && (x)->e_machine == EM_X86_64))
 
+
 static inline void elf_common_init(struct thread_struct *t,
 				   struct pt_regs *regs, const u16 ds)
 {
@@ -166,6 +167,17 @@ static inline void elf_common_init(struct thread_struct *t,
 		t->fsindex = t->gsindex = 0;
 		t->ds = t->es = ds;
 	}
+#ifdef CONFIG_UNIKERNEL_LINUX
+	else {
+		/* UKL's ld.so expects us to initalize $r15 to
+		 * &ukl_entry_SYSCALL_64 so that it can make system
+		 * calls under the UKL syscall ABI without depending on a 
+		 * PLT entry
+		 */
+		extern void (*ukl_entry_SYSCALL_64)(void);
+		regs->r15 = (unsigned long int) &ukl_entry_SYSCALL_64;
+	}
+#endif
 }
 
 #define ELF_PLAT_INIT(_r, load_addr)			\

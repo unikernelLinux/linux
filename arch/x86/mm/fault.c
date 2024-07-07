@@ -1240,7 +1240,7 @@ void do_user_addr_fault(struct pt_regs *regs,
 	tsk = current;
 	mm = tsk->mm;
 
-	if (unlikely((error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR)) {
+	if (unlikely((error_code & (X86_PF_USER | X86_PF_INSTR)) == X86_PF_INSTR && !is_ukl_thread())) {
 		/*
 		 * Whoops, this is kernel mode code trying to execute from
 		 * user memory.  Unless this is AMD erratum #93, which
@@ -1254,7 +1254,6 @@ void do_user_addr_fault(struct pt_regs *regs,
 		page_fault_oops(regs, error_code, address);
 		return;
 	}
-
 	/* kprobes don't want to hook the spurious faults: */
 	if (WARN_ON_ONCE(kprobe_page_fault(regs, X86_TRAP_PF)))
 		return;

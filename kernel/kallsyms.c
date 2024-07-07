@@ -283,6 +283,9 @@ unsigned long kallsyms_lookup_name(const char *name)
 
 	return module_kallsyms_lookup_name(name);
 }
+#ifdef CONFIG_UNIKERNEL_LINUX
+EXPORT_SYMBOL(kallsyms_lookup_name);
+#endif
 
 /*
  * Iterate over all symbols in vmlinux.  For symbols from modules use

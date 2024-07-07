@@ -456,6 +456,7 @@ struct pi_entry {
 #define printk_deferred(fmt, ...)					\
 	printk_index_wrap(_printk_deferred, fmt, ##__VA_ARGS__)
 
+#define print_ukl(fmt, ...) do {if (is_ukl_thread()) printk(fmt, ##__VA_ARGS__);} while(0);
 /**
  * pr_emerg - Print an emergency-level message
  * @fmt: format string
