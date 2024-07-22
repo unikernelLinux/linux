@@ -46,7 +46,12 @@ struct event_handler
 	spinlock_t			work_lock;
 };
 
-static DEFINE_PER_CPU(struct *event_handler, pcpu_upcall);
+struct pcpu_handler
+{
+	struct event_handler *handler;
+};
+
+static DEFINE_PER_CPU(struct pcpu_handler, pcpu_upcall);
 
 extern void ukl_state_u2k(void);
 extern void ukl_state_k2u(void);
@@ -69,10 +74,10 @@ void ukl_worker_sleep(void)
 		struct event_handler *handler;
 
 		local_irq_save(flags);
-		handler = this_cpu_read(&pcpu_upcall);
+		handler = this_cpu_ptr(&pcpu_upcall)->handler;
 		set_current_state(TASK_IDLE);
 		spin_lock(&handler->tasks_lock);
-		list_add_tail(&current->event_handlers, &handlers->idle_tasks);
+		list_add_tail(&current->event_handlers, &handler->idle_tasks);
 		spin_unlock(&handler->tasks_lock);
 		local_irq_restore(flags);
 	}
@@ -108,7 +113,7 @@ void init_upcall_handler(int concurrency_model)
 {
 	int i;
 	int j;
-	struct event_handler **handler;
+	struct pcpu_handler *container;
 	struct event_handler *mine;
 	unsigned long flags;
 
@@ -116,24 +121,24 @@ void init_upcall_handler(int concurrency_model)
 	case UPCALL_PCPU:
 		local_irq_save(flags);
 		for_each_online_cpu(i) {
-			handler = per_cpu_ptr(&pcpu_upcall, i);
-			*handler = create_handler();
+			container = per_cpu_ptr(&pcpu_upcall, i);
+			container->handler = create_handler();
 		}
 		local_irq_restore(flags);
 		break;
 	case UPCALL_PCACHE:
 		local_irq_save(flags);
 		for_each_online_cpu(i) {
-			handler = per_cpu_ptr(&pcpu_upcall, i);
-			if (*handler) // We already have one set
+			container = per_cpu_ptr(&pcpu_upcall, i);
+			if (container->handler) // We already have one set
 				continue;
 			mine = create_handler();
-			*handler = mine;
+			container->handler = mine;
 			for_each_cpu(j, topology_cluster_cpumask(i)) {
 				if (i == j)
 					continue;
-				handler = per_cpu_ptr(&pcpu_upcall, j);
-				*handler = mine;
+				container = per_cpu_ptr(&pcpu_upcall, j);
+				container->handler = mine;
 			}
 		}
 		local_irq_restore(flags);
@@ -142,8 +147,8 @@ void init_upcall_handler(int concurrency_model)
 		mine = create_handler();
 		local_irq_save(flags);
 		for_each_online_cpu(i) {
-			handler = per_cpu_ptr(&pcpu_upcall, i);
-			*handler = mine;
+			container = per_cpu_ptr(&pcpu_upcall, i);
+			container->handler = mine;
 		}
 		local_irq_restore(flags);
 		break;
@@ -164,7 +169,7 @@ void register_ukl_handler_task(void)
 
 	enter_ukl_kernel();
 	local_irq_save(flags);
-	handler = this_cpu_read(&pcpu_upcall);
+	handler = this_cpu_ptr(&pcpu_upcall)->handler;
 
 	// Set scheduler and cpu for handler task
 	params.sched_priority = 99;
@@ -193,12 +198,12 @@ void* workitem_queue_consume_event(void)
 	enter_ukl_kernel();
 
 	local_irq_save(flags);
-	handler = this_cpu_read(&pcpu_upcall);
+	handler = this_cpu_ptr(&pcpu_upcall)->handler;
 	spin_lock(&handler->work_lock);
 	evi = list_first_entry_or_null(&handler->work_item_head, struct event_work_item,
 			work_item_head);
 	if (!evi) {
-		spin_unlockirq_restore(&handler->work_lock, flags);
+		spin_unlock_irqrestore(&handler->work_lock, flags);
 		goto out;
 	}
 
@@ -234,7 +239,7 @@ void upcall_handler(void *private)
 	struct task_struct *thread = NULL;
 
 	local_irq_save(flags);
-	handler = this_cpu_read(&pcpu_upcall);
+	handler = this_cpu_ptr(&pcpu_upcall)->handler;
 
 	if (!handler) {
 		pr_err("Can't read pcpu handler pointer\n");
@@ -247,7 +252,7 @@ void upcall_handler(void *private)
 	// Check if there is an idle handler and wake it. If there are no handlers idle,
 	// the next one to finish its work will take up this new task.
 	if (!list_empty(&handler->idle_tasks)) {
-		thread = container_of(handler->idle_tasks->next, struct task_struct, event_handlers);
+		thread = container_of(handler->idle_tasks.next, struct task_struct, event_handlers);
 		list_del(&thread->event_handlers);
 	}
 	spin_unlock(&handler->tasks_lock);
