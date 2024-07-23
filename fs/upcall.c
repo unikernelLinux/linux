@@ -164,12 +164,14 @@ void init_upcall_handler(int concurrency_model)
 void register_ukl_handler_task(void)
 {
 	struct sched_param params;
+	struct pcpu_handler *container;
 	struct event_handler *handler;
 	unsigned long flags;
 
 	enter_ukl_kernel();
 	local_irq_save(flags);
-	handler = this_cpu_ptr(&pcpu_upcall)->handler;
+	container = this_cpu_ptr(&pcpu_upcall);
+	handler = container->handler;
 
 	// Set scheduler and cpu for handler task
 	params.sched_priority = 99;
@@ -193,12 +195,14 @@ void* workitem_queue_consume_event(void)
 	void *value = NULL;
 	unsigned long flags;
 	struct event_work_item *evi;
+	struct pcpu_handler *container;
 	struct event_handler *handler;
 
 	enter_ukl_kernel();
 
 	local_irq_save(flags);
-	handler = this_cpu_ptr(&pcpu_upcall)->handler;
+	container = this_cpu_ptr(&pcpu_upcall);
+	handler = container->handler;
 	spin_lock(&handler->work_lock);
 	evi = list_first_entry_or_null(&handler->work_item_head, struct event_work_item,
 			work_item_head);
@@ -207,7 +211,7 @@ void* workitem_queue_consume_event(void)
 		goto out;
 	}
 
-	__list_del_entry(&handler->work_item_head);
+	list_del(&evi->work_item_head);
 	spin_unlock_irqrestore(&handler->work_lock, flags);
 	value = evi->data;
 	kfree(evi);
@@ -236,10 +240,12 @@ void upcall_handler(void *private)
 {
 	unsigned long flags;
 	struct event_handler *handler;
+	struct pcpu_handler *container;
 	struct task_struct *thread = NULL;
 
 	local_irq_save(flags);
-	handler = this_cpu_ptr(&pcpu_upcall)->handler;
+	container = this_cpu_ptr(&pcpu_upcall);
+	handler = container->handler;
 
 	if (!handler) {
 		pr_err("Can't read pcpu handler pointer\n");
