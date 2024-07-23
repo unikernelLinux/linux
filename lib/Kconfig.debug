@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: GPL-2.0-only
 menu "Kernel hacking"
 
+config TSC_LOGGER
+	tristate "Enable TSC logging facility"
+	default n
+	depends on X86_64
+	select PROC_FS
+	help
+	  The TSC logger is a facility for logging TSC values with little
+	  overhead. It provides the values in a proc file called tsc_log.
+
 menu "printk and dmesg options"
 
 config PRINTK_TIME

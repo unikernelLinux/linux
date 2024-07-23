@@ -40,6 +40,8 @@
 #include <net/busy_poll.h>
 #include <asm/mmu_context.h>
 
+#include <linux/tsc_logger.h>
+
 #include <linux/sched.h>
 #include <uapi/linux/sched/types.h>
 
@@ -51,137 +53,15 @@ struct ukl_event{
 	wait_queue_head_t *whead;
 };
 
-struct task_struct *ukl_task;
-
-void register_ukl_handler_task(void)
-{
-	struct sched_param params;
-	enter_ukl_kernel();
-	params.sched_priority = 99;
-	if (sched_setscheduler_nocheck(current, SCHED_RR, &params)) {
-		pr_warn("Failed to change scheduler policy to SCHED_RR.\n");
-	}
-	ukl_task = current;
-	pr_warn("Worker pid %d\n", current->pid);
-	enter_ukl_user();
-}
-
-extern void ukl_state_u2k(void);
-extern void ukl_state_k2u(void);
-
-void ukl_worker_sleep(void)
-{
-	// This function is intended to be called from a user space thread that
-	// was created to handle events. AFAICT this is the most efficient way
-	// for a task to "sleep".
-	
-	//ukl_state_u2k();
-	enter_ukl_kernel();
-
-	// The block here is for the stack allocation of flags and to ensure
-	// that it is popped before we call ukl_state_k2u
-	{
-		// There are no events to handle at the moment, mark ourselves
-		// idle and go to sleep
-		unsigned long flags;
-		local_irq_save(flags);
-		set_current_state(TASK_IDLE);
-		local_irq_restore(flags);
-	}
-
-	// Schedule is outside the block with flags because we don't know where
-	// we will be running when we return
-	schedule();
-
-	enter_ukl_user();
-
-	//ukl_state_k2u();
-}
-
-
-struct event_work_item{
-        void *data;
-        struct list_head work_item_head;
-};
-struct event_workitem_queue{
-        spinlock_t queue_lock;
-        struct list_head work_item_head;
-};
-
-struct event_workitem_queue *ewq;
-
-void init_event_workitem_queue(void)
-{
-	enter_ukl_kernel();
-
-        ewq = kmalloc(sizeof(struct event_workitem_queue), GFP_KERNEL);
-	spin_lock_init(&ewq->queue_lock);
-        INIT_LIST_HEAD(&ewq->work_item_head);
-
-	enter_ukl_user();
-}
-void workitem_queue_add_event(void *private)
-{
-	unsigned long flags;
-        struct event_work_item *evi = kmalloc(sizeof(struct event_work_item), GFP_ATOMIC);
-	//pr_warn("Adding UKL event\n");
-        evi->data = private;
-        spin_lock_irqsave(&ewq->queue_lock, flags);
-        list_add_tail(&evi->work_item_head, &ewq->work_item_head);
-        spin_unlock_irqrestore(&ewq->queue_lock, flags);
-	//pr_warn("Added event\n");
-}
-
-struct event_work_item* workitem_queue_consume_event(void)
-{
-	void *value = NULL;
-	unsigned long flags;
-        struct event_work_item *evi;
-
-	enter_ukl_kernel();
-
-        evi = list_first_entry_or_null(&ewq->work_item_head, struct event_work_item,
-                work_item_head);
-	//pr_warn("Retrieving UKL event\n");
-	if (!evi)
-		goto out;
-
-	value = evi->data;
-        spin_lock_irqsave(&ewq->queue_lock, flags);
-        __list_del_entry(&evi->work_item_head);
-        spin_unlock_irqrestore(&ewq->queue_lock, flags);
-	kfree(evi);
-	//pr_warn("Returning event\n");
-out:
-	enter_ukl_user();
-        return value;
-}
+void upcall_handler(void *private);
 
 int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
 {
-        /*
-         * When we get here we should be executing as a napi thread
-         * and we know that there is data to be processed by our target
-         * application. We will swap the mm_struct in use by the napi thread
-         * with the one from the UKL task, execute the handler, and then swap
-         * back to the original mm_struct and return.
-         */
-
-        int ret = 0;
-        struct ukl_event *ukl_handler;
-	//pr_warn("In redis_handler\n");
-        ukl_handler = container_of(wq_entry, struct ukl_event, wait);
-
-        /* Assuming the event_workitem_queue is already initialized*/
-	//pr_warn("Adding Event to queue\n");
-        workitem_queue_add_event(ukl_handler->private);
-        /* Pick a worker thread*/
-	//pr_warn("Waking UKL event handler thread\n");
-	wake_up_process(ukl_task);
-	//pr_warn("Woken\n");
-
-        return ret;
+	struct ukl_event *ukl_handler = container_of(wq_entry, struct ukl_event, wait);
+	upcall_handler(ukl_handler->private);
+	return 0;
 }
+
 /*
  * LOCKING:
  * There are three level of locking required by epoll :
@@ -2285,8 +2165,7 @@ void *do_event_ctl(int fd, void *private)
 	error = event_insert(fd, tf.file, event);
 	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
 		// There was already data present on this socket, create an event for it
-		workitem_queue_add_event(private);
-		wake_up_process(ukl_task);
+		upcall_handler(private);
 	}
 
 	/*We may need to release locks here*/

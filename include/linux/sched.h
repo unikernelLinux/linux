@@ -765,6 +765,7 @@ struct task_struct {
 	unsigned int			ukl_bypass_syscall;
 	unsigned int			ukl_bypass_limit;
 	unsigned int			ukl_bypass_current;
+	struct list_head		event_handlers;
 #endif
 	refcount_t			usage;
 	/* Per task flags (PF_*), defined further below: */
