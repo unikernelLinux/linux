@@ -75,10 +75,10 @@ void ukl_worker_sleep(void)
 
 		local_irq_save(flags);
 		handler = this_cpu_ptr(&pcpu_upcall)->handler;
-		set_current_state(TASK_IDLE);
 		spin_lock(&handler->tasks_lock);
 		list_add_tail(&current->event_handlers, &handler->idle_tasks);
 		spin_unlock(&handler->tasks_lock);
+		set_current_state(TASK_IDLE);
 		local_irq_restore(flags);
 	}
 
@@ -99,7 +99,6 @@ static struct event_handler *create_handler(void)
 	spin_lock_init(&handler->tasks_lock);
 	spin_lock_init(&handler->work_lock);
 	return handler;
-
 }
 
 #define UPCALL_PCPU	0
@@ -206,17 +205,14 @@ void* workitem_queue_consume_event(void)
 	spin_lock(&handler->work_lock);
 	evi = list_first_entry_or_null(&handler->work_item_head, struct event_work_item,
 			work_item_head);
-	if (!evi) {
-		spin_unlock_irqrestore(&handler->work_lock, flags);
-		goto out;
+	if (evi) {
+		list_del(&evi->work_item_head);
+		value = evi->data;
 	}
 
-	list_del(&evi->work_item_head);
 	spin_unlock_irqrestore(&handler->work_lock, flags);
-	value = evi->data;
 	kfree(evi);
 
-out:
 	enter_ukl_user();
 	return value;
 }
@@ -257,14 +253,16 @@ void upcall_handler(void *private)
 	spin_lock(&handler->tasks_lock);
 	// Check if there is an idle handler and wake it. If there are no handlers idle,
 	// the next one to finish its work will take up this new task.
-	if (!list_empty(&handler->idle_tasks)) {
-		thread = container_of(handler->idle_tasks.next, struct task_struct, event_handlers);
+	thread = list_first_entry_or_null(&handler->idle_tasks, struct task_struct,
+			event_handlers);
+	if (thread)
 		list_del(&thread->event_handlers);
-	}
 	spin_unlock(&handler->tasks_lock);
 
-	if (thread)
+	if (thread) {
+		INIT_LIST_HEAD(&thread->event_handlers);
 		wake_up_process(thread);
+	}
 
 	local_irq_restore(flags);
 }
