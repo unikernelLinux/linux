@@ -206,7 +206,7 @@ void* workitem_queue_consume_event(void)
 	evi = list_first_entry_or_null(&handler->work_item_head, struct event_work_item,
 			work_item_head);
 	if (evi) {
-		list_del(&evi->work_item_head);
+		list_del_init(&evi->work_item_head);
 		value = evi->data;
 	}
 
@@ -225,6 +225,8 @@ static void workitem_queue_add_event(struct event_handler *handler, void *privat
 		pr_err("Out of memory, dropping event!\n");
 		return;
 	}
+
+	INIT_LIST_HEAD(&evi->work_item_head);
 
 	evi->data = private;
 	spin_lock(&handler->work_lock);
@@ -256,13 +258,12 @@ void upcall_handler(void *private)
 	thread = list_first_entry_or_null(&handler->idle_tasks, struct task_struct,
 			event_handlers);
 	if (thread)
-		list_del(&thread->event_handlers);
+		list_del_init(&thread->event_handlers);
+
 	spin_unlock(&handler->tasks_lock);
 
-	if (thread) {
-		INIT_LIST_HEAD(&thread->event_handlers);
+	if (thread)
 		wake_up_process(thread);
-	}
 
 	local_irq_restore(flags);
 }
