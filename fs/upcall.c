@@ -56,6 +56,11 @@ static DEFINE_PER_CPU(struct pcpu_handler, pcpu_upcall);
 extern void ukl_state_u2k(void);
 extern void ukl_state_k2u(void);
 
+void check_sched(void)
+{
+	cond_resched();
+}
+
 void ukl_worker_sleep(void)
 {
 	// This function is intended to be called from a user space thread that
