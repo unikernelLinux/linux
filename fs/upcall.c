@@ -272,8 +272,18 @@ void upcall_handler(void *private)
 
 	spin_unlock(&handler->tasks_lock);
 
+	spin_lock(&handler->work_lock);
 	if (thread)
 		wake_up_process(thread);
+	spin_unlock(&handler->work_lock);
+
+	if (!list_empty(&handler->work_item_head)) {
+		spin_lock(&handler->work_lock);
+		if (thread)
+			wake_up_process(thread);
+		spin_unlock(&handler->work_lock);
+	}
+
 
 	local_irq_restore(flags);
 }
