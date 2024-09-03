@@ -84,11 +84,15 @@ void ukl_worker_sleep(void)
 		// There are no events to handle at the moment, mark ourselves
 		// idle and go to sleep
 
+		spin_lock(&handler->work_lock);
+		set_current_state(TASK_IDLE);
 		if (!list_empty(&handler->work_item_head)) {
+			set_current_state(TASK_RUNNING);
 			local_irq_restore(flags);
+			spin_unlock(&handler->work_lock);
 			goto out;
 		}
-		set_current_state(TASK_IDLE);
+		spin_unlock(&handler->work_lock);
 		local_irq_restore(flags);
 	}
 
