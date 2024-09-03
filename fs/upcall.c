@@ -40,7 +40,7 @@ struct event_work_item{
 
 struct event_handler
 {
-	struct list_head		idle_tasks;
+	struct list_head		tasks;
 	spinlock_t			tasks_lock;
 	struct list_head		work_item_head;
 	spinlock_t			work_lock;
@@ -56,6 +56,11 @@ static DEFINE_PER_CPU(struct pcpu_handler, pcpu_upcall);
 extern void ukl_state_u2k(void);
 extern void ukl_state_k2u(void);
 
+void check_sched(void)
+{
+	cond_resched();
+}
+
 void ukl_worker_sleep(void)
 {
 	// This function is intended to be called from a user space thread that
@@ -68,24 +73,33 @@ void ukl_worker_sleep(void)
 	// The block here is for the stack allocation of flags and to ensure
 	// that it is popped before we call ukl_state_k2u
 	{
-		// There are no events to handle at the moment, mark ourselves
-		// idle and go to sleep
 		unsigned long flags;
 		struct event_handler *handler;
+		struct pcpu_handler *container;
 
 		local_irq_save(flags);
-		handler = this_cpu_ptr(&pcpu_upcall)->handler;
-		spin_lock(&handler->tasks_lock);
-		list_add_tail(&current->event_handlers, &handler->idle_tasks);
-		spin_unlock(&handler->tasks_lock);
+		container = this_cpu_ptr(&pcpu_upcall);
+		handler = container->handler;
+
+		// There are no events to handle at the moment, mark ourselves
+		// idle and go to sleep
+
+		spin_lock(&handler->work_lock);
 		set_current_state(TASK_IDLE);
+		if (!list_empty(&handler->work_item_head)) {
+			set_current_state(TASK_RUNNING);
+			local_irq_restore(flags);
+			spin_unlock(&handler->work_lock);
+			goto out;
+		}
+		spin_unlock(&handler->work_lock);
 		local_irq_restore(flags);
 	}
 
 	// Schedule is outside the block with flags because we want it cleared from
 	// the stack when we return.
 	schedule();
-
+out:
 	enter_ukl_user();
 
 	//ukl_state_k2u();
@@ -94,7 +108,7 @@ void ukl_worker_sleep(void)
 static struct event_handler *create_handler(void)
 {
 	struct event_handler *handler = kmalloc(sizeof(struct event_handler), GFP_ATOMIC);
-	INIT_LIST_HEAD(&handler->idle_tasks);
+	INIT_LIST_HEAD(&handler->tasks);
 	INIT_LIST_HEAD(&handler->work_item_head);
 	spin_lock_init(&handler->tasks_lock);
 	spin_lock_init(&handler->work_lock);
@@ -181,7 +195,7 @@ void register_ukl_handler_task(void)
 
 	INIT_LIST_HEAD(&current->event_handlers);
 	spin_lock(&handler->tasks_lock);
-	list_add_tail(&current->event_handlers, &handler->idle_tasks);
+	list_add_tail(&current->event_handlers, &handler->tasks);
 	spin_unlock(&handler->tasks_lock);
 	local_irq_restore(flags);
 
@@ -255,15 +269,25 @@ void upcall_handler(void *private)
 	spin_lock(&handler->tasks_lock);
 	// Check if there is an idle handler and wake it. If there are no handlers idle,
 	// the next one to finish its work will take up this new task.
-	thread = list_first_entry_or_null(&handler->idle_tasks, struct task_struct,
+	thread = list_first_entry_or_null(&handler->tasks, struct task_struct,
 			event_handlers);
 	if (thread)
-		list_del_init(&thread->event_handlers);
+		list_rotate_left(&handler->tasks);
 
 	spin_unlock(&handler->tasks_lock);
 
+	spin_lock(&handler->work_lock);
 	if (thread)
 		wake_up_process(thread);
+	spin_unlock(&handler->work_lock);
+
+	if (!list_empty(&handler->work_item_head)) {
+		spin_lock(&handler->work_lock);
+		if (thread)
+			wake_up_process(thread);
+		spin_unlock(&handler->work_lock);
+	}
+
 
 	local_irq_restore(flags);
 }
