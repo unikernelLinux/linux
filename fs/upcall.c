@@ -84,22 +84,15 @@ void ukl_worker_sleep(void)
 		// There are no events to handle at the moment, mark ourselves
 		// idle and go to sleep
 
-		spin_lock(&handler->work_lock);
+		spin_lock(&handler->tasks_lock);
 		set_current_state(TASK_IDLE);
-		if (!list_empty(&handler->work_item_head)) {
-			set_current_state(TASK_RUNNING);
-			local_irq_restore(flags);
-			spin_unlock(&handler->work_lock);
-			goto out;
-		}
-		spin_unlock(&handler->work_lock);
+		spin_unlock(&handler->tasks_lock);
 		local_irq_restore(flags);
 	}
 
 	// Schedule is outside the block with flags because we want it cleared from
 	// the stack when we return.
 	schedule();
-out:
 	enter_ukl_user();
 
 	//ukl_state_k2u();
@@ -267,27 +260,13 @@ void upcall_handler(void *private)
 	workitem_queue_add_event(handler, private);
 
 	spin_lock(&handler->tasks_lock);
-	// Check if there is an idle handler and wake it. If there are no handlers idle,
-	// the next one to finish its work will take up this new task.
+
 	thread = list_first_entry_or_null(&handler->tasks, struct task_struct,
 			event_handlers);
-	if (thread)
-		list_rotate_left(&handler->tasks);
+	list_rotate_left(&handler->tasks);
+	wake_up_process(thread);
 
 	spin_unlock(&handler->tasks_lock);
-
-	spin_lock(&handler->work_lock);
-	if (thread)
-		wake_up_process(thread);
-	spin_unlock(&handler->work_lock);
-
-	if (!list_empty(&handler->work_item_head)) {
-		spin_lock(&handler->work_lock);
-		if (thread)
-			wake_up_process(thread);
-		spin_unlock(&handler->work_lock);
-	}
-
 
 	local_irq_restore(flags);
 }
