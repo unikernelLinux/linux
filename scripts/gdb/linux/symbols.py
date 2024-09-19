@@ -15,7 +15,7 @@ import gdb
 import os
 import re
 
-from linux import modules, utils
+from linux import utils
 
 
 if hasattr(gdb, 'Breakpoint'):
@@ -90,50 +90,10 @@ lx-symbols command."""
         return None
 
     def _section_arguments(self, module):
-        try:
-            sect_attrs = module['sect_attrs'].dereference()
-        except gdb.error:
-            return ""
-        attrs = sect_attrs['attrs']
-        section_name_to_address = {
-            attrs[n]['battr']['attr']['name'].string(): attrs[n]['address']
-            for n in range(int(sect_attrs['nsections']))}
-        args = []
-        for section_name in [".data", ".data..read_mostly", ".rodata", ".bss",
-                             ".text", ".text.hot", ".text.unlikely"]:
-            address = section_name_to_address.get(section_name)
-            if address:
-                args.append(" -s {name} {addr}".format(
-                    name=section_name, addr=str(address)))
-        return "".join(args)
+        return ""
 
     def load_module_symbols(self, module):
-        module_name = module['name'].string()
-        module_addr = str(module['core_layout']['base']).split()[0]
-
-        module_file = self._get_module_file(module_name)
-        if not module_file and not self.module_files_updated:
-            self._update_module_files()
-            module_file = self._get_module_file(module_name)
-
-        if module_file:
-            if utils.is_target_arch('s390'):
-                # Module text is preceded by PLT stubs on s390.
-                module_arch = module['arch']
-                plt_offset = int(module_arch['plt_offset'])
-                plt_size = int(module_arch['plt_size'])
-                module_addr = hex(int(module_addr, 0) + plt_offset + plt_size)
-            gdb.write("loading @{addr}: {filename}\n".format(
-                addr=module_addr, filename=module_file))
-            cmdline = "add-symbol-file {filename} {addr}{sections}".format(
-                filename=module_file,
-                addr=module_addr,
-                sections=self._section_arguments(module))
-            gdb.execute(cmdline, to_string=True)
-            if module_name not in self.loaded_modules:
-                self.loaded_modules.append(module_name)
-        else:
-            gdb.write("no module object found for '{0}'\n".format(module_name))
+        pass
 
     def load_all_symbols(self):
         gdb.write("loading vmlinux\n")
@@ -155,7 +115,7 @@ lx-symbols command."""
         gdb.execute("symbol-file {0}".format(orig_vmlinux))
 
         self.loaded_modules = []
-        module_list = modules.module_list()
+        module_list = None
         if not module_list:
             gdb.write("no modules found\n")
         else:
