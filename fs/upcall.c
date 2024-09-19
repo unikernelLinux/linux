@@ -85,9 +85,13 @@ void ukl_worker_sleep(void)
 		// idle and go to sleep
 
 		spin_lock(&handler->tasks_lock);
+		list_add_tail(&current->event_handlers, &handler->tasks);
 		set_current_state(TASK_IDLE);
 		spin_unlock(&handler->tasks_lock);
 		local_irq_restore(flags);
+		// This barrier is paired with the one in upcall_hanlder() which will execute in
+		// softIRQ context and attempt to wake a worker.
+		smp_mb();
 	}
 
 	// Schedule is outside the block with flags because we want it cleared from
@@ -175,6 +179,7 @@ void register_ukl_handler_task(void)
 	unsigned long flags;
 
 	enter_ukl_kernel();
+
 	local_irq_save(flags);
 	container = this_cpu_ptr(&pcpu_upcall);
 	handler = container->handler;
@@ -210,6 +215,9 @@ void* workitem_queue_consume_event(void)
 	container = this_cpu_ptr(&pcpu_upcall);
 	handler = container->handler;
 	spin_lock(&handler->work_lock);
+	// This barrier is paired with one in workitem_queue_add_event(), this barrier ensures
+	// the worker thread sees the new work items.
+	smp_mb();
 	evi = list_first_entry_or_null(&handler->work_item_head, struct event_work_item,
 			work_item_head);
 	if (evi) {
@@ -239,6 +247,8 @@ static void workitem_queue_add_event(struct event_handler *handler, void *privat
 	spin_lock(&handler->work_lock);
 	list_add_tail(&evi->work_item_head, &handler->work_item_head);
 	spin_unlock(&handler->work_lock);
+	// This barrier is paired with the one in workitem_queue_consume_event()
+	smp_mb();
 }
 
 void upcall_handler(void *private)
@@ -260,11 +270,15 @@ void upcall_handler(void *private)
 	workitem_queue_add_event(handler, private);
 
 	spin_lock(&handler->tasks_lock);
+	// This barrier is paired with the one in the worker_sleep() function
+	smp_mb();
 
 	thread = list_first_entry_or_null(&handler->tasks, struct task_struct,
 			event_handlers);
-	list_rotate_left(&handler->tasks);
-	wake_up_process(thread);
+	if (thread) {
+		list_del_init(&thread->event_handlers);
+		wake_up_process(thread);
+	}
 
 	spin_unlock(&handler->tasks_lock);
 
