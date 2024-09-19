@@ -24,7 +24,6 @@ except:
 else:
     import linux.utils
     import linux.symbols
-    import linux.modules
     import linux.dmesg
     import linux.tasks
     import linux.config
