@@ -61,7 +61,7 @@ static struct proc_dir_entry *proc_logger;
 
 static int __init setup_tsc_logger(void)
 {
-	u64 entry_sz = max_event_count + TscLogEntrySize(vals_per_entry);
+	u64 entry_sz = max_event_count * TscLogEntrySize(vals_per_entry);
 	u64 total_sz = sizeof(struct TscLog) + entry_sz + L1_CACHE_BYTES;
 
 	if (max_event_count == 0)
@@ -77,7 +77,7 @@ static int __init setup_tsc_logger(void)
 		ukl_tsc_log = allocated;
 
 	ukl_tsc_log->hdr.info.cur = &(ukl_tsc_log->entries[0]);
-	ukl_tsc_log->hdr.info.end = &(ukl_tsc_log->entries[max_event_count]);
+	ukl_tsc_log->hdr.info.end = (void *)((unsigned long)ukl_tsc_log->hdr.info.cur + entry_sz);
 	ukl_tsc_log->hdr.info.overflow = 0;
 	ukl_tsc_log->hdr.info.valperentry = vals_per_entry;
 
