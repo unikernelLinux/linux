@@ -599,12 +599,47 @@ static inline loff_t *file_ppos(struct file *file)
 	return file->f_mode & FMODE_STREAM ? NULL : &file->f_pos;
 }
 
+unsigned int get_skb_offset(unsigned int fd, void *skb)
+{
+	struct fd f = fdget_pos(fd);
+	struct sock *sk = (f.file)->private_data->sock;
+	struct tcp_sock *tp = tcp_sk(sk);
+	u32 *seq;
+	u32 offset;
+	seq = &tp->copied_seq;
+	offset = *seq - TCP_SKB_CB(skb)->seq;
+	return offset;
+}
+ssize_t ukl_ksys_read(unsigned int fd, char __user *ret_skb, size_t count)
+{	
+	struct fd f = fdget_pos(fd);
+	ssize_t ret = -EBADF;
+	struct sock *sk;
+	if (f.file) {
+		//replace this line with call chain
+		sk = (f.file)->private_data->sock;
+		sk->sk_zc = 1;
+		off_t pos, *ppos = file_ppos(f.file);
+		if (ppos) {
+			pos = *ppos;
+			ppos = &pos;
+		}
+		ret = vfs_read(f.file, buf, count, ppos);
+		if (ret >= 0 && ppos)
+			f.file->f_pos = pos;
+		fdput_pos(f);
+	}
+	return ret;
+
+}
 ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
 {
 	struct fd f = fdget_pos(fd);
 	ssize_t ret = -EBADF;
-
-	if (f.file) {
+	struct sock *sk;
+        if (f.file) { 
+                sk = (f.file)->private_data->sock;  
+                sk->sk_zc = 0;
 		loff_t pos, *ppos = file_ppos(f.file);
 		if (ppos) {
 			pos = *ppos;

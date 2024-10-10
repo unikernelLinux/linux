@@ -2600,6 +2600,10 @@ found_ok_skb:
 		}
 
 		if (!(flags & MSG_TRUNC)) {
+			if (sk->sk_zc){
+				*(msg->msg_iter->ubuf) = (void *) skb;
+				return (skb->len - offset);
+			}
 			err = skb_copy_datagram_msg(skb, offset, msg, used);
 			if (err) {
 				/* Exception. Bailout! */
@@ -2661,6 +2665,19 @@ recv_urg:
 recv_sndq:
 	err = tcp_peek_sndq(sk, msg, len);
 	goto out;
+}
+
+void ukl_zc_cleanup(unsigned int fd, unsigned long used)
+{
+	struct fd f = fdget_pos(fd);                
+        struct sock *sk = (f.file)->private_data->sock;         
+        struct tcp_sock *tp = tcp_sk(sk);
+
+	WRITE_ONCE(tp->copied, tp->copied+used);
+
+	tcp_rcv_space_adjust(sk);
+	tcp_cleanup_rbuf(sk,used);
+
 }
 
 int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,

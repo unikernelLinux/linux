@@ -516,6 +516,7 @@ struct sock {
 				sk_txtime_report_errors : 1,
 				sk_txtime_unused : 6;
 	bool			sk_use_task_frag;
+	bool			sk_zc;
 
 	struct socket		*sk_socket;
 	void			*sk_user_data;

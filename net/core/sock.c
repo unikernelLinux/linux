@@ -2101,6 +2101,7 @@ struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 		sk->sk_kern_sock = kern;
 		sock_lock_init(sk);
 		sk->sk_net_refcnt = kern ? 0 : 1;
+		sk->sk_zc = 0;
 		if (likely(sk->sk_net_refcnt)) {
 			get_net_track(net, &sk->ns_tracker, priority);
 			sock_inuse_add(net, 1);
