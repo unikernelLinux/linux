@@ -21,7 +21,11 @@
 #include <linux/mount.h>
 #include <linux/fs.h>
 #include "internal.h"
-
+#include <linux/net.h>
+#include <net/sock.h>
+#include <linux/tcp.h>
+#include <net/tcp.h>
+#include <linux/skbuff.h>
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
 
@@ -602,24 +606,27 @@ static inline loff_t *file_ppos(struct file *file)
 unsigned int get_skb_offset(unsigned int fd, void *skb)
 {
 	struct fd f = fdget_pos(fd);
-	struct sock *sk = (f.file)->private_data->sock;
+	struct socket *sock = (f.file)->private_data;
+	struct sock *sk = sock->sk;
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 *seq;
 	u32 offset;
 	seq = &tp->copied_seq;
-	offset = *seq - TCP_SKB_CB(skb)->seq;
+	offset = *seq - TCP_SKB_CB((struct sk_buff *)skb)->seq;
 	return offset;
 }
-ssize_t ukl_ksys_read(unsigned int fd, char __user *ret_skb, size_t count)
+ssize_t ukl_ksys_read(unsigned int fd, char __user **ret_skb, size_t count)
 {	
 	struct fd f = fdget_pos(fd);
 	ssize_t ret = -EBADF;
 	struct sock *sk;
+	struct socket *sock;
+	char __user *buf = (char __user *) ret_skb;
 	if (f.file) {
-		//replace this line with call chain
-		sk = (f.file)->private_data->sock;
+		loff_t pos, *ppos = file_ppos(f.file);
+		sock = (f.file)->private_data;
+        	sk = sock->sk;
 		sk->sk_zc = 1;
-		off_t pos, *ppos = file_ppos(f.file);
 		if (ppos) {
 			pos = *ppos;
 			ppos = &pos;
@@ -636,11 +643,13 @@ ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
 {
 	struct fd f = fdget_pos(fd);
 	ssize_t ret = -EBADF;
+	struct socket *sock;
 	struct sock *sk;
-        if (f.file) { 
-                sk = (f.file)->private_data->sock;  
-                sk->sk_zc = 0;
+        if (f.file) {
 		loff_t pos, *ppos = file_ppos(f.file);
+		sock = (f.file)->private_data;
+                sk = sock->sk;  
+                sk->sk_zc = 0;
 		if (ppos) {
 			pos = *ppos;
 			ppos = &pos;

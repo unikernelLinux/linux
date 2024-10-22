@@ -62,6 +62,12 @@
 #include <trace/events/skb.h>
 #include <net/busy_poll.h>
 
+
+unsigned char* get_skb_data( void *skb_hold)
+{
+	struct sk_buff* skb = (struct sk_buff*) skb;
+	return skb->data;
+}
 /*
  *	Is a socket 'connection oriented' ?
  */
