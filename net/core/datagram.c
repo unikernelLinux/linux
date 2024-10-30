@@ -65,7 +65,7 @@
 
 unsigned char* get_skb_data( void *skb_hold)
 {
-	struct sk_buff* skb = (struct sk_buff*) skb;
+	struct sk_buff* skb = (struct sk_buff*) skb_hold;
 	return skb->data;
 }
 /*

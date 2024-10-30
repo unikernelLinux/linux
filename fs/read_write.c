@@ -454,6 +454,8 @@ EXPORT_SYMBOL(kernel_read);
 ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 {
 	ssize_t ret;
+	struct socket *sock;
+	struct sock *sk;
 
 	if (!(file->f_mode & FMODE_READ))
 		return -EBADF;
@@ -470,8 +472,57 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 
 	if (file->f_op->read)
 		ret = file->f_op->read(file, buf, count, pos);
-	else if (file->f_op->read_iter)
+	else if (file->f_op->read_iter){
+		if (file->private_data) {
+			sock = sock_from_file(file);
+			if (sock) {
+				sk = sock->sk;
+				sk->sk_zc = 0;
+			}
+		}
 		ret = new_sync_read(file, buf, count, pos);
+	}
+	else
+		ret = -EINVAL;
+	if (ret > 0) {
+		fsnotify_access(file);
+		add_rchar(current, ret);
+	}
+	inc_syscr(current);
+	return ret;
+}
+
+ssize_t ukl_vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+{
+	ssize_t ret;
+	struct socket* sock;
+	struct sock *sk;
+
+	if (!(file->f_mode & FMODE_READ))
+		return -EBADF;
+	if (!(file->f_mode & FMODE_CAN_READ))
+		return -EINVAL;
+	if (unlikely(!access_ok(buf, count)))
+		return -EFAULT;
+
+	ret = rw_verify_area(READ, file, pos, count);
+	if (ret)
+		return ret;
+	if (count > MAX_RW_COUNT)
+		count =  MAX_RW_COUNT;
+
+	if (file->f_op->read)
+		ret = file->f_op->read(file, buf, count, pos);
+	else if (file->f_op->read_iter){
+		if (file->private_data) {
+                        sock = sock_from_file(file);
+                        if (sock) {
+                                sk = sock->sk;
+                                sk->sk_zc = 1;
+                        }       
+                }
+		ret = new_sync_read(file, buf, count, pos);
+	}
 	else
 		ret = -EINVAL;
 	if (ret > 0) {
@@ -619,19 +670,14 @@ ssize_t ukl_ksys_read(unsigned int fd, char __user **ret_skb, size_t count)
 {	
 	struct fd f = fdget_pos(fd);
 	ssize_t ret = -EBADF;
-	struct sock *sk;
-	struct socket *sock;
 	char __user *buf = (char __user *) ret_skb;
 	if (f.file) {
 		loff_t pos, *ppos = file_ppos(f.file);
-		sock = (f.file)->private_data;
-        	sk = sock->sk;
-		sk->sk_zc = 1;
 		if (ppos) {
 			pos = *ppos;
 			ppos = &pos;
 		}
-		ret = vfs_read(f.file, buf, count, ppos);
+		ret = ukl_vfs_read(f.file, buf, count, ppos);
 		if (ret >= 0 && ppos)
 			f.file->f_pos = pos;
 		fdput_pos(f);
@@ -643,13 +689,8 @@ ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
 {
 	struct fd f = fdget_pos(fd);
 	ssize_t ret = -EBADF;
-	struct socket *sock;
-	struct sock *sk;
         if (f.file) {
-		loff_t pos, *ppos = file_ppos(f.file);
-		sock = (f.file)->private_data;
-                sk = sock->sk;  
-                sk->sk_zc = 0;
+		loff_t pos, *ppos = file_ppos(f.file);	
 		if (ppos) {
 			pos = *ppos;
 			ppos = &pos;
