@@ -2437,6 +2437,7 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 	struct sk_buff *skb, *last;
 	u32 urg_hole = 0;
 
+	printk("Got to tcp_recvmsg_locked\n");
 	err = -ENOTCONN;
 	if (sk->sk_state == TCP_LISTEN)
 		goto out;
@@ -2677,7 +2678,7 @@ void ukl_zc_cleanup(unsigned int fd, unsigned long used)
 	WRITE_ONCE(tp->copied_seq, tp->copied_seq+used);
 
 	tcp_rcv_space_adjust(sk);
-	tcp_cleanup_rbuf(sk,used);
+	//tcp_cleanup_rbuf(sk,used);
 
 }
 

@@ -497,7 +497,7 @@ ssize_t ukl_vfs_read(struct file *file, char __user *buf, size_t count, loff_t *
 	ssize_t ret;
 	struct socket* sock;
 	struct sock *sk;
-
+	printk("Got to ukl_vfs_read\n");
 	if (!(file->f_mode & FMODE_READ))
 		return -EBADF;
 	if (!(file->f_mode & FMODE_CAN_READ))
@@ -668,9 +668,11 @@ unsigned int get_skb_offset(unsigned int fd, void *skb)
 }
 ssize_t ukl_ksys_read(unsigned int fd, char __user **ret_skb, size_t count)
 {	
-	struct fd f = fdget_pos(fd);
+	struct fd f;
 	ssize_t ret = -EBADF;
 	char __user *buf = (char __user *) ret_skb;
+	printk("Got to ukl_ksys_read\n");
+	f = fdget_pos(fd);
 	if (f.file) {
 		loff_t pos, *ppos = file_ppos(f.file);
 		if (ppos) {
