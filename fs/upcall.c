@@ -23,6 +23,7 @@
 #include <linux/atomic.h>
 #include <linux/compat.h>
 #include <linux/rculist.h>
+#include <linux/upcall.h>
 #include <net/busy_poll.h>
 #include <asm/mmu_context.h>
 #include <linux/percpu-defs.h>
@@ -32,11 +33,6 @@
 
 #include <linux/sched.h>
 #include <uapi/linux/sched/types.h>
-
-struct event_work_item{
-	void *data;
-	struct list_head work_item_head;
-};
 
 struct event_handler
 {
@@ -55,11 +51,6 @@ static DEFINE_PER_CPU(struct pcpu_handler, pcpu_upcall);
 
 extern void ukl_state_u2k(void);
 extern void ukl_state_k2u(void);
-
-void check_sched(void)
-{
-	cond_resched();
-}
 
 void ukl_worker_sleep(void)
 {
@@ -119,13 +110,14 @@ static struct event_handler *create_handler(void)
  * Initialize the percpu event handler structures and prepare for execution
  * contexts to be registered.
  */
-void init_upcall_handler(int concurrency_model)
+int init_upcall_handler(int concurrency_model)
 {
 	int i;
 	int j;
 	struct pcpu_handler *container;
 	struct event_handler *mine;
 	unsigned long flags;
+	int queue_cnt = 0;
 
 	switch(concurrency_model) {
 	case UPCALL_PCPU:
@@ -133,6 +125,7 @@ void init_upcall_handler(int concurrency_model)
 		for_each_online_cpu(i) {
 			container = per_cpu_ptr(&pcpu_upcall, i);
 			container->handler = create_handler();
+			queue_cnt++;
 		}
 		local_irq_restore(flags);
 		break;
@@ -143,6 +136,7 @@ void init_upcall_handler(int concurrency_model)
 			if (container->handler) // We already have one set
 				continue;
 			mine = create_handler();
+			queue_cnt++;
 			container->handler = mine;
 			for_each_cpu(j, topology_cluster_cpumask(i)) {
 				if (i == j)
@@ -155,6 +149,7 @@ void init_upcall_handler(int concurrency_model)
 		break;
 	case UPCALL_SINGLE:
 		mine = create_handler();
+		queue_cnt++;
 		local_irq_save(flags);
 		for_each_online_cpu(i) {
 			container = per_cpu_ptr(&pcpu_upcall, i);
@@ -163,7 +158,7 @@ void init_upcall_handler(int concurrency_model)
 		local_irq_restore(flags);
 		break;
 	}
-
+	return queue_cnt;
 }
 
 /*
@@ -194,16 +189,21 @@ void register_ukl_handler_task(void)
 	INIT_LIST_HEAD(&current->event_handlers);
 	spin_lock(&handler->tasks_lock);
 	list_add_tail(&current->event_handlers, &handler->tasks);
-	spin_unlock(&handler->tasks_lock);
-	local_irq_restore(flags);
+	spin_unlock_irqrestore(&handler->tasks_lock, flags);
 
 	enter_ukl_user();
 }
 
-// Return the opaque pointer supplied when this event was registered
-void* workitem_queue_consume_event(void)
+struct event_work_item {
+	struct list_head	work_item_head;
+	struct ukl_event *	event;
+};
+
+// Return the opaque pointer supplied when this event was registered and re-enable
+// the event waiter
+struct work_item* workitem_queue_consume_event(void)
 {
-	void *value = NULL;
+	struct ukl_event *value = NULL;
 	unsigned long flags;
 	struct event_work_item *evi;
 	struct pcpu_handler *container;
@@ -222,18 +222,24 @@ void* workitem_queue_consume_event(void)
 			work_item_head);
 	if (evi) {
 		list_del_init(&evi->work_item_head);
-		value = evi->data;
+		value = evi->event;
 	}
 
 	spin_unlock_irqrestore(&handler->work_lock, flags);
+
+	if (!value)
+		return NULL;
+
 	kfree(evi);
 
+	add_wait_queue(value->whead, &value->wait);
+
 	enter_ukl_user();
-	return value;
+	return &value->work;
 }
 
 /* Caller is expected to have disabled interrupts */
-static void workitem_queue_add_event(struct event_handler *handler, void *private)
+static void workitem_queue_add_event(struct event_handler *handler, struct ukl_event *event)
 {
 	struct event_work_item *evi = kmalloc(sizeof(struct event_work_item), GFP_ATOMIC);
 	if (!evi) {
@@ -243,7 +249,7 @@ static void workitem_queue_add_event(struct event_handler *handler, void *privat
 
 	INIT_LIST_HEAD(&evi->work_item_head);
 
-	evi->data = private;
+	evi->event = event;
 	spin_lock(&handler->work_lock);
 	list_add_tail(&evi->work_item_head, &handler->work_item_head);
 	spin_unlock(&handler->work_lock);
@@ -251,7 +257,7 @@ static void workitem_queue_add_event(struct event_handler *handler, void *privat
 	smp_mb();
 }
 
-void upcall_handler(void *private)
+void enqueue_event(struct ukl_event *event)
 {
 	unsigned long flags;
 	struct event_handler *handler;
@@ -267,7 +273,7 @@ void upcall_handler(void *private)
 		return;
 	}
 
-	workitem_queue_add_event(handler, private);
+	workitem_queue_add_event(handler, event);
 
 	spin_lock(&handler->tasks_lock);
 	// This barrier is paired with the one in the worker_sleep() function
@@ -280,8 +286,6 @@ void upcall_handler(void *private)
 		wake_up_process(thread);
 	}
 
-	spin_unlock(&handler->tasks_lock);
-
-	local_irq_restore(flags);
+	spin_unlock_irqrestore(&handler->tasks_lock, flags);
 }
 

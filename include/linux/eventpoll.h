@@ -53,7 +53,7 @@ static inline void eventpoll_release(struct file *file)
 	eventpoll_release_file(file);
 }
 
-void *do_event_ctl(int fd, void *private);
+void *do_event_ctl(int fd, void (*work_fn)(void *arg), void *arg);
 void release_ukl_event(void *event);
 
 int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *epds,

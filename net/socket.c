@@ -88,6 +88,9 @@
 #include <linux/nospec.h>
 #include <linux/indirect_call_wrapper.h>
 
+#include <linux/upcall.h>
+#include <linux/list.h>
+
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
 
@@ -473,6 +476,7 @@ struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname)
 
 	sock->file = file;
 	file->private_data = sock;
+	file->f_upcall = NULL;
 	stream_open(SOCK_INODE(sock), file);
 	return file;
 }
@@ -1393,6 +1397,18 @@ static int sock_mmap(struct file *file, struct vm_area_struct *vma)
 static int sock_close(struct inode *inode, struct file *filp)
 {
 	__sock_release(SOCKET_I(inode), inode);
+
+	// Maybe (probably) not the right place for this, but HAX4LYFE
+	if (filp->f_upcall) {
+		struct list_head *pos, *n;
+		list_for_each_safe(pos, n, filp->f_upcall) {
+			struct ukl_event *event = list_entry( pos, struct ukl_event, anchor);
+			list_del(&event->anchor);
+			kfree(event);
+		}
+		filp->f_upcall = NULL;
+	}
+
 	return 0;
 }
 

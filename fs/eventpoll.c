@@ -37,6 +37,7 @@
 #include <linux/seq_file.h>
 #include <linux/compat.h>
 #include <linux/rculist.h>
+#include <linux/upcall.h>
 #include <net/busy_poll.h>
 #include <asm/mmu_context.h>
 
@@ -45,20 +46,13 @@
 #include <linux/sched.h>
 #include <uapi/linux/sched/types.h>
 
-struct ukl_event{
-	void *private;
-	void *work_data;
-	wait_queue_entry_t wait;
-	__poll_t events;
-	wait_queue_head_t *whead;
-};
+void enqueue_event(struct ukl_event *event);
 
-void upcall_handler(void *private);
-
-int redis_handler(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
+int unpack_event(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
 {
-	struct ukl_event *ukl_handler = container_of(wq_entry, struct ukl_event, wait);
-	upcall_handler(ukl_handler->private);
+	struct ukl_event *event = container_of(wq_entry, struct ukl_event, wait);
+	enqueue_event(event);
+	list_del_init(&wq_entry->entry);
 	return 0;
 }
 
@@ -1283,11 +1277,10 @@ static void event_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 	struct event_pqueue *epq = container_of(pt, struct event_pqueue, pt);
 	struct ukl_event *event = epq->event;
 	event->whead = whead;
-	init_waitqueue_func_entry(&event->wait, redis_handler);
+	init_waitqueue_func_entry(&event->wait, unpack_event);
 	add_wait_queue(whead, &event->wait);
 
 	return;
-
 }
 
 
@@ -1501,25 +1494,21 @@ static __poll_t event_insert(int fd, struct file *tfile, struct ukl_event *event
 {
 	__poll_t revents;
 	struct event_pqueue epq;
-	//pr_warn("INVOKING EVENT_INSERT\n");
 	/* We may need to do something like "attach_epitem()" which attaches a pointer in epitem to
 	 * the list in file->fep
 	 */
-
-	/* create struct event_pqueue { struct ukl_event * event, struct poll_table pt;}
-	 */
-
 	epq.event = event;
+
+	if (!tfile->f_upcall)
+		tfile->f_upcall = &event->anchor;
+	else
+		list_add(&event->anchor, tfile->f_upcall);
+
 	init_poll_funcptr(&epq.pt, event_ptable_queue_proc);
 
 	revents = event_item_poll(event, &epq.pt, tfile);
 
 	return revents;
-
-
-
-
-
 }
 
 static int ep_insert(struct eventpoll *ep, const struct epoll_event *event,
@@ -2133,43 +2122,56 @@ static inline int epoll_mutex_lock(struct mutex *mutex, int depth,
 	return -EAGAIN;
 }
 
-/*
- * Entry point into kernel for event handling for the ukl application. Later
- * we may need to add a pointer to event handler and/or events field in the argument.
- * We are only adding the events at this point, not deleting it or modifying it
- */
-void *do_event_ctl(int fd, void *private)
+int attach_event(struct ukl_event *event, int fd)
 {
 	__poll_t error;
-	struct ukl_event *event;
 	struct fd tf;
-
-	if(!(event = kmalloc(sizeof(struct ukl_event), GFP_KERNEL))){
-		return NULL;
-	}
-
-	event->private = private;
 
 	/*  Get the "struct file *" for the target file */
 	tf = fdget(fd);
 	if (!tf.file)
-		goto out_free;
+		return 1;
 
-	if(!file_can_poll(tf.file))
-	{
+	if(!file_can_poll(tf.file)) {
 		fdput(tf);
-		goto out_free;
+		return 1;
 	}
 
 	/*We may need to manipulate locks at this point*/
 	error = event_insert(fd, tf.file, event);
 	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
 		// There was already data present on this socket, create an event for it
-		upcall_handler(private);
+		enqueue_event(event);
+		// Remove this event from the wait tables, when the processing event context
+		// retrieves it, we will re-add.
+		list_del_init(&event->wait.entry);
 	}
 
 	/*We may need to release locks here*/
 	fdput(tf);
+	return 0;
+}
+
+/*
+ * Entry point into kernel for event handling for the ukl application. Later
+ * we may need to add a pointer to event handler and/or events field in the argument.
+ * We are only adding the events at this point, not deleting it or modifying it
+ */
+void *do_event_ctl(int fd, void (*work_fn)(void *arg), void *arg)
+{
+	struct ukl_event *event;
+
+	if(!(event = kmalloc(sizeof(struct ukl_event), GFP_KERNEL))){
+		return NULL;
+	}
+
+	event->work.arg = arg;
+	event->work.work_fn = work_fn;
+	INIT_LIST_HEAD(&event->anchor);
+
+	if (attach_event(event, fd))
+		goto out_free;
+
 	return (void*)event;
 
 out_free:
@@ -2178,9 +2180,9 @@ out_free:
 
 }
 
-void release_ukl_event(void *private)
+void release_ukl_event(void *ukl_event)
 {
-	struct ukl_event *event = (struct ukl_event*)private;
+	struct ukl_event *event = (struct ukl_event*)ukl_event;
 	remove_wait_queue(event->whead, &event->wait);
 	kfree(event);
 }
