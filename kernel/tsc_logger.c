@@ -16,16 +16,20 @@ static void *allocated;
 struct TscLog *ukl_tsc_log;
 EXPORT_SYMBOL_GPL(ukl_tsc_log);
 
-static int max_event_count = 100000;
+static int max_event_count = 1000000;
 module_param(max_event_count, int, 0);
 
 static int vals_per_entry = 1;
 module_param(vals_per_entry, int, 0);
 
+extern unsigned int __read_mostly tsc_khz;
+
 static int logger_show(struct seq_file *m, void *v)
 {
 	struct TscLogEntry *e = (struct TscLogEntry *)&(ukl_tsc_log->entries[0]);
 	struct TscLogEntry *cur = ukl_tsc_log->hdr.info.cur;
+
+	pr_err("tsc_khz value is %u\n", tsc_khz);
 
 	seq_printf(m, "CPU\tTID\tTSC");
 	for (int i = 0; i < vals_per_entry; i++) {
