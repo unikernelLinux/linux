@@ -227,8 +227,10 @@ struct work_item* workitem_queue_consume_event(void)
 
 	spin_unlock_irqrestore(&handler->work_lock, flags);
 
-	if (!value)
+	if (!value) {
+		enter_ukl_user();
 		return NULL;
+	}
 
 	kfree(evi);
 
