@@ -6,6 +6,7 @@
 #include <linux/list.h>
 #include <linux/rbtree.h>
 #include <linux/wait.h>
+#include <linux/file.h>
 
 struct work_item {
         void *arg;
@@ -14,8 +15,9 @@ struct work_item {
 
 struct ukl_event{
         struct work_item work;
-        wait_queue_entry_t wait;
+	struct file *tfile;
         __poll_t events;
+        wait_queue_entry_t wait;
         wait_queue_head_t *whead;
 	struct list_head anchor;
 };

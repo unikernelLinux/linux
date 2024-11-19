@@ -51,8 +51,8 @@ void enqueue_event(struct ukl_event *event);
 int unpack_event(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
 {
 	struct ukl_event *event = container_of(wq_entry, struct ukl_event, wait);
-	enqueue_event(event);
 	list_del_init(&wq_entry->entry);
+	enqueue_event(event);
 	return 0;
 }
 
@@ -1490,7 +1490,7 @@ allocate:
 /*
  * Must be called with "mtx" held.
  */
-static __poll_t event_insert(int fd, struct file *tfile, struct ukl_event *event)
+static __poll_t event_insert(struct file *tfile, struct ukl_event *event)
 {
 	__poll_t revents;
 	struct event_pqueue epq;
@@ -2122,9 +2122,22 @@ static inline int epoll_mutex_lock(struct mutex *mutex, int depth,
 	return -EAGAIN;
 }
 
-int attach_event(struct ukl_event *event, int fd)
+void check_event_insert(struct file *tfile, struct ukl_event *event)
 {
 	__poll_t error;
+
+	error = event_insert(tfile, event);
+	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
+		// Remove this event from the wait tables, when the processing event context
+		// retrieves it, we will re-add.
+		list_del_init(&event->wait.entry);
+		// There was already data present on this socket, create an event for it
+		enqueue_event(event);
+	}
+}
+
+int attach_event(struct ukl_event *event, int fd)
+{
 	struct fd tf;
 
 	/*  Get the "struct file *" for the target file */
@@ -2137,17 +2150,15 @@ int attach_event(struct ukl_event *event, int fd)
 		return 1;
 	}
 
-	/*We may need to manipulate locks at this point*/
-	error = event_insert(fd, tf.file, event);
-	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
-		// There was already data present on this socket, create an event for it
-		enqueue_event(event);
-		// Remove this event from the wait tables, when the processing event context
-		// retrieves it, we will re-add.
-		list_del_init(&event->wait.entry);
-	}
+	if (!tf.file->f_upcall)
+		tf.file->f_upcall = &event->anchor;
+	else
+		list_add(&event->anchor, tf.file->f_upcall);
 
-	/*We may need to release locks here*/
+	event->tfile = tf.file;
+
+
+	check_event_insert(tf.file, event);
 	fdput(tf);
 	return 0;
 }
