@@ -1400,7 +1400,6 @@ static int sock_close(struct inode *inode, struct file *filp)
 	struct list_head *pos, *n;
 	list_for_each_safe(pos, n, &filp->f_upcall) {
 		struct ukl_event *event = list_entry(pos, struct ukl_event, anchor);
-		pr_err("Break point\n");
 		list_del(&event->anchor);
 		remove_wait_queue(event->whead, &event->wait);
 		event->closed = 1;

@@ -52,6 +52,9 @@ static DEFINE_PER_CPU(struct pcpu_handler, pcpu_upcall);
 extern void ukl_state_u2k(void);
 extern void ukl_state_k2u(void);
 
+size_t sleep_count;
+size_t event_count;
+
 void ukl_worker_sleep(void)
 {
 	// This function is intended to be called from a user space thread that
@@ -78,6 +81,7 @@ void ukl_worker_sleep(void)
 		spin_lock(&handler->tasks_lock);
 		list_add_tail(&current->event_handlers, &handler->tasks);
 		set_current_state(TASK_IDLE);
+		sleep_count++;
 		spin_unlock(&handler->tasks_lock);
 		local_irq_restore(flags);
 		// This barrier is paired with the one in upcall_hanlder() which will execute in
@@ -240,7 +244,7 @@ struct work_item* workitem_queue_consume_event(void)
 		kfree(value);
 		goto out;
 	} else {
-		check_event_insert(value->tfile, value);
+	//	check_event_insert(value->tfile, value);
 		ret = &value->work;
 	}
 
@@ -263,6 +267,7 @@ static void workitem_queue_add_event(struct event_handler *handler, struct ukl_e
 	evi->event = event;
 	spin_lock(&handler->work_lock);
 	list_add_tail(&evi->work_item_head, &handler->work_item_head);
+	event_count++;
 	spin_unlock(&handler->work_lock);
 	// This barrier is paired with the one in workitem_queue_consume_event()
 	smp_mb();

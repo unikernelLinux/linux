@@ -1491,6 +1491,10 @@ handle_page_fault(struct pt_regs *regs, unsigned long error_code,
 {
 	trace_page_fault_entries(regs, error_code, address);
 
+	if (current->ukl_thread && address < 4096) {
+		pr_err("faulting address is %lx\n", regs->ip);
+	}
+
 	if (unlikely(kmmio_fault(regs, address)))
 		return;
 

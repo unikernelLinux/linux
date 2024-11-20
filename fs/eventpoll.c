@@ -51,7 +51,7 @@ void enqueue_event(struct ukl_event *event);
 int unpack_event(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
 {
 	struct ukl_event *event = container_of(wq_entry, struct ukl_event, wait);
-	list_del_init(&wq_entry->entry);
+//	list_del_init(&wq_entry->entry);
 	enqueue_event(event);
 	return 0;
 }
@@ -2125,7 +2125,7 @@ void check_event_insert(struct file *tfile, struct ukl_event *event)
 	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
 		// Remove this event from the wait tables, when the processing event context
 		// retrieves it, we will re-add.
-		list_del_init(&event->wait.entry);
+//		list_del_init(&event->wait.entry);
 		// There was already data present on this socket, create an event for it
 		enqueue_event(event);
 	}
