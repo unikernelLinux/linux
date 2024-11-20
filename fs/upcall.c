@@ -210,6 +210,7 @@ struct work_item* workitem_queue_consume_event(void)
 	struct event_work_item *evi;
 	struct pcpu_handler *container;
 	struct event_handler *handler;
+	struct work_item *ret = NULL;
 
 	enter_ukl_kernel();
 
@@ -229,17 +230,23 @@ struct work_item* workitem_queue_consume_event(void)
 
 	spin_unlock_irqrestore(&handler->work_lock, flags);
 
-	if (!value) {
-		enter_ukl_user();
-		return NULL;
-	}
-
 	kfree(evi);
 
-	check_event_insert(value->tfile, value);
+	if (!value) {
+		goto out;
+	}
 
+	if (value->closed) {
+		kfree(value);
+		goto out;
+	} else {
+		check_event_insert(value->tfile, value);
+		ret = &value->work;
+	}
+
+out:
 	enter_ukl_user();
-	return &value->work;
+	return ret;
 }
 
 /* Caller is expected to have disabled interrupts */

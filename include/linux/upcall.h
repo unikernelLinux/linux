@@ -20,6 +20,7 @@ struct ukl_event{
         wait_queue_entry_t wait;
         wait_queue_head_t *whead;
 	struct list_head anchor;
+	int closed;
 };
 
 #endif

@@ -1499,11 +1499,6 @@ static __poll_t event_insert(struct file *tfile, struct ukl_event *event)
 	 */
 	epq.event = event;
 
-	if (!tfile->f_upcall)
-		tfile->f_upcall = &event->anchor;
-	else
-		list_add(&event->anchor, tfile->f_upcall);
-
 	init_poll_funcptr(&epq.pt, event_ptable_queue_proc);
 
 	revents = event_item_poll(event, &epq.pt, tfile);
@@ -2150,13 +2145,9 @@ int attach_event(struct ukl_event *event, int fd)
 		return 1;
 	}
 
-	if (!tf.file->f_upcall)
-		tf.file->f_upcall = &event->anchor;
-	else
-		list_add(&event->anchor, tf.file->f_upcall);
-
 	event->tfile = tf.file;
 
+	list_add(&event->anchor, &tf.file->f_upcall);
 
 	check_event_insert(tf.file, event);
 	fdput(tf);
@@ -2178,6 +2169,7 @@ void *do_event_ctl(int fd, void (*work_fn)(void *arg), void *arg)
 
 	event->work.arg = arg;
 	event->work.work_fn = work_fn;
+	event->closed = 0;
 	INIT_LIST_HEAD(&event->anchor);
 
 	if (attach_event(event, fd))
