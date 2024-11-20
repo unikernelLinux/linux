@@ -203,8 +203,6 @@ struct event_work_item {
 	struct ukl_event *	event;
 };
 
-void check_event_insert(struct file *tfile, struct ukl_event *event);
-
 // Return the opaque pointer supplied when this event was registered and re-enable
 // the event waiter
 struct work_item* workitem_queue_consume_event(void)
@@ -244,7 +242,6 @@ struct work_item* workitem_queue_consume_event(void)
 		kfree(value);
 		goto out;
 	} else {
-	//	check_event_insert(value->tfile, value);
 		ret = &value->work;
 	}
 

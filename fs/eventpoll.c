@@ -51,7 +51,6 @@ void enqueue_event(struct ukl_event *event);
 int unpack_event(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
 {
 	struct ukl_event *event = container_of(wq_entry, struct ukl_event, wait);
-//	list_del_init(&wq_entry->entry);
 	enqueue_event(event);
 	return 0;
 }
@@ -2117,23 +2116,10 @@ static inline int epoll_mutex_lock(struct mutex *mutex, int depth,
 	return -EAGAIN;
 }
 
-void check_event_insert(struct file *tfile, struct ukl_event *event)
-{
-	__poll_t error;
-
-	error = event_insert(tfile, event);
-	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
-		// Remove this event from the wait tables, when the processing event context
-		// retrieves it, we will re-add.
-//		list_del_init(&event->wait.entry);
-		// There was already data present on this socket, create an event for it
-		enqueue_event(event);
-	}
-}
-
 int attach_event(struct ukl_event *event, int fd)
 {
 	struct fd tf;
+	__poll_t error;
 
 	/*  Get the "struct file *" for the target file */
 	tf = fdget(fd);
@@ -2149,7 +2135,12 @@ int attach_event(struct ukl_event *event, int fd)
 
 	list_add(&event->anchor, &tf.file->f_upcall);
 
-	check_event_insert(tf.file, event);
+	error = event_insert(tf.file, event);
+	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
+		// There was already data present on this socket, create an event for it
+		enqueue_event(event);
+	}
+
 	fdput(tf);
 	return 0;
 }
