@@ -15,7 +15,6 @@ struct work_item {
 
 struct ukl_event{
         struct work_item work;
-	struct file *tfile;
         __poll_t events;
         wait_queue_entry_t wait;
         wait_queue_head_t *whead;

@@ -2131,8 +2131,6 @@ int attach_event(struct ukl_event *event, int fd)
 		return 1;
 	}
 
-	event->tfile = tf.file;
-
 	list_add(&event->anchor, &tf.file->f_upcall);
 
 	error = event_insert(tf.file, event);

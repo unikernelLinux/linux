@@ -241,10 +241,9 @@ struct work_item* workitem_queue_consume_event(void)
 	if (value->closed) {
 		kfree(value);
 		goto out;
-	} else {
-		ret = &value->work;
 	}
 
+	ret = &value->work;
 out:
 	enter_ukl_user();
 	return ret;
