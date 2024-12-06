@@ -173,15 +173,8 @@ int init_upcall_handler(int concurrency_model)
 void register_ukl_handler_task(void)
 {
 	struct sched_param params;
-	struct pcpu_handler *container;
-	struct event_handler *handler;
-	unsigned long flags;
 
 	enter_ukl_kernel();
-
-	local_irq_save(flags);
-	container = this_cpu_ptr(&pcpu_upcall);
-	handler = container->handler;
 
 	// Set scheduler and cpu for handler task
 	params.sched_priority = 99;
@@ -189,11 +182,7 @@ void register_ukl_handler_task(void)
 		pr_warn("Failed to change scheduler policy to SCHED_RR.\n");
 	}
 
-
 	INIT_LIST_HEAD(&current->event_handlers);
-	spin_lock(&handler->tasks_lock);
-	list_add_tail(&current->event_handlers, &handler->tasks);
-	spin_unlock_irqrestore(&handler->tasks_lock, flags);
 
 	enter_ukl_user();
 }
