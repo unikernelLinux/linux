@@ -57,6 +57,10 @@ size_t event_count;
 
 void ukl_worker_sleep(void)
 {
+	unsigned long flags;
+	struct event_handler *handler;
+	struct pcpu_handler *container;
+
 	// This function is intended to be called from a user space thread that
 	// was created to handle events. AFAICT this is the most efficient way
 	// for a task to "sleep".
@@ -66,28 +70,39 @@ void ukl_worker_sleep(void)
 
 	// The block here is for the stack allocation of flags and to ensure
 	// that it is popped before we call ukl_state_k2u
-	{
-		unsigned long flags;
-		struct event_handler *handler;
-		struct pcpu_handler *container;
 
-		local_irq_save(flags);
-		container = this_cpu_ptr(&pcpu_upcall);
-		handler = container->handler;
+	local_irq_save(flags);
+	container = this_cpu_ptr(&pcpu_upcall);
+	handler = container->handler;
 
-		// There are no events to handle at the moment, mark ourselves
-		// idle and go to sleep
+	// There are no events to handle at the moment, mark ourselves
+	// idle and go to sleep
 
-		spin_lock(&handler->tasks_lock);
-		list_add_tail(&current->event_handlers, &handler->tasks);
-		set_current_state(TASK_IDLE);
-		sleep_count++;
+	spin_lock(&handler->tasks_lock);
+
+	// However, we may have raced with the event notifications so double check
+	// before we go to sleep
+	spin_lock(&handler->work_lock);
+	if (!list_empty(&handler->work_item_head)) {
+		// We did race, let's go do the work
+		spin_unlock(&handler->work_lock);
 		spin_unlock(&handler->tasks_lock);
 		local_irq_restore(flags);
-		// This barrier is paired with the one in upcall_hanlder() which will execute in
-		// softIRQ context and attempt to wake a worker.
-		smp_mb();
+		return;
 	}
+
+	spin_unlock(&handler->work_lock);
+
+	// Okay, we really need to sleep.
+	list_add_tail(&current->event_handlers, &handler->tasks);
+	set_current_state(TASK_IDLE);
+	sleep_count++;
+	spin_unlock(&handler->tasks_lock);
+	local_irq_restore(flags);
+	// This barrier is paired with the one in upcall_hanlder() which will execute in
+	// softIRQ context and attempt to wake a worker.
+	smp_mb();
+
 
 	// Schedule is outside the block with flags because we want it cleared from
 	// the stack when we return.
