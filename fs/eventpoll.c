@@ -46,15 +46,6 @@
 #include <linux/sched.h>
 #include <uapi/linux/sched/types.h>
 
-void enqueue_event(struct ukl_event *event);
-
-int unpack_event(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key)
-{
-	struct ukl_event *event = container_of(wq_entry, struct ukl_event, wait);
-	enqueue_event(event);
-	return 0;
-}
-
 /*
  * LOCKING:
  * There are three level of locking required by epoll :
@@ -255,15 +246,6 @@ struct ep_pqueue {
  */
 /* Maximum number of epoll watched descriptors, per user */
 static long max_user_watches __read_mostly;
-/*
- *This is management structure used by the event_handling API and the UKL application
- */
-
-struct event_pqueue
-{
-	poll_table pt;
-	struct ukl_event *event;
-};
 /*
  * This mutex is used to serialize ep_free() and eventpoll_release_file().
  */
@@ -824,7 +806,6 @@ static int ep_eventpoll_release(struct inode *inode, struct file *file)
 }
 
 static __poll_t ep_item_poll(const struct epitem *epi, poll_table *pt, int depth);
-static __poll_t event_item_poll(const struct ukl_event *event, poll_table *pt, struct file *tfile);
 static __poll_t __ep_eventpoll_poll(struct file *file, poll_table *wait, int depth)
 {
 	struct eventpoll *ep = file->private_data;
@@ -882,13 +863,6 @@ static __poll_t ep_item_poll(const struct epitem *epi, poll_table *pt,
 	return res & epi->event.events;
 }
 
-static __poll_t event_item_poll(const struct ukl_event *event, poll_table *pt, struct file *tfile)
-{
-	__poll_t res;
-	pt->_key = event->events;
-	res = vfs_poll(tfile, pt);
-	return res;
-}
 static __poll_t ep_eventpoll_poll(struct file *file, poll_table *wait)
 {
 	return __ep_eventpoll_poll(file, wait, 0);
@@ -1265,25 +1239,6 @@ out_unlock:
 	return ewake;
 }
 
-/*
- * This is the callback that is used to add our wait queue to the
- * target file wakeup lists.
- */
-
-static void event_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
-				 poll_table *pt)
-{
-	struct event_pqueue *epq = container_of(pt, struct event_pqueue, pt);
-	struct ukl_event *event = epq->event;
-	event->whead = whead;
-	init_waitqueue_func_entry(&event->wait, unpack_event);
-	add_wait_queue(whead, &event->wait);
-
-	return;
-}
-
-
-
 static void ep_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
 				 poll_table *pt)
 {
@@ -1484,25 +1439,6 @@ allocate:
 	spin_unlock(&file->f_lock);
 	free_ephead(to_free);
 	return 0;
-}
-
-/*
- * Must be called with "mtx" held.
- */
-static __poll_t event_insert(struct file *tfile, struct ukl_event *event)
-{
-	__poll_t revents;
-	struct event_pqueue epq;
-	/* We may need to do something like "attach_epitem()" which attaches a pointer in epitem to
-	 * the list in file->fep
-	 */
-	epq.event = event;
-
-	init_poll_funcptr(&epq.pt, event_ptable_queue_proc);
-
-	revents = event_item_poll(event, &epq.pt, tfile);
-
-	return revents;
 }
 
 static int ep_insert(struct eventpoll *ep, const struct epoll_event *event,
@@ -2114,69 +2050,6 @@ static inline int epoll_mutex_lock(struct mutex *mutex, int depth,
 	if (mutex_trylock(mutex))
 		return 0;
 	return -EAGAIN;
-}
-
-int attach_event(struct ukl_event *event, int fd)
-{
-	struct fd tf;
-	__poll_t error;
-
-	/*  Get the "struct file *" for the target file */
-	tf = fdget(fd);
-	if (!tf.file)
-		return 1;
-
-	if(!file_can_poll(tf.file)) {
-		fdput(tf);
-		return 1;
-	}
-
-	list_add(&event->anchor, &tf.file->f_upcall);
-
-	error = event_insert(tf.file, event);
-	if ((error & (EPOLLIN | EPOLLRDNORM)) == (EPOLLIN | EPOLLRDNORM)) {
-		// There was already data present on this socket, create an event for it
-		enqueue_event(event);
-	}
-
-	fdput(tf);
-	return 0;
-}
-
-/*
- * Entry point into kernel for event handling for the ukl application. Later
- * we may need to add a pointer to event handler and/or events field in the argument.
- * We are only adding the events at this point, not deleting it or modifying it
- */
-void *do_event_ctl(int fd, void (*work_fn)(void *arg), void *arg)
-{
-	struct ukl_event *event;
-
-	if(!(event = kmalloc(sizeof(struct ukl_event), GFP_KERNEL))){
-		return NULL;
-	}
-
-	event->work.arg = arg;
-	event->work.work_fn = work_fn;
-	event->closed = 0;
-	INIT_LIST_HEAD(&event->anchor);
-
-	if (attach_event(event, fd))
-		goto out_free;
-
-	return (void*)event;
-
-out_free:
-	kfree(event);
-	return NULL;
-
-}
-
-void release_ukl_event(void *ukl_event)
-{
-	struct ukl_event *event = (struct ukl_event*)ukl_event;
-	remove_wait_queue(event->whead, &event->wait);
-	kfree(event);
 }
 
 int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *epds,

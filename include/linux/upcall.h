@@ -2,10 +2,6 @@
 #ifndef _LINUX_UPCALL_H
 #define _LINUX_UPCALL_H
 
-#include <linux/poll.h>
-#include <linux/list.h>
-#include <linux/rbtree.h>
-#include <linux/wait.h>
 #include <linux/file.h>
 
 struct work_item {
@@ -13,13 +9,14 @@ struct work_item {
         void (*work_fn)(void *arg);
 };
 
-struct ukl_event{
-        struct work_item work;
-        __poll_t events;
-        wait_queue_entry_t wait;
-        wait_queue_head_t *whead;
-	struct list_head anchor;
-	int closed;
+void upcall_release_file(struct file *file);
+
+static inline void upcall_release(struct file *file)
+{
+	if (likely(!file->f_upcall))
+		return;
+
+	upcall_release_file(file);
 };
 
 #endif

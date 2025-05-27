@@ -17,6 +17,7 @@
 #include <linux/security.h>
 #include <linux/cred.h>
 #include <linux/eventpoll.h>
+#include <linux/upcall.h>
 #include <linux/rcupdate.h>
 #include <linux/mount.h>
 #include <linux/capability.h>
@@ -310,6 +311,7 @@ static void __fput(struct file *file)
 	 * in the file cleanup chain.
 	 */
 	eventpoll_release(file);
+	upcall_release(file);
 	locks_remove_file(file);
 
 	ima_file_free(file);
