@@ -598,7 +598,6 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 	init_poll_funcptr(&sub->tables->pt, upcall_ptable_queue_proc);
 
 	if(upcall_item_poll(sub)) {
-		pr_err("Found a waiting event, enqueing work item\n");
 		// There were events present already, enqueue them
 		enqueue_event(sub);
 	}
