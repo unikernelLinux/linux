@@ -41,8 +41,6 @@
 #include <net/busy_poll.h>
 #include <asm/mmu_context.h>
 
-#include <linux/tsc_logger.h>
-
 #include <linux/sched.h>
 #include <uapi/linux/sched/types.h>
 

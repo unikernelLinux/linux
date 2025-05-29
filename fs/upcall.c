@@ -444,8 +444,10 @@ int handle_event_source(struct wait_queue_entry *wq_entry, unsigned mode,
 	__poll_t pollflags = key_to_poll(key);
 
 	/* Check if we got events in key and if we are watching for them */
-	if (pollflags && !(pollflags & tables->parent->events))
+	if (pollflags && !(pollflags & tables->parent->events)) {
+		pr_err("No events shown, pollflags '%x', our events '%x'\n", pollflags, tables->parent->events);
 		return 0;
+	}
 
 	/*
 	 * We have an event that we care about, we need to increment the subscription
@@ -531,6 +533,18 @@ static void upcall_ptable_queue_proc(struct file *file, wait_queue_head_t *whead
 	add_wait_queue(whead, &table->wait);
 }
 
+static __poll_t upcall_item_poll(struct subscription *sub)
+{
+	struct file *file = sub->fileinfo.file;
+	poll_table *pt = &sub->tables->pt;
+	__poll_t res;
+
+	pt->_key = sub->events;
+	res = vfs_poll(file, pt);
+
+	return res & sub->events;
+}
+
 static int create_subscription(struct subscription_manager *mgr, int fd, struct file *file, __poll_t events,
 				void(work_fn)(void*), void *arg)
 {
@@ -547,6 +561,8 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 		return -ENOMEM;
 	}
 
+	sub->work.work_fn = work_fn;
+	sub->work.arg = arg;
 	setup_filefd(&sub->fileinfo, file, fd);
 	sub->mgr = mgr;
 	kref_init(&sub->ref_count);
@@ -554,6 +570,7 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 
 	// Init tables
 	INIT_LIST_HEAD(&sub->tables->anchor);
+	sub->tables->parent = sub;
 
 	if (!READ_ONCE(file->f_upcall)) {
 		if (!(to_free = kmem_cache_zalloc(uplist_cache, GFP_KERNEL))) {
@@ -575,10 +592,16 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 	if (to_free)
 		kmem_cache_free(uplist_cache, to_free);
 
+	sub_rbtree_insert(mgr, sub);
+
 	// Setup the poll table waiters
 	init_poll_funcptr(&sub->tables->pt, upcall_ptable_queue_proc);
 
-	sub_rbtree_insert(mgr, sub);
+	if(upcall_item_poll(sub)) {
+		pr_err("Found a waiting event, enqueing work item\n");
+		// There were events present already, enqueue them
+		enqueue_event(sub);
+	}
 
 	return 0;
 }
@@ -654,6 +677,7 @@ int remove_subscription(struct subscription_manager *mgr, int fd, __poll_t event
 	 * release the reference below.
 	 */
 	unhook_waiters(sub->tables);
+	cleanup_file(sub);
 
 	mutex_unlock(&mgr->sub_mtx);
 	fdput(desc);
