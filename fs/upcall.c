@@ -566,7 +566,7 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 	setup_filefd(&sub->fileinfo, file, fd);
 	sub->mgr = mgr;
 	kref_init(&sub->ref_count);
-	sub->events = events | EPOLLERR | EPOLLHUP;
+	sub->events = events | EPOLLERR;
 
 	// Init tables
 	INIT_LIST_HEAD(&sub->tables->anchor);
