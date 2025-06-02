@@ -36,6 +36,7 @@
 
 struct upcall_filefd {
 	struct file *file;
+	__poll_t events;
 	int fd;
 } __packed;
 
@@ -69,9 +70,6 @@ struct subscription
 	 * event will release the subscription.
 	 */
 	struct kref ref_count;
-
-	/* The events we care about */
-	__poll_t events;
 
 	/* The structure containing the work to be done in response to an event */
 	struct work_item work;
@@ -444,8 +442,9 @@ int handle_event_source(struct wait_queue_entry *wq_entry, unsigned mode,
 	__poll_t pollflags = key_to_poll(key);
 
 	/* Check if we got events in key and if we are watching for them */
-	if (pollflags && !(pollflags & tables->parent->events)) {
-		pr_err("No events shown, pollflags '%x', our events '%x'\n", pollflags, tables->parent->events);
+	if (pollflags && !(pollflags & tables->parent->fileinfo.events)) {
+		pr_err("No events shown, pollflags '%x', our events '%x'\n", pollflags,
+				tables->parent->fileinfo.events);
 		return 0;
 	}
 
@@ -460,17 +459,23 @@ int handle_event_source(struct wait_queue_entry *wq_entry, unsigned mode,
         return 0;
 }
 
-static inline void setup_filefd(struct upcall_filefd *ffd, struct file *file, int fd)
+static inline void setup_filefd(struct upcall_filefd *ffd, struct file *file, int fd, __poll_t events)
 {
 	ffd->file = file;
+	ffd->events = events;
 	ffd->fd = fd;
 }
 
 /* Used for RB tree management */
 static inline int upcall_cmp(struct upcall_filefd *l, struct upcall_filefd *r)
 {
-	return (l->file > r->file ? +1:
-			(l->file < r->file ? -1 : l->fd - r->fd));
+	if (l->file > r->file)
+		return +1;
+	if (l->file < r->file)
+		return -1;
+	if (l->fd != r->fd)
+		return l->fd - r->fd;
+	return l->events - r->events;
 }
 
 /*
@@ -479,14 +484,17 @@ static inline int upcall_cmp(struct upcall_filefd *l, struct upcall_filefd *r)
  * Note: we do not alter the refcount_t value here so the caller must do that before releasing
  * the mutex to ensure that the pointer remains valid.
  */
-static inline struct subscription *lookup_sub(struct subscription_manager *mgr, int fd, struct file *file)
+static inline struct subscription *lookup_sub(struct subscription_manager *mgr, int fd, struct file *file, __poll_t events)
 {
 	int cmp;
 	struct rb_node *rbp;
 	struct subscription *node, *ret = NULL;
 	struct upcall_filefd ffd;
 
-	setup_filefd(&ffd, file, fd);
+	// Ensure we account for EPOLLERR
+	events |= EPOLLERR;
+
+	setup_filefd(&ffd, file, fd, events);
 	for (rbp = mgr->rbr.rb_root.rb_node; rbp; ) {
 		node = rb_entry(rbp, struct subscription, rbn);
 		cmp = upcall_cmp(&ffd, &node->fileinfo);
@@ -539,10 +547,10 @@ static __poll_t upcall_item_poll(struct subscription *sub)
 	poll_table *pt = &sub->tables->pt;
 	__poll_t res;
 
-	pt->_key = sub->events;
+	pt->_key = sub->fileinfo.events;
 	res = vfs_poll(file, pt);
 
-	return res & sub->events;
+	return res & sub->fileinfo.events;
 }
 
 static int create_subscription(struct subscription_manager *mgr, int fd, struct file *file, __poll_t events,
@@ -561,12 +569,13 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 		return -ENOMEM;
 	}
 
+	/* We add EPOLLERR to all events */
+	events |= EPOLLERR;
 	sub->work.work_fn = work_fn;
 	sub->work.arg = arg;
-	setup_filefd(&sub->fileinfo, file, fd);
+	setup_filefd(&sub->fileinfo, file, fd, events);
 	sub->mgr = mgr;
 	kref_init(&sub->ref_count);
-	sub->events = events | EPOLLERR;
 
 	// Init tables
 	INIT_LIST_HEAD(&sub->tables->anchor);
@@ -625,7 +634,7 @@ int register_subscription(struct subscription_manager *mgr, int fd, __poll_t eve
 
 	mutex_lock(&mgr->sub_mtx);
 
-	sub = lookup_sub(mgr, fd, desc.file);
+	sub = lookup_sub(mgr, fd, desc.file, events);
 
 	if (sub) {
 		err = -EEXIST;
@@ -656,14 +665,14 @@ int remove_subscription(struct subscription_manager *mgr, int fd, __poll_t event
 
 	mutex_lock(&mgr->sub_mtx);
 
-	sub = lookup_sub(mgr, fd, desc.file);
+	sub = lookup_sub(mgr, fd, desc.file, events | EPOLLERR);
 
 	if (!sub) {
 		err = -EEXIST;
 		goto out_put_unlock;
 	}
 
-	if ((sub->events & (events | EPOLLERR | EPOLLHUP)) != (events | EPOLLERR | EPOLLHUP)) {
+	if ((sub->fileinfo.events & (events | EPOLLERR)) != (events | EPOLLERR)) {
 		err = -EEXIST;
 		goto out_put_unlock;
 	}
