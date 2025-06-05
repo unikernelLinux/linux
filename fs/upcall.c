@@ -443,8 +443,6 @@ int handle_event_source(struct wait_queue_entry *wq_entry, unsigned mode,
 
 	/* Check if we got events in key and if we are watching for them */
 	if (pollflags && !(pollflags & tables->parent->fileinfo.events)) {
-		pr_err("No events shown, pollflags '%x', our events '%x'\n", pollflags,
-				tables->parent->fileinfo.events);
 		return 0;
 	}
 
