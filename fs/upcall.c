@@ -629,6 +629,8 @@ int register_subscription(struct subscription_manager *mgr, int fd, __poll_t eve
 	struct fd desc;
 	struct subscription *sub;
 
+	enter_ukl_kernel();
+
 	desc = fdget(fd);
 	if (!desc.file) {
 		err = -EBADF;
@@ -656,6 +658,7 @@ unlock_out:
 desc_put:
 	fdput(desc);
 err_ret:
+	enter_ukl_user();
 	return err;
 }
 
@@ -664,6 +667,8 @@ int remove_subscription(struct subscription_manager *mgr, int fd, __poll_t event
 	int err;
 	struct fd desc;
 	struct subscription *sub;
+
+	enter_ukl_kernel();
 
 	desc = fdget(fd);
 	if (!desc.file) {
@@ -699,12 +704,15 @@ int remove_subscription(struct subscription_manager *mgr, int fd, __poll_t event
 	fdput(desc);
 
 	kref_put(&sub->ref_count, subscription_release);
+	
+	enter_ukl_user();
 	return 0;
 
 out_put_unlock:
 	mutex_unlock(&mgr->sub_mtx);
 	fdput(desc);
 err_ret:
+	enter_ukl_user();
 	return err;
 }
 
