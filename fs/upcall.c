@@ -557,7 +557,7 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 				void(work_fn)(void*), void *arg)
 {
 	struct subscription *sub;
-	struct list_head *to_free;
+	struct list_head *to_free = NULL;
 
 	lockdep_assert_irqs_enabled();
 
