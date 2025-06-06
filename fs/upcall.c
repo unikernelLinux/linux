@@ -292,8 +292,10 @@ static void cleanup_file(struct subscription *sub)
 		spin_unlock(&file->f_lock);
 	}
 
-	if (to_free)
+	if (to_free) {
+		pr_err("Freeing %px into cache %px\n", to_free, uplist_cache);
 		kmem_cache_free(uplist_cache, to_free);
+	}
 }
 
 static void unhook_waiters(struct sub_poll *tables)
@@ -314,7 +316,9 @@ static void sub_rcu_free(struct rcu_head *rcu)
 	struct subscription *sub = container_of(rcu, struct subscription, rcu);
 	struct sub_poll *tables = sub->tables;
 
+	pr_err("Freeing %px into cache %px\n", tables, table_cache);
 	kmem_cache_free(table_cache, tables);
+	pr_err("Freeing %px into cache %px\n", sub, sub_cache);
 	kmem_cache_free(sub_cache, sub);
 }
 
@@ -372,8 +376,9 @@ struct work_item* workitem_queue_consume_event(void)
 
 	spin_unlock_irqrestore(&handler->work_lock, flags);
 
-	if (event)
+	if (event) {
 		kmem_cache_free(event_cache, event);
+	}
 
 	enter_ukl_user();
 	return ret;
@@ -563,6 +568,7 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 		return -ENOMEM;
 
 	if (!(sub->tables = kmem_cache_zalloc(table_cache, GFP_KERNEL))) {
+		pr_err("Freeing %px into cache %px\n", sub, sub_cache);
 		kmem_cache_free(sub_cache, sub);
 		return -ENOMEM;
 	}
@@ -581,7 +587,9 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 
 	if (!READ_ONCE(file->f_upcall)) {
 		if (!(to_free = kmem_cache_zalloc(uplist_cache, GFP_KERNEL))) {
+			pr_err("Freeing %px into cache %px\n", sub->tables, table_cache);
 			kmem_cache_free(table_cache, sub->tables);
+			pr_err("Freeing %px into cache %px\n", sub, sub_cache);
 			kmem_cache_free(sub_cache, sub);
 			return -ENOMEM;
 		}
@@ -596,8 +604,10 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 	list_add_rcu(&sub->tables->anchor, file->f_upcall);
 	spin_unlock(&file->f_lock);
 
-	if (to_free)
+	if (to_free) {
+		pr_err("Freeing %px into cache %px\n", to_free, uplist_cache);
 		kmem_cache_free(uplist_cache, to_free);
+	}
 
 	sub_rbtree_insert(mgr, sub);
 
