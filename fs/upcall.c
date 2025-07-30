@@ -167,11 +167,11 @@ void ukl_worker_sleep(void)
 	// Okay, we really need to sleep.
 	list_add_tail(&current->event_handlers, &handler->tasks);
 	set_current_state(TASK_IDLE);
-	spin_unlock(&handler->tasks_lock);
-	local_irq_restore(flags);
-	// This barrier is paired with the one in upcall_hanlder() which will execute in
+	// This barrier is paired with the one in upcall_handler() which will execute in
 	// softIRQ context and attempt to wake a worker.
 	smp_mb();
+	spin_unlock(&handler->tasks_lock);
+	local_irq_restore(flags);
 
 	schedule();
 out:
@@ -258,16 +258,10 @@ int init_upcall_handler(int concurrency_model)
  */
 void register_ukl_handler_task(void)
 {
-	struct sched_param params;
-
 	enter_ukl_kernel();
 
-	// Set scheduler and cpu for handler task
-	params.sched_priority = 99;
-	if (sched_setscheduler_nocheck(current, SCHED_RR, &params)) {
-		pr_warn("Failed to change scheduler policy to SCHED_RR.\n");
-	}
-
+	// Unfortunately, there really isn't a better place to do this. Finding a better
+	// location would allow us to delete this function.
 	INIT_LIST_HEAD(&current->event_handlers);
 
 	enter_ukl_user();
