@@ -838,6 +838,10 @@ struct task_struct {
 	struct alloc_tag		*alloc_tag;
 #endif
 
+#ifdef CONFIG_UPCALL
+	struct list_head		event_handlers;
+#endif
+
 #ifdef CONFIG_SMP
 	int				on_cpu;
 	struct __call_single_node	wake_entry;

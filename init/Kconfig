@@ -1737,6 +1737,13 @@ config EPOLL
 	  Disabling this option will cause the kernel to be built without
 	  support for epoll family of system calls.
 
+config UPCALL
+	bool "Enable upcall event handling support"
+	default y
+	help
+	  Disabling this option will build the kernel without upcall event
+	  handling support.
+
 config SIGNALFD
 	bool "Enable signalfd() system call" if EXPERT
 	default y

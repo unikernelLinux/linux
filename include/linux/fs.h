@@ -1122,6 +1122,9 @@ struct file {
 #ifdef CONFIG_EPOLL
 	struct hlist_head		*f_ep;
 #endif
+#ifdef CONFIG_UPCALL
+	struct list_head		*f_upcall;
+#endif
 	union {
 		struct callback_head	f_task_work;
 		struct llist_node	f_llist;
