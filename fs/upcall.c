@@ -229,7 +229,7 @@ static struct subscription_manager *create_upcall_handler(int flags)
 			for_each_cpu(j, topology_cluster_cpumask(i)) {
 				if (i == j)
 					continue;
-				mgr->handlers[i] = mine;
+				mgr->handlers[j] = mine;
 			}
 		}
 		break;
@@ -266,15 +266,15 @@ static void cleanup_file(struct subscription *sub)
 
 	/* Unhook from the file, if we are still connected */
 	if ((file = smp_load_acquire(&sub->fileinfo.file))) {
-		spin_lock(&file->f_lock);
-		head = file->f_upcall;
-		if (head->next == &sub->tables->anchor && sub->tables->anchor.next == head) {
-			to_free = head;
-			file->f_upcall = NULL;
+		scoped_guard(spinlock, &file->f_lock) {
+			head = file->f_upcall;
+			if (head->next == &sub->tables->anchor && sub->tables->anchor.next == head) {
+				to_free = head;
+				file->f_upcall = NULL;
+			}
+			list_del_rcu(&sub->tables->anchor);
+			smp_store_release(&sub->fileinfo.file, NULL);
 		}
-		list_del_rcu(&sub->tables->anchor);
-		smp_store_release(&sub->fileinfo.file, NULL);
-		spin_unlock(&file->f_lock);
 	}
 
 	if (to_free) {
@@ -286,13 +286,13 @@ static void unhook_waiters(struct sub_poll *tables)
 {
 	wait_queue_head_t *whead;
 
-	rcu_read_lock();
-	whead = smp_load_acquire(&tables->whead);
-	if (whead) {
-		remove_wait_queue(whead, &tables->wait);
-		smp_store_release(&tables->whead, NULL);
+	scoped_guard(rcu) {
+		whead = smp_load_acquire(&tables->whead);
+		if (whead) {
+			remove_wait_queue(whead, &tables->wait);
+			smp_store_release(&tables->whead, NULL);
+		}
 	}
-	rcu_read_unlock();
 }
 
 static void sub_rcu_free(struct rcu_head *rcu)
@@ -312,12 +312,12 @@ static void subscription_release(struct kref *ref)
 	struct sub_poll *tables = sub->tables;
 
 	/* Remove us from the overall RB tree */
-	mutex_lock(&mgr->sub_mtx);
-	rb_erase_cached(&sub->rbn, &mgr->rbr);
+	scoped_guard(mutex, &mgr->sub_mtx) {
+		rb_erase_cached(&sub->rbn, &mgr->rbr);
 
-	unhook_waiters(tables);
-	cleanup_file(sub);
-	mutex_unlock(&mgr->sub_mtx);
+		unhook_waiters(tables);
+		cleanup_file(sub);
+	}
 
 	/* Now tell RCU to free everything when we are sure it's safe */
 	call_rcu(&sub->rcu, sub_rcu_free);
@@ -334,34 +334,25 @@ static struct subscription* workitem_queue_consume_event(struct subscription_man
 
 	local_irq_save(flags);
 	handler = mgr->handlers[smp_processor_id()];
-	spin_lock(&handler->work_lock);
-	// This barrier is paired with one in workitem_queue_add_event(), this barrier ensures
-	// the worker thread sees the new work items.
-	smp_mb();
-	event = list_first_entry_or_null(&handler->work_item_head, struct sub_event,
-			work_item_head);
-	if (event) {
-		list_del_init(&event->work_item_head);
-		ret = event->sub;
+	scoped_guard(spinlock, &handler->work_lock) {
+		// This barrier is paired with one in enqueue_event(), this barrier ensures
+		// the worker thread sees the new work items.
+		smp_mb();
+		event = list_first_entry_or_null(&handler->work_item_head, struct sub_event,
+				work_item_head);
+		if (event) {
+			list_del_init(&event->work_item_head);
+			ret = event->sub;
+		}
 	}
 
-	spin_unlock_irqrestore(&handler->work_lock, flags);
+	local_irq_restore(flags);
 
 	if (event) {
 		kmem_cache_free(event_cache, event);
 	}
 
 	return ret;
-}
-
-/* Caller is expected to have disabled interrupts */
-static void workitem_queue_add_event(struct event_handler *handler, struct sub_event *event)
-{
-	spin_lock(&handler->work_lock);
-	list_add_tail(&event->work_item_head, &handler->work_item_head);
-	spin_unlock(&handler->work_lock);
-	// This barrier is paired with the one in workitem_queue_consume_event()
-	smp_mb();
 }
 
 static void enqueue_event(struct subscription *sub)
@@ -393,20 +384,24 @@ static void enqueue_event(struct subscription *sub)
 	kref_get(&sub->ref_count);
 	event->sub = sub;
 
-	workitem_queue_add_event(handler, event);
-
-	spin_lock(&handler->tasks_lock);
-	// This barrier is paired with the one in the worker_sleep() function
-	smp_mb();
-
-	thread = list_first_entry_or_null(&handler->tasks, struct task_struct,
-			event_handlers);
-	if (thread) {
-		list_del_init(&thread->event_handlers);
-		wake_up_process(thread);
+	scoped_guard(spinlock, &handler->work_lock) {
+		list_add_tail(&event->work_item_head, &handler->work_item_head);
+		// This barrier is paired with the one in workitem_queue_consume_event()
+		smp_mb();
 	}
 
-	spin_unlock_irqrestore(&handler->tasks_lock, flags);
+	scoped_guard(spinlock, &handler->tasks_lock) {
+		// This barrier is paired with the one in the worker_sleep() function
+		smp_mb();
+
+		thread = list_first_entry_or_null(&handler->tasks, struct task_struct,
+				event_handlers);
+		if (thread) {
+			list_del_init(&thread->event_handlers);
+			wake_up_state(thread, TASK_NORMAL | TASK_IDLE);
+		}
+	}
+	local_irq_restore(flags);
 }
 
 static int handle_event_source(struct wait_queue_entry *wq_entry, unsigned mode,
@@ -562,13 +557,13 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 		INIT_LIST_HEAD(to_free);
 	}
 
-	spin_lock(&file->f_lock);
-	if (!file->f_upcall) {
-		file->f_upcall = to_free;
-		to_free = NULL;
+	scoped_guard(spinlock, &file->f_lock) {
+		if (!file->f_upcall) {
+			WRITE_ONCE(file->f_upcall, to_free);
+			to_free = NULL;
+		}
+		list_add_rcu(&sub->tables->anchor, file->f_upcall);
 	}
-	list_add_rcu(&sub->tables->anchor, file->f_upcall);
-	spin_unlock(&file->f_lock);
 
 	if (to_free) {
 		kmem_cache_free(uplist_cache, to_free);
@@ -590,64 +585,46 @@ static int create_subscription(struct subscription_manager *mgr, int fd, struct 
 static int register_subscription(struct subscription_manager *mgr, int fd, struct file *file,
 				__poll_t events, void(work_fn)(void*), void *arg)
 {
-	int err;
 	struct subscription *sub;
 
-	mutex_lock(&mgr->sub_mtx);
+	scoped_guard(mutex, &mgr->sub_mtx) {
+		sub = lookup_sub(mgr, fd, file, events);
 
-	sub = lookup_sub(mgr, fd, file, events);
+		if (sub)
+			return -EEXIST;
 
-	if (sub) {
-		err = -EEXIST;
-		goto unlock_out;
+		return create_subscription(mgr, fd, file, events, work_fn, arg);
 	}
-
-	err = create_subscription(mgr, fd, file, events, work_fn, arg);
-
-unlock_out:
-	mutex_unlock(&mgr->sub_mtx);
-	return err;
 }
 
 static int remove_subscription(struct subscription_manager *mgr, int fd,
 				struct file *file, __poll_t events)
 {
-	int err;
 	struct subscription *sub;
 
-	mutex_lock(&mgr->sub_mtx);
+	scoped_guard(mutex, &mgr->sub_mtx) {
+		sub = lookup_sub(mgr, fd, file, events | UPCALLERR);
 
-	sub = lookup_sub(mgr, fd, file, events | UPCALLERR);
+		if (!sub)
+			return -EEXIST;
 
-	if (!sub) {
-		err = -EEXIST;
-		goto out_unlock;
+		if ((sub->fileinfo.events & (events | UPCALLERR)) != (events | UPCALLERR))
+			return -EEXIST;
+
+		/*
+		* When removing a subscription from an existing file, we only want to
+		* remove the ability to trigger new events without removing information
+		* needed to handle the existing events. If this is the last outstanding
+		* reference to the subscription, the file bits will be cleaned when we
+		* release the reference below.
+		*/
+		unhook_waiters(sub->tables);
+		cleanup_file(sub);
 	}
-
-	if ((sub->fileinfo.events & (events | UPCALLERR)) != (events | UPCALLERR)) {
-		err = -EEXIST;
-		goto out_unlock;
-	}
-
-	/*
-	 * When removing a subscription from an existing file, we only want to
-	 * remove the ability to trigger new events without removing information
-	 * needed to handle the existing events. If this is the last outstanding
-	 * reference to the subscription, the file bits will be cleaned when we
-	 * release the reference below.
-	 */
-	unhook_waiters(sub->tables);
-	cleanup_file(sub);
-
-	mutex_unlock(&mgr->sub_mtx);
 
 	kref_put(&sub->ref_count, subscription_release);
 	
 	return 0;
-
-out_unlock:
-	mutex_unlock(&mgr->sub_mtx);
-	return err;
 }
 
 void upcall_release_file(struct file *file)
@@ -670,14 +647,14 @@ static void free_manager(struct subscription_manager *mgr)
 	uint64_t i;
 	/* When we get here we have no remaining subscriptions and no outstanding
 	   events so we can safely delete our queues */
-	mutex_lock(&mgr->sub_mtx);
-	for (i = 0; i < NR_CPUS; i++) {
-		if (mgr->handlers[i]) {
-			kfree(mgr->handlers[i]);
-			mgr->handlers[i] = NULL;
+	scoped_guard(mutex, &mgr->sub_mtx) {
+		for (i = 0; i < NR_CPUS; i++) {
+			if (mgr->handlers[i]) {
+				kfree(mgr->handlers[i]);
+				mgr->handlers[i] = NULL;
+			}
 		}
 	}
-	mutex_unlock(&mgr->sub_mtx);
 	kfree(mgr);
 }
 
@@ -705,18 +682,18 @@ static void upcall_show_fdinfo(struct seq_file *m, struct file *f)
 	struct subscription_manager *mgr = f->private_data;
 	struct rb_node *rbp;
 
-	mutex_lock(&mgr->sub_mtx);
-	for (rbp = rb_first_cached(&mgr->rbr); rbp; rbp = rb_next(rbp)) {
-		struct subscription *sub = rb_entry(rbp, struct subscription, rbn);
-		struct inode *inode = file_inode(sub->fileinfo.file);
-		seq_printf(m, "tfd: %8d events: %8x pos: %16llx ino: %lx sdev: %x\n",
-				sub->fileinfo.fd, sub->fileinfo.events,
-				sub->fileinfo.file->f_pos, inode->i_ino,
-				inode->i_sb->s_dev);
-		if (seq_has_overflowed(m))
-			break;
+	scoped_guard(mutex, &mgr->sub_mtx) {
+		for (rbp = rb_first_cached(&mgr->rbr); rbp; rbp = rb_next(rbp)) {
+			struct subscription *sub = rb_entry(rbp, struct subscription, rbn);
+			struct inode *inode = file_inode(sub->fileinfo.file);
+			seq_printf(m, "tfd: %8d events: %8x pos: %16llx ino: %lx sdev: %x\n",
+					sub->fileinfo.fd, sub->fileinfo.events,
+					sub->fileinfo.file->f_pos, inode->i_ino,
+					inode->i_sb->s_dev);
+			if (seq_has_overflowed(m))
+				break;
+		}
 	}
-	mutex_unlock(&mgr->sub_mtx);
 }
 #endif
 
@@ -747,9 +724,25 @@ static const struct file_operations upcall_fops = {
 	.unlocked_ioctl		= upcall_ioctl,
 };
 
-SYSCALL_DEFINE2(upcall_wait, int, upfd, struct work_item __user *, item)
+static int do_upcall_wait(struct subscription_manager *mgr, struct work_item __user *item)
 {
 	struct subscription *sub = NULL;
+
+	while (NULL == (sub = workitem_queue_consume_event(mgr))) {
+		upcall_worker_sleep(mgr);
+	}
+
+	if (copy_to_user(item, &sub->work, sizeof(struct work_item))) {
+		pr_err("Failed to send event.\n");
+		return -EFAULT;
+	}
+	kref_put(&sub->ref_count, subscription_release);
+
+	return 0;
+}
+
+SYSCALL_DEFINE2(upcall_wait, int, upfd, struct work_item __user *, item)
+{
 	struct subscription_manager *mgr;
 
 	CLASS(fd, f)(upfd);
@@ -761,15 +754,7 @@ SYSCALL_DEFINE2(upcall_wait, int, upfd, struct work_item __user *, item)
 
 	mgr = fd_file(f)->private_data;
 
-	while (NULL == (sub = workitem_queue_consume_event(mgr))) {
-		upcall_worker_sleep(mgr);
-	}
-
-	if (copy_to_user(item, &sub->work, sizeof(struct work_item)))
-		return -EFAULT;
-	kref_put(&sub->ref_count, subscription_release);
-
-	return 0;
+	return do_upcall_wait(mgr, item);
 }
 
 SYSCALL_DEFINE5(upcall_ctl, int, upfd, int, op, int, fd,
@@ -787,11 +772,13 @@ SYSCALL_DEFINE5(upcall_ctl, int, upfd, int, op, int, fd,
 	if (fd_empty(tf))
 		return -EBADF;
 
-	if (is_file_upcall(fd_file(tf)))
+	if (is_file_upcall(fd_file(tf))) {
 		return -EINVAL;
+	}
 
-	if(!is_file_upcall(fd_file(f)))
+	if(!is_file_upcall(fd_file(f))) {
 		return -EINVAL;
+	}
 
 	mgr = fd_file(f)->private_data;
 
