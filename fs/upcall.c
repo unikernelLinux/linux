@@ -168,7 +168,7 @@ static void upcall_worker_sleep(struct subscription_manager *mgr)
 	spin_unlock(&handler->work_lock);
 
 	// Okay, we really need to sleep.
-	list_add_tail(&current->event_handlers, &handler->tasks);
+	list_add(&current->event_handlers, &handler->tasks);
 	set_current_state(TASK_IDLE);
 	// This barrier is paired with the one in upcall_handler() which will execute in
 	// softIRQ context and attempt to wake a worker.
