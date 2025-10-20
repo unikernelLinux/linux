@@ -724,26 +724,39 @@ static const struct file_operations upcall_fops = {
 	.unlocked_ioctl		= upcall_ioctl,
 };
 
-static int do_upcall_wait(struct subscription_manager *mgr, struct work_item __user *item)
+static int do_upcall_wait(struct subscription_manager *mgr, int count, struct work_item __user *item)
 {
 	struct subscription *sub = NULL;
+	int copied = 0;
 
-	while (NULL == (sub = workitem_queue_consume_event(mgr))) {
-		upcall_worker_sleep(mgr);
+	while (copied < count) {
+		sub = workitem_queue_consume_event(mgr);
+		if (sub == NULL) {
+			if (copied == 0) {
+				upcall_worker_sleep(mgr);
+			} else {
+				break;
+			}
+		} else {
+			if (__put_user(sub->work.arg, &item[copied].arg) ||
+					__put_user(sub->work.work_fn, &item[copied].work_fn)) {
+				pr_err("Failed to send event.\n");
+				return -EFAULT;
+			}
+			kref_put(&sub->ref_count, subscription_release);
+			copied++;
+		}
 	}
 
-	if (copy_to_user(item, &sub->work, sizeof(struct work_item))) {
-		pr_err("Failed to send event.\n");
-		return -EFAULT;
-	}
-	kref_put(&sub->ref_count, subscription_release);
-
-	return 0;
+	return copied;
 }
 
-SYSCALL_DEFINE2(upcall_wait, int, upfd, struct work_item __user *, item)
+SYSCALL_DEFINE3(upcall_wait, int, upfd, int, count, struct work_item __user *, item)
 {
 	struct subscription_manager *mgr;
+
+	if (count <= 0)
+		return -EINVAL;
 
 	CLASS(fd, f)(upfd);
 	if (fd_empty(f))
@@ -754,7 +767,7 @@ SYSCALL_DEFINE2(upcall_wait, int, upfd, struct work_item __user *, item)
 
 	mgr = fd_file(f)->private_data;
 
-	return do_upcall_wait(mgr, item);
+	return do_upcall_wait(mgr, count, item);
 }
 
 SYSCALL_DEFINE5(upcall_ctl, int, upfd, int, op, int, fd,
