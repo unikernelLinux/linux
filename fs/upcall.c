@@ -5,34 +5,28 @@
 
 #include <linux/init.h>
 #include <linux/kernel.h>
-#include <linux/sched/signal.h>
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/errno.h>
 #include <linux/poll.h>
-#include <linux/string.h>
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/syscalls.h>
 #include <linux/rbtree.h>
 #include <linux/wait.h>
+#include <linux/kref.h>
 #include <linux/eventpoll.h>
 #include <linux/bitops.h>
 #include <linux/smp.h>
 #include <linux/uaccess.h>
-#include <asm/io.h>
 #include <linux/atomic.h>
-#include <linux/compat.h>
 #include <linux/rculist.h>
-#include <net/busy_poll.h>
-#include <asm/mmu_context.h>
 #include <linux/percpu-defs.h>
 #include <linux/cpumask.h>
 #include <linux/anon_inodes.h>
 #include <linux/upcall.h>
 
 #include <linux/sched.h>
-#include <uapi/linux/sched/types.h>
 
 struct upcall_filefd {
 	struct file *file;
