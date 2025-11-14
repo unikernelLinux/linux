@@ -619,6 +619,8 @@ static int remove_subscription(struct subscription_manager *mgr, int fd,
 		* release the reference below.
 		*/
 		unhook_waiters(sub->tables);
+		list_del_rcu(&sub->tables->anchor);
+		smp_store_release(&sub->fileinfo.file, NULL);
 		cleanup_file(sub);
 	}
 
