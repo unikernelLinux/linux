@@ -164,9 +164,6 @@ static void upcall_worker_sleep(struct subscription_manager *mgr)
 	// Okay, we really need to sleep.
 	list_add(&current->event_handlers, &handler->tasks);
 	set_current_state(TASK_IDLE);
-	// This barrier is paired with the one in upcall_handler() which will execute in
-	// softIRQ context and attempt to wake a worker.
-	smp_mb();
 	spin_unlock(&handler->tasks_lock);
 	local_irq_restore(flags);
 
@@ -329,9 +326,6 @@ static struct subscription* workitem_queue_consume_event(struct subscription_man
 	local_irq_save(flags);
 	handler = mgr->handlers[smp_processor_id()];
 	scoped_guard(spinlock, &handler->work_lock) {
-		// This barrier is paired with one in enqueue_event(), this barrier ensures
-		// the worker thread sees the new work items.
-		smp_mb();
 		event = list_first_entry_or_null(&handler->work_item_head, struct sub_event,
 				work_item_head);
 		if (event) {
@@ -380,14 +374,9 @@ static void enqueue_event(struct subscription *sub)
 
 	scoped_guard(spinlock, &handler->work_lock) {
 		list_add_tail(&event->work_item_head, &handler->work_item_head);
-		// This barrier is paired with the one in workitem_queue_consume_event()
-		smp_mb();
 	}
 
 	scoped_guard(spinlock, &handler->tasks_lock) {
-		// This barrier is paired with the one in the worker_sleep() function
-		smp_mb();
-
 		thread = list_first_entry_or_null(&handler->tasks, struct task_struct,
 				event_handlers);
 		if (thread) {
