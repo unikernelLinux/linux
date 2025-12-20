@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# io_uring configuration
+#
+
+config UPCALLS
+	bool "Enable Upcall Support"
+	default y
+	help
+	  Support for the upcall event handler.
+
+#depends on NET_RX_BUSY_POLL

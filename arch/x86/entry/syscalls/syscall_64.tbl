@@ -392,8 +392,7 @@
 466	common	removexattrat		sys_removexattrat
 467	common	open_tree_attr		sys_open_tree_attr
 468	common	upcall_create		sys_upcall_create
-469	common	upcall_ctl		sys_upcall_ctl
-470	common	upcall_wait		sys_upcall_wait
+469	common	upcall_submit		sys_upcall_submit
 
 #
 # Due to a historical design error, certain syscalls are numbered differently

@@ -13,21 +13,6 @@
 #include <uapi/linux/eventpoll.h>
 
 /* Upcall event masks, lifted from eventpoll.h */
-#define UPCALLIN	EPOLLIN
-#define UPCALLPRI	EPOLLPRI
-#define UPCALLOUT	EPOLLOUT
-#define UPCALLERR	EPOLLERR
-#define UPCALLHUP	EPOLLHUP
-#define UPCALLNVAL	EPOLLNVAL
-#define UPCALLRDNORM	EPOLLRDNORM
-#define UPCALLRDBAND	EPOLLRDBAND
-#define UPCALLWRNORM	EPOLLWRNORM
-#define UPCALLWRBAND	EPOLLWRBAND
-#define UPCALLMSG	EPOLLMSG
-#define UPCALLRDHUP	EPOLLRDHUP
-
-#define UPCALL_ADD 1
-#define UPCALL_DEL 2
 
 #ifdef __x86_64__
 #define UPCALL_PACKED __attribute__((packed))
@@ -36,18 +21,19 @@
 #endif
 
 #define UPIOGQCNT	0x00000001
-#define UPIOSTSK	0x00000002
 
 #define UPCALL_PCPU		0x00010000
 #define UPCALL_PCACHE		0x00020000
 #define UPCALL_SINGLE		0x00040000
 #define UPCALL_MODEL_MASK	0x00070000
-#define UPCALL_MASK		(O_CLOEXEC | UPCALL_MODEL_MASK)
 
-struct work_item {
+struct up_event {
+	int32_t		fd;
+	int32_t		result;
+	void		__user *buf;
+	uint64_t	len;
 	void *arg;
 	void (*work_fn)(void *arg);
 } UPCALL_PACKED;
-
 
 #endif

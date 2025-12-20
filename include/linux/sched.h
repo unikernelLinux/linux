@@ -838,7 +838,7 @@ struct task_struct {
 	struct alloc_tag		*alloc_tag;
 #endif
 
-#ifdef CONFIG_UPCALL
+#ifdef CONFIG_UPCALLS
 	struct list_head		event_handlers;
 #endif
 

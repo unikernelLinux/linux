@@ -32,3 +32,5 @@ source "lib/Kconfig.debug"
 source "Documentation/Kconfig"
 
 source "io_uring/Kconfig"
+
+source "upcalls/Kconfig"
