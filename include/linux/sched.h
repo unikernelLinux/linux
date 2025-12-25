@@ -765,6 +765,14 @@ struct task_struct {
 	unsigned int			ukl_bypass_syscall;
 	unsigned int			ukl_bypass_limit;
 	unsigned int			ukl_bypass_current;
+	/*
+	 * UKL Pledge: Bitmask of allowed capabilities for this task.
+	 * Inspired by OpenBSD pledge(2) and Nanos unikernel.
+	 * 0 = no restrictions (all syscalls allowed)
+	 * non-zero = only syscalls matching the bitmask are permitted
+	 * See include/linux/ukl_pledge.h for bit definitions.
+	 */
+	u64				ukl_pledge;
 #endif
 	refcount_t			usage;
 	/* Per task flags (PF_*), defined further below: */

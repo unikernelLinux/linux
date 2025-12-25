@@ -86,6 +86,63 @@ space, application should have the correct memory model. Examples of other
 applications like Redis, Memcached etc along with glibc and libgcc etc.,
 can be found at https://github.com/unikernelLinux/ukl
 
+UKL Pledge (Security Sandboxing)
+=================================
+
+UKL Pledge is a security mechanism inspired by OpenBSD's pledge(2) and the
+Nanos unikernel implementation. It allows a UKL application to restrict its
+own capabilities after initialization, providing defense-in-depth for
+applications running in supervisor mode.
+
+Since UKL applications run in Ring 0, a bug or exploit could theoretically
+affect kernel structures. Pledge mitigates this by allowing the application
+to declare: "I only need these specific capabilities; terminate me if I try
+anything else."
+
+Pledge Promises
+---------------
+
+Each promise grants access to a category of system calls:
+
+- ``stdio``: Basic I/O (read, write, close, etc.)
+- ``rpath``: Read-only filesystem access
+- ``wpath``: Write filesystem access
+- ``cpath``: Create/delete filesystem entries
+- ``inet``: IPv4/IPv6 network operations
+- ``unix``: UNIX domain sockets
+- ``dns``: DNS resolution
+- ``proc``: Process operations (fork, kill, wait)
+- ``exec``: Execute other programs
+- ``id``: Change UID/GID
+
+Usage
+-----
+
+From C::
+
+    #include <linux/ukl_pledge.h>
+    
+    int main() {
+        // Restrict to stdio and network only
+        ukl_pledge(UKL_PLEDGE_STDIO | UKL_PLEDGE_INET, 0);
+        
+        // ... application code ...
+        // Any attempt to fork() or exec() will now fail
+    }
+
+Language Bindings
+-----------------
+
+The pledge API is designed to support bindings for multiple languages:
+
+- **C/C++**: Direct syscall or wrapper function
+- **Go**: Via ``syscall.Syscall()`` or cgo wrapper
+- **Rust**: Via ``libc`` crate or direct ``syscall!`` macro
+- **Python**: Via ``ctypes`` or native extension module
+
+The underlying mechanism uses a simple ``u64`` bitmask stored per-task,
+making it straightforward to expose through any language's FFI.
+
 List of authors and contributors:
 =================================
 
