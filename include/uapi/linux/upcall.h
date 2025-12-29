@@ -32,8 +32,7 @@ struct up_event {
 	int32_t		result;
 	void		__user *buf;
 	uint64_t	len;
-	void *arg;
-	void (*work_fn)(void *arg);
+	void		(*work_fn)(struct up_event *arg);
 } UPCALL_PACKED;
 
 #endif

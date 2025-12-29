@@ -63,27 +63,22 @@ static struct kmem_cache *anchor_cache __read_mostly;
 
 static void free_manager_kref(struct kref *kref);
 
+static inline void put_mgr(struct event_manager *mgr)
+{
+	kref_put(&mgr->ref_count, free_manager_kref);
+}
+
 /* Callers are expected to have disabled IRQs */
 static inline struct event_channel *get_event_channel(struct event_manager *mgr)
 {
 	return mgr->channels[smp_processor_id()];
 }
 
-static inline void post_event(struct event_anchor *anchor)
+static void post_event(struct event_anchor *anchor)
 {
 	unsigned long flags;
 	struct task_struct *thread;
-	struct wait_queue_head *head;
 	struct event_channel *channel;
-
-	/* We found one we care about, unhook the waiter */
-	head = smp_load_acquire(&anchor->whead);
-	if (head) {
-		spin_lock_irq(&head->lock);
-		list_del_init(&anchor->wait.entry);
-		anchor->whead = NULL;
-		spin_unlock_irq(&head->lock);
-	}
 
 	/* Now, we add this to the wakeup list for this CPU and potentially wake a
 	   waiting thread to process */
@@ -170,7 +165,7 @@ static __poll_t upcall_item_poll(struct event_anchor *anchor, __poll_t events)
 	poll_table *pt = &anchor->pt;
 	__poll_t res;
 
-	pt->_key = events;
+	anchor->events = pt->_key = events;
 	res = vfs_poll(file, pt);
 
 	fput(file);
@@ -188,8 +183,11 @@ static struct event_anchor *get_next_wakeup(struct event_manager *mgr)
 	channel = get_event_channel(mgr);
 	scoped_guard(spinlock, &channel->wakeup_lock) {
 		anchor = list_first_entry_or_null(&channel->wakeups, struct event_anchor, anchor);
+		if (!anchor)
+			goto out;
 		list_del_init(&anchor->anchor);
 	}
+out:
 	local_irq_restore(flags);
 	return anchor;
 }
@@ -233,6 +231,7 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt, struct up_eve
 	int out_idx = 0;
 	struct event_anchor *anchor;
 	int armed;
+	struct wait_queue_head *head;
 
 	INIT_LIST_HEAD(&current->event_handlers);
 
@@ -253,6 +252,7 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt, struct up_eve
 			}
 			anchor->event = in[i];
 			INIT_LIST_HEAD(&anchor->anchor);
+			INIT_LIST_HEAD(&anchor->wait.entry);
 			anchor->mgr = mgr;
 			kref_get(&mgr->ref_count);
 			atomic_set(&anchor->armed, 1);
@@ -261,8 +261,9 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt, struct up_eve
 				/* There was data waiting, check if we are still armed
 				and remove the poll linkage if we are */
 				armed = atomic_dec_return(&anchor->armed);
-				if (!armed)
+				if (!armed) {
 					post_event(anchor);
+				}
 			}
 		}
 		in[i] = NULL;
@@ -279,16 +280,20 @@ again:
 		if (!anchor)
 			break;
 
-		if (anchor->event->buf == NULL || anchor->event->len == 0) {
-			// This is either a READINESS request or an accept, either way
-			// punt it back to user space
-			out[out_idx] = anchor->event;
-		} else {
-			try_read(anchor->event);
-			out[out_idx] = anchor->event;
+		/* We found one we care about, unhook the waiter */
+		rcu_read_lock();
+		head = smp_load_acquire(&anchor->whead);
+		if (head) {
+			remove_wait_queue(head, &anchor->wait);
 		}
+		rcu_read_unlock();
+
+		if (anchor->event->buf != NULL && anchor->event->len != 0) {
+			try_read(anchor->event);
+		}
+		out[out_idx] = anchor->event;
 		out_idx++;
-		kref_put(&mgr->ref_count, free_manager_kref);
+		put_mgr(mgr);
 		kmem_cache_free(anchor_cache, anchor);
 	}
 
@@ -374,7 +379,9 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 	int ret = -EINVAL;
 	int cnt;
 
-	if (in_cnt <= 0 || in == NULL || out_cnt <= 0 || out == NULL)
+	if (in == NULL && in_cnt > 0)
+		goto out;
+	if (out_cnt <= 0 || out == NULL)
 		goto out;
 
 	ret = -EBADF;
@@ -400,16 +407,22 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 			clean_kitems(i, kitems);
 			goto out_free;
 		}
+		item->fd = -1;
 
 		kitems[i] = item;
 			
-		if (copy_from_user(item, &in[i], sizeof(struct up_event))) {
+		if (copy_from_user(item, &in[i], sizeof(*item))) {
 			clean_kitems(i + 1, kitems);
 			ret = -EFAULT;
 			goto out_free;
 		}
 
-		if (item->fd < 0) {
+		if (item->fd < 0 || item->work_fn == NULL) {
+			pr_err("Corrupted submission at %d of %d\n", i, in_cnt);
+			if (item->fd < 0)
+				pr_err("Bad fd\n");
+			else
+				pr_err("Missing continuation\n");
 			clean_kitems(i + 1, kitems);
 			ret = -EINVAL;
 			goto out_free;
@@ -420,16 +433,17 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 
 	cnt = do_upcall_submit(mgr, in_cnt, kitems, out_cnt, koutput);
 
-	for (int i = 0; i < out_cnt; i++) {
+	for (int i = 0; i < out_cnt && i < cnt; i++) {
 		if (copy_to_user(&out[i], koutput[i], sizeof(struct up_event))) {
 			ret = -EFAULT;
-			break;
+			goto out_clean;
 		}
 	}
 
-	ret = cnt;
 
-	clean_kitems(out_cnt, koutput);
+	ret = cnt;
+out_clean:
+	clean_kitems(cnt, koutput);
 out_free:
 	kfree(kitems);
 	kfree(koutput);
@@ -500,6 +514,8 @@ static struct event_manager *create_manager(int flags)
 		}
 		break;
 	}
+
+	kref_init(&mgr->ref_count);
 
 	return mgr;
 
