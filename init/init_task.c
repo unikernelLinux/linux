@@ -128,6 +128,9 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 #ifdef CONFIG_IO_URING
 	.io_uring	= NULL,
 #endif
+#ifdef CONFIG_UPCALLS
+	.worker_context	= NULL,
+#endif
 	.signal		= &init_signals,
 	.sighand	= &init_sighand,
 	.nsproxy	= &init_nsproxy,

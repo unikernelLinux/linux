@@ -21,11 +21,20 @@
 #endif
 
 #define UPIOGQCNT	0x00000001
+#define UPWRKINIT       0x00000002
 
 #define UPCALL_PCPU		0x00010000
 #define UPCALL_PCACHE		0x00020000
 #define UPCALL_SINGLE		0x00040000
-#define UPCALL_MODEL_MASK	0x00070000
+#define UPCALL_MODEL_MASK	(UPCALL_PCPU | UPCALL_PCACHE | UPCALL_SINGLE)
+#define UPCALL_MASK		(O_CLOEXEC | UPCALL_MODEL_MASK)
+
+typedef enum {
+	UP_READ,        // Requesting a read of the fd
+	UP_ACCEPT,      // Requesting an accept4 on the fd (will imply SOCK_NONBLOCK)
+	UP_VEC,         // Give the struct iovec array at buf with len items to the kernel
+	NR_ACTIONS      // Error checking
+} up_action_t;
 
 struct up_event {
 	int32_t		fd;
@@ -33,6 +42,10 @@ struct up_event {
 	void		__user *buf;
 	uint64_t	len;
 	void		(*work_fn)(struct up_event *arg);
+	union {
+		up_action_t	type;
+		uint64_t	pad;
+	};
 } UPCALL_PACKED;
 
 #endif

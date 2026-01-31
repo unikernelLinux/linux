@@ -949,6 +949,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 #ifdef CONFIG_X86_BUS_LOCK_DETECT
 	tsk->reported_split_lock = 0;
 #endif
+#ifdef CONFIG_UPCALLS
+	tsk->worker_context = NULL;
+#endif
 
 #ifdef CONFIG_SCHED_MM_CID
 	tsk->mm_cid = -1;
@@ -2089,6 +2092,10 @@ __latent_entropy struct task_struct *copy_process(
 
 	posix_cputimers_init(&p->posix_cputimers);
 	tick_dep_init_task(p);
+
+#ifdef CONFIG_UPCALLS
+	p->worker_context = NULL;
+#endif
 
 	p->io_context = NULL;
 	audit_set_context(p, NULL);

@@ -18,6 +18,7 @@
 #include <linux/eventpoll.h>
 #include <linux/bitops.h>
 #include <linux/smp.h>
+#include <linux/net.h>
 #include <linux/uaccess.h>
 #include <linux/atomic.h>
 #include <linux/rculist.h>
@@ -25,14 +26,16 @@
 #include <linux/cpumask.h>
 #include <linux/anon_inodes.h>
 #include <linux/upcall.h>
+#include <linux/socket.h>
 
 #include <linux/sched.h>
 
 struct event_channel {
-	struct list_head	wakeups;
 	spinlock_t		wakeup_lock;
-	struct list_head	sleeping_workers;
 	spinlock_t		worker_lock;
+	struct list_head	wakeups;
+	struct list_head	sleeping_workers;
+	uint8_t			pad[8]; // Pad to a cacheline
 };
 
 struct event_manager {
@@ -48,11 +51,22 @@ struct event_anchor {
 	struct list_head	anchor;
 	struct up_event		*event;
 	struct event_manager	*mgr;
+	atomic_t		armed;
 	wait_queue_entry_t	wait;
 	wait_queue_head_t	*whead;
 	poll_table		pt;
 	__poll_t		events;
-	atomic_t		armed;
+};
+
+struct event_buffer {
+	struct iovec		iovec;
+	struct list_head	anchor;
+};
+
+struct worker_context {
+	struct task_struct	*worker;
+	struct list_head	buffers;
+	struct list_head	anchor;
 };
 
 /* up_event cache */
@@ -60,6 +74,9 @@ static struct kmem_cache *event_cache __read_mostly;
 
 /* Anchor cache */
 static struct kmem_cache *anchor_cache __read_mostly;
+
+/* Buffer cache */
+static struct kmem_cache *buffer_cache __read_mostly;
 
 static void free_manager_kref(struct kref *kref);
 
@@ -77,7 +94,7 @@ static inline struct event_channel *get_event_channel(struct event_manager *mgr)
 static void post_event(struct event_anchor *anchor)
 {
 	unsigned long flags;
-	struct task_struct *thread;
+	struct worker_context *ctx;
 	struct event_channel *channel;
 
 	/* Now, we add this to the wakeup list for this CPU and potentially wake a
@@ -90,11 +107,11 @@ static void post_event(struct event_anchor *anchor)
 	}
 
 	scoped_guard(spinlock, &channel->worker_lock) {
-		thread = list_first_entry_or_null(&channel->sleeping_workers,
-				struct task_struct, event_handlers);
-		if (thread) {
-			list_del_init(&thread->event_handlers);
-			wake_up_state(thread, TASK_NORMAL | TASK_IDLE);
+		ctx = list_first_entry_or_null(&channel->sleeping_workers,
+				struct worker_context, anchor);
+		if (ctx) {
+			list_del_init(&ctx->anchor);
+			wake_up_state(ctx->worker, TASK_NORMAL | TASK_IDLE);
 		}
 	}
 
@@ -107,11 +124,13 @@ static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
 	struct event_anchor *anchor = container_of(wq_entry, struct event_anchor, wait);
 	__poll_t pollflags = key_to_poll(key);
 	int armed;
+	pr_err("Got event for %d\n", anchor->event->fd);
 	
 	/* Check if this is an event we are waiting for */
 	if (pollflags && !(pollflags & anchor->events))
 		return 0;
 
+	pr_err("Got event we care about for %d\n", anchor->event->fd);
 	/* Take ownership of this anchor */
 	armed = atomic_dec_return(&anchor->armed);
 	if (armed) {
@@ -120,6 +139,7 @@ static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
 	}
 
 	post_event(anchor);
+	pr_err("Posted event for %d\n", anchor->event->fd);
 	return 0;
 }
 
@@ -132,31 +152,68 @@ static void upcall_poll_init(struct file *file, wait_queue_head_t *whead, poll_t
 	add_wait_queue(whead, &anchor->wait);
 }
 
-static inline int try_read(struct up_event *evt)
+static void get_buffer(struct iovec *iov)
+{
+	struct event_buffer *buf;
+
+	buf = list_first_entry_or_null(&(current->worker_context->buffers), struct event_buffer, anchor);
+	if (!buf) {
+		iov->iov_base = NULL;
+		return;
+	}
+	iov->iov_base = buf->iovec.iov_base;
+	iov->iov_len = buf->iovec.iov_len;
+	kmem_cache_free(buffer_cache, buf);
+}
+
+
+static void try_read(struct up_event *evt)
 {
 	struct file *file;
 	struct kiocb kiocb;
 	struct iov_iter iter;
+	struct iovec iov;
+	size_t cursor = 0;
 	int ret;
 	CLASS(fd_pos, f)(evt->fd);
 
 	if (fd_empty(f)) {
 		evt->result = -EBADF;
-		return 1;
+		return;
 	}
+
+	get_buffer(&iov);
+	if (iov.iov_base == NULL) {
+		evt->result = -ENOMEM;
+		return;
+	}
+
+	evt->buf = iov.iov_base;
+	evt->len = iov.iov_len;
 
 	file = fd_file(f);
 	init_sync_kiocb(&kiocb, file);
 
-	iov_iter_ubuf(&iter, ITER_DEST, evt->buf, evt->len);
+	while (cursor < iov.iov_len) {
 
-	ret = file->f_op->read_iter(&kiocb, &iter);
+		iov_iter_ubuf(&iter, ITER_DEST, iov.iov_base + cursor, iov.iov_len - cursor);
 
-	if (ret == -EAGAIN || ret == -EWOULDBLOCK)
-		return 0;
+		ret = file->f_op->read_iter(&kiocb, &iter);
 
-	evt->result = ret;
-	return 1;
+		if (ret <= 0)
+			break;
+		cursor += ret;
+	}
+
+	if (cursor == 0)
+		evt->result = ret;
+	else
+		evt->result = cursor;
+}
+
+static void try_accept(struct up_event *evt)
+{
+	 evt->result = __sys_accept4(evt->fd, NULL, 0, SOCK_NONBLOCK);
 }
 
 static __poll_t upcall_item_poll(struct event_anchor *anchor, __poll_t events)
@@ -216,7 +273,7 @@ static void worker_sleep(struct event_manager *mgr)
 	spin_unlock(&channel->wakeup_lock);
 
 	// Okay, we really need to sleep.
-	list_add(&current->event_handlers, &channel->sleeping_workers);
+	list_add_tail(&current->worker_context->anchor, &channel->sleeping_workers);
 	set_current_state(TASK_IDLE);
 	spin_unlock(&channel->worker_lock);
 	local_irq_restore(flags);
@@ -226,52 +283,93 @@ out:
 	return;
 }
 
-static int do_upcall_submit(struct event_manager *mgr, int in_cnt, struct up_event **in, int out_cnt, struct up_event **out)
+static struct event_anchor *build_anchor(struct event_manager *mgr, struct up_event *evt)
 {
-	int out_idx = 0;
+	struct event_anchor *anchor;
+
+	anchor = kmem_cache_alloc(anchor_cache, GFP_KERNEL);
+	if (!anchor) {
+		// Not sure what to do here, needs thinking
+		return NULL;
+	}
+	anchor->event = evt;
+	INIT_LIST_HEAD(&anchor->anchor);
+	INIT_LIST_HEAD(&anchor->wait.entry);
+	anchor->mgr = mgr;
+	kref_get(&mgr->ref_count);
+	atomic_set(&anchor->armed, 1);
+	return anchor;
+}
+
+static void attach_buffers(uint64_t cnt, struct iovec __user *bufs)
+{
+	struct worker_context *ctx = current->worker_context;
+	struct event_buffer *buf;
+
+	for (uint64_t i = 0; i < cnt; i++) {
+		buf = kmem_cache_alloc(buffer_cache, GFP_KERNEL);
+		INIT_LIST_HEAD(&buf->anchor);
+		if (copy_from_user(&buf->iovec, &bufs[i], sizeof(struct iovec)))
+			return;
+		list_add_tail(&ctx->buffers, &buf->anchor);
+	}
+}
+
+static int attach_poll(struct event_manager *mgr, struct up_event *evt)
+{
 	struct event_anchor *anchor;
 	int armed;
-	struct wait_queue_head *head;
 
-	INIT_LIST_HEAD(&current->event_handlers);
-
-	// Try all the submissions for I/O now
-	for (int i = 0; i < in_cnt; i++) {
-		// If we don't have a results buffer, this is either a poll notification or
-		// something like accept, we will use the vfs_poll interface later to check
-		// readability before returning.
-		if (in[i]->buf != NULL && in[i]->len != 0 &&
-				out_idx < out_cnt && try_read(in[i])) {
-			out[out_idx] = in[i];
-			out_idx++;
-		} else {
-			anchor = kmem_cache_alloc(anchor_cache, GFP_KERNEL);
-			if (!anchor) {
-				// Not sure what to do here, needs thinking
-				return -ENOMEM;
-			}
-			anchor->event = in[i];
-			INIT_LIST_HEAD(&anchor->anchor);
-			INIT_LIST_HEAD(&anchor->wait.entry);
-			anchor->mgr = mgr;
-			kref_get(&mgr->ref_count);
-			atomic_set(&anchor->armed, 1);
-			init_poll_funcptr(&anchor->pt, upcall_poll_init);
-			if (upcall_item_poll(anchor, EPOLLIN | EPOLLERR | EPOLLHUP)) {
-				/* There was data waiting, check if we are still armed
-				and remove the poll linkage if we are */
-				armed = atomic_dec_return(&anchor->armed);
-				if (!armed) {
-					post_event(anchor);
-				}
-			}
-		}
-		in[i] = NULL;
+	anchor = build_anchor(mgr, evt);
+	if (!anchor) {
+		return -ENOMEM;
 	}
 
-	if (out_idx == out_cnt)
-		goto out;
-	cond_resched();
+	pr_err("Polling on %d\n", evt->fd);
+	init_poll_funcptr(&anchor->pt, upcall_poll_init);
+	if (upcall_item_poll(anchor, EPOLLIN | EPOLLERR | EPOLLHUP)) {
+		/* There was data waiting, check if we are still armed
+		and remove the poll linkage if we are */
+		armed = atomic_dec_return(&anchor->armed);
+		if (!armed) {
+			post_event(anchor);
+		}
+	}
+
+	return 0;
+}
+
+static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
+		struct up_event **in, int out_cnt, struct up_event **out)
+{
+	int out_idx = 0;
+	int ret = 0;
+	struct event_anchor *anchor;
+	struct wait_queue_head *head;
+
+	// Handle all the incoming submissions
+	for (int i = 0; i < in_cnt; i++) {
+		switch (in[i]->type) {
+		case UP_VEC:
+			attach_buffers(in[i]->len, (struct iovec*)in[i]->buf);
+			kmem_cache_free(event_cache, in[i]);
+			break;
+
+		case UP_ACCEPT:
+			pr_err("Registering accept interest on %d\n", in[i]->fd);
+			ret = attach_poll(mgr, in[i]);
+			break;
+
+		case UP_READ:
+			ret = attach_poll(mgr, in[i]);
+			break;
+
+		default:
+			return -EINVAL;
+		};
+		in[i] = NULL;
+
+	}
 
 again:
 	// Now we need to check wakeups
@@ -288,8 +386,17 @@ again:
 		}
 		rcu_read_unlock();
 
-		if (anchor->event->buf != NULL && anchor->event->len != 0) {
+		switch (anchor->event->type) {
+		case UP_READ:
 			try_read(anchor->event);
+			break;
+		case UP_ACCEPT:
+			pr_err("Got accept wake up on %d\n", anchor->event->fd);
+			try_accept(anchor->event);
+			pr_err("Accept returned %d\n", anchor->event->result);
+			break;
+		default:
+			return -EINVAL;
 		}
 		out[out_idx] = anchor->event;
 		out_idx++;
@@ -298,24 +405,44 @@ again:
 	}
 
 	// Finally, if we have no active wakeups and no output, we need to sleep here and try again.
-	if (!out_idx) {
+	if (!out_idx && out_cnt > 0) {
+		pr_err("No work, sleeping\n");
 		worker_sleep(mgr);
+		pr_err("Woken by event\n");
 		goto again;
 	}
 
-out:
 	return out_idx;
+}
+
+static struct worker_context *build_context(void)
+{
+	struct worker_context *ctx;
+	ctx = kzalloc(sizeof(struct worker_context), GFP_KERNEL);
+	if (!ctx)
+		return NULL;
+	INIT_LIST_HEAD(&ctx->anchor);
+	INIT_LIST_HEAD(&ctx->buffers);
+	return ctx;
 }
 
 static long upcall_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct event_manager *mgr = file->private_data;
 	void __user *uarg = (void __user *)arg;
+	struct worker_context *ctx;
 
 	switch (cmd) {
 	case UPIOGQCNT:
 		if (copy_to_user(uarg, &mgr->queue_cnt, sizeof(uint64_t)))
 			return -EFAULT;
+		return 0;
+	case UPWRKINIT:
+		ctx = build_context();
+		if (!ctx)
+			return -ENOMEM;
+		ctx->worker = current;
+		current->worker_context = ctx;
 		return 0;
 	default:
 		return -ENOIOCTLCMD;
@@ -371,17 +498,18 @@ static inline void clean_kitems(int count, struct up_event **kitems)
 }
 
 SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *, in,
-		int, out_cnt, struct up_event __user *, out)
+		int, out_cnt, struct up_event __user *, output)
 {
 	struct event_manager *mgr = NULL;
 	struct up_event **kitems = NULL;
 	struct up_event **koutput = NULL;
 	int ret = -EINVAL;
 	int cnt;
+	struct worker_context *ctx;
 
 	if (in == NULL && in_cnt > 0)
 		goto out;
-	if (out_cnt <= 0 || out == NULL)
+	if (out_cnt != 0 && output == NULL)
 		goto out;
 
 	ret = -EBADF;
@@ -393,6 +521,14 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 		goto out;
 
 	ret = -ENOMEM;
+
+	if (current->worker_context == NULL) {
+		ctx = build_context();
+		if (!ctx)
+			goto out;
+		ctx->worker = current;
+		current->worker_context = ctx;
+	}
 
 	kitems = kzalloc(sizeof(struct up_event *) * in_cnt, GFP_KERNEL);
 	if (!kitems)
@@ -417,12 +553,17 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 			goto out_free;
 		}
 
-		if (item->fd < 0 || item->work_fn == NULL) {
-			pr_err("Corrupted submission at %d of %d\n", i, in_cnt);
-			if (item->fd < 0)
-				pr_err("Bad fd\n");
-			else
-				pr_err("Missing continuation\n");
+		// Check if we have an fd, UP_VEC doesn't need one
+		if (item->fd < 0 && item->type != UP_VEC) {
+			pr_err("Corrupted submission at %d of %d, bad fd\n", i, in_cnt);
+			clean_kitems(i + 1, kitems);
+			ret = -EINVAL;
+			goto out_free;
+		}
+
+		// Check if we have a continuation, UP_VEC doesn't need one
+		if (item->work_fn == NULL && item->type != UP_VEC) {
+			pr_err("Corrupted submission at %d of %d, missing continuation\n", i, in_cnt);
 			clean_kitems(i + 1, kitems);
 			ret = -EINVAL;
 			goto out_free;
@@ -434,7 +575,7 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 	cnt = do_upcall_submit(mgr, in_cnt, kitems, out_cnt, koutput);
 
 	for (int i = 0; i < out_cnt && i < cnt; i++) {
-		if (copy_to_user(&out[i], koutput[i], sizeof(struct up_event))) {
+		if (copy_to_user(&output[i], koutput[i], sizeof(struct up_event))) {
 			ret = -EFAULT;
 			goto out_clean;
 		}
@@ -454,6 +595,7 @@ out:
 static struct event_channel *create_channel(void)
 {
 	struct event_channel *ret = kzalloc(sizeof(struct event_channel), GFP_KERNEL);
+
 	if (!ret)
 		return ret;
 
@@ -567,10 +709,17 @@ static int __init upcall_init(void)
 			0, SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);
 	if (!event_cache)
 		return -ENOMEM;
+
 	anchor_cache = kmem_cache_create("upcall_anchor", sizeof(struct event_anchor),
 			0, SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);
 	if (!anchor_cache)
 		return -ENOMEM;
+
+	buffer_cache = kmem_cache_create("upcall_buffer", sizeof(struct event_buffer),
+			0, SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);
+	if (!buffer_cache)
+		return -ENOMEM;
+
 	return 0;
 }
 
