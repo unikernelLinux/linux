@@ -111,7 +111,7 @@ static void post_event(struct event_anchor *anchor)
 				struct worker_context, anchor);
 		if (ctx) {
 			list_del_init(&ctx->anchor);
-			wake_up_state(ctx->worker, TASK_NORMAL | TASK_IDLE);
+			wake_up_process(ctx->worker);
 		}
 	}
 
@@ -124,13 +124,11 @@ static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
 	struct event_anchor *anchor = container_of(wq_entry, struct event_anchor, wait);
 	__poll_t pollflags = key_to_poll(key);
 	int armed;
-	pr_err("Got event for %d\n", anchor->event->fd);
 	
 	/* Check if this is an event we are waiting for */
 	if (pollflags && !(pollflags & anchor->events))
 		return 0;
 
-	pr_err("Got event we care about for %d\n", anchor->event->fd);
 	/* Take ownership of this anchor */
 	armed = atomic_dec_return(&anchor->armed);
 	if (armed) {
@@ -139,7 +137,6 @@ static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
 	}
 
 	post_event(anchor);
-	pr_err("Posted event for %d\n", anchor->event->fd);
 	return 0;
 }
 
@@ -274,7 +271,7 @@ static void worker_sleep(struct event_manager *mgr)
 
 	// Okay, we really need to sleep.
 	list_add_tail(&current->worker_context->anchor, &channel->sleeping_workers);
-	set_current_state(TASK_IDLE);
+	set_current_state(TASK_INTERRUPTIBLE);
 	spin_unlock(&channel->worker_lock);
 	local_irq_restore(flags);
 
@@ -311,7 +308,7 @@ static void attach_buffers(uint64_t cnt, struct iovec __user *bufs)
 		INIT_LIST_HEAD(&buf->anchor);
 		if (copy_from_user(&buf->iovec, &bufs[i], sizeof(struct iovec)))
 			return;
-		list_add_tail(&ctx->buffers, &buf->anchor);
+		list_add_tail(&buf->anchor, &ctx->buffers);
 	}
 }
 
@@ -325,9 +322,8 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt)
 		return -ENOMEM;
 	}
 
-	pr_err("Polling on %d\n", evt->fd);
 	init_poll_funcptr(&anchor->pt, upcall_poll_init);
-	if (upcall_item_poll(anchor, EPOLLIN | EPOLLERR | EPOLLHUP)) {
+	if (upcall_item_poll(anchor, EPOLLIN | POLLRDNORM | EPOLLERR | EPOLLHUP | EPOLLPRI)) {
 		/* There was data waiting, check if we are still armed
 		and remove the poll linkage if we are */
 		armed = atomic_dec_return(&anchor->armed);
@@ -356,7 +352,6 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 			break;
 
 		case UP_ACCEPT:
-			pr_err("Registering accept interest on %d\n", in[i]->fd);
 			ret = attach_poll(mgr, in[i]);
 			break;
 
@@ -391,9 +386,7 @@ again:
 			try_read(anchor->event);
 			break;
 		case UP_ACCEPT:
-			pr_err("Got accept wake up on %d\n", anchor->event->fd);
 			try_accept(anchor->event);
-			pr_err("Accept returned %d\n", anchor->event->result);
 			break;
 		default:
 			return -EINVAL;
@@ -406,9 +399,7 @@ again:
 
 	// Finally, if we have no active wakeups and no output, we need to sleep here and try again.
 	if (!out_idx && out_cnt > 0) {
-		pr_err("No work, sleeping\n");
 		worker_sleep(mgr);
-		pr_err("Woken by event\n");
 		goto again;
 	}
 
