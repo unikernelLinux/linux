@@ -158,6 +158,9 @@ static void get_buffer(struct iovec *iov)
 		iov->iov_base = NULL;
 		return;
 	}
+
+	list_del(&buf->anchor);
+
 	iov->iov_base = buf->iovec.iov_base;
 	iov->iov_len = buf->iovec.iov_len;
 	kmem_cache_free(buffer_cache, buf);
