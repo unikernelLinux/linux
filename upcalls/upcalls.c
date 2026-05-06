@@ -35,6 +35,7 @@ struct event_channel {
 	spinlock_t		worker_lock;
 	struct list_head	wakeups;
 	struct list_head	sleeping_workers;
+	size_t			event_count;
 	uint8_t			pad[8]; // Pad to a cacheline
 };
 
@@ -43,8 +44,15 @@ struct event_manager {
 	struct kref ref_count;
 	/* Number of channels created during initialization */
 	uint64_t		queue_cnt;
-	/* Per CPU event channels */
+	/* Each CPU has its own pointer to an event_channel but they
+	 * are not necessarily unique. In the case of per LLC channels,
+	 * all CPUs that share an LLC will also share an event_channel
+	 */
 	struct event_channel	*channels[NR_CPUS];
+	struct worker_context	*pcpu_workers[NR_CPUS];
+	struct event_channel	*channel_list[NR_CPUS];
+	// The number of events we will tolerate in a work queue before working a neighbor core
+	size_t			backlog;
 };
 
 struct event_anchor {
@@ -67,6 +75,7 @@ struct worker_context {
 	struct task_struct	*worker;
 	struct list_head	buffers;
 	struct list_head	anchor;
+	uint64_t		spurious_count;
 };
 
 /* up_event cache */
@@ -91,6 +100,11 @@ static inline struct event_channel *get_event_channel(struct event_manager *mgr)
 	return mgr->channels[smp_processor_id()];
 }
 
+static inline struct worker_context *get_local_worker(struct event_manager *mgr)
+{
+	return mgr->pcpu_workers[smp_processor_id()];
+}
+
 static void post_event(struct event_anchor *anchor)
 {
 	unsigned long flags;
@@ -104,12 +118,13 @@ static void post_event(struct event_anchor *anchor)
 	INIT_LIST_HEAD(&anchor->anchor);
 	scoped_guard(spinlock, &channel->wakeup_lock) {
 		list_add_tail(&anchor->anchor, &channel->wakeups);
+		channel->event_count++;
 	}
 
+	// Start by checking if the local worker is sleeping and wake it only.
 	scoped_guard(spinlock, &channel->worker_lock) {
-		ctx = list_first_entry_or_null(&channel->sleeping_workers,
-				struct worker_context, anchor);
-		if (ctx) {
+		ctx = get_local_worker(anchor->mgr);
+		if (ctx && !list_empty(&ctx->anchor)) {
 			list_del_init(&ctx->anchor);
 			wake_up_process(ctx->worker);
 		}
@@ -135,6 +150,8 @@ static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
 		/* We raced with another wake up, and they won */
 		return 0;
 	}
+
+	remove_wait_queue(anchor->whead, &anchor->wait);
 
 	post_event(anchor);
 	return 0;
@@ -200,15 +217,51 @@ static void try_read(struct up_event *evt)
 
 		ret = file->f_op->read_iter(&kiocb, &iter);
 
-		if (ret <= 0)
-			break;
+		if (ret <= 0) {
+			evt->result = ret;
+			return;
+		}
 		cursor += ret;
 	}
 
-	if (cursor == 0)
-		evt->result = ret;
-	else
-		evt->result = cursor;
+	evt->result = cursor;
+}
+
+static void try_write(struct up_event *evt)
+{
+	struct file *file;
+	struct kiocb kiocb;
+	struct iov_iter iter;
+	struct iovec iov;
+	size_t cursor = 0;
+	int ret;
+	CLASS(fd_pos, f)(evt->fd);
+
+	if (fd_empty(f)) {
+		evt->result = -EBADF;
+		return;
+	}
+
+	iov.iov_base = evt->buf;
+	iov.iov_len = evt->len;
+
+	file = fd_file(f);
+	init_sync_kiocb(&kiocb, file);
+
+	while (cursor < iov.iov_len) {
+
+		iov_iter_ubuf(&iter, ITER_SOURCE, iov.iov_base + cursor, iov.iov_len - cursor);
+
+		ret = file->f_op->write_iter(&kiocb, &iter);
+
+		if (ret <= 0) {
+			evt->result = ret;
+			return;
+		}
+		cursor += ret;
+	}
+
+	evt->result = cursor;
 }
 
 static void try_accept(struct up_event *evt)
@@ -243,6 +296,7 @@ static struct event_anchor *get_next_wakeup(struct event_manager *mgr)
 		if (!anchor)
 			goto out;
 		list_del_init(&anchor->anchor);
+		channel->event_count--;
 	}
 out:
 	local_irq_restore(flags);
@@ -263,7 +317,7 @@ static void worker_sleep(struct event_manager *mgr)
 	// However, we may have raced with the event notifications so double check
 	// before we go to sleep
 	spin_lock(&channel->wakeup_lock);
-	if (!list_empty(&channel->wakeups)) {
+	if (channel->event_count > 0) {
 		// We did race, go do the work
 		spin_unlock(&channel->wakeup_lock);
 		spin_unlock(&channel->worker_lock);
@@ -273,12 +327,26 @@ static void worker_sleep(struct event_manager *mgr)
 	spin_unlock(&channel->wakeup_lock);
 
 	// Okay, we really need to sleep.
-	list_add_tail(&current->worker_context->anchor, &channel->sleeping_workers);
+	list_add(&current->worker_context->anchor, &channel->sleeping_workers);
 	set_current_state(TASK_INTERRUPTIBLE);
 	spin_unlock(&channel->worker_lock);
 	local_irq_restore(flags);
-
+again:
 	schedule();
+
+	// schedule() can return without us having called ttwp, check if we are still on
+	// the worker list
+	local_irq_save(flags);
+	spin_lock(&channel->worker_lock);
+	if (!list_empty(&current->worker_context->anchor)) {
+		current->worker_context->spurious_count++;
+		set_current_state(TASK_INTERRUPTIBLE);
+		spin_unlock(&channel->worker_lock);
+		local_irq_restore(flags);
+		goto again;
+	}
+	spin_unlock(&channel->worker_lock);
+	local_irq_restore(flags);
 out:
 	return;
 }
@@ -311,11 +379,11 @@ static void attach_buffers(uint64_t cnt, struct iovec __user *bufs)
 		INIT_LIST_HEAD(&buf->anchor);
 		if (copy_from_user(&buf->iovec, &bufs[i], sizeof(struct iovec)))
 			return;
-		list_add_tail(&buf->anchor, &ctx->buffers);
+		list_add(&buf->anchor, &ctx->buffers);
 	}
 }
 
-static int attach_poll(struct event_manager *mgr, struct up_event *evt)
+static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t rdw) 
 {
 	struct event_anchor *anchor;
 	int armed;
@@ -326,10 +394,12 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt)
 	}
 
 	init_poll_funcptr(&anchor->pt, upcall_poll_init);
-	if (upcall_item_poll(anchor, EPOLLIN | POLLRDNORM | EPOLLERR | EPOLLHUP | EPOLLPRI)) {
-		/* There was data waiting, check if we are still armed
-		and remove the poll linkage if we are */
+	if (upcall_item_poll(anchor, rdw | EPOLLERR | EPOLLHUP | EPOLLPRI)) {
+		/* There was data waiting, remove the poll linkage now.
+		 * If we win the race and still own the anchor, post it.
+		 */
 		armed = atomic_dec_return(&anchor->armed);
+		remove_wait_queue(anchor->whead, &anchor->wait);
 		if (!armed) {
 			post_event(anchor);
 		}
@@ -344,7 +414,6 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 	int out_idx = 0;
 	int ret = 0;
 	struct event_anchor *anchor;
-	struct wait_queue_head *head;
 
 	// Handle all the incoming submissions
 	for (int i = 0; i < in_cnt; i++) {
@@ -355,11 +424,15 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 			break;
 
 		case UP_ACCEPT:
-			ret = attach_poll(mgr, in[i]);
+			ret = attach_poll(mgr, in[i], EPOLLIN | POLLRDNORM);
 			break;
 
 		case UP_READ:
-			ret = attach_poll(mgr, in[i]);
+			ret = attach_poll(mgr, in[i], EPOLLIN | POLLRDNORM);
+			break;
+
+		case UP_WRITE:
+			ret = attach_poll(mgr, in[i], EPOLLOUT | POLLWRNORM);
 			break;
 
 		default:
@@ -376,17 +449,12 @@ again:
 		if (!anchor)
 			break;
 
-		/* We found one we care about, unhook the waiter */
-		rcu_read_lock();
-		head = smp_load_acquire(&anchor->whead);
-		if (head) {
-			remove_wait_queue(head, &anchor->wait);
-		}
-		rcu_read_unlock();
-
 		switch (anchor->event->type) {
 		case UP_READ:
 			try_read(anchor->event);
+			break;
+		case UP_WRITE:
+			try_write(anchor->event);
 			break;
 		case UP_ACCEPT:
 			try_accept(anchor->event);
@@ -417,6 +485,7 @@ static struct worker_context *build_context(void)
 		return NULL;
 	INIT_LIST_HEAD(&ctx->anchor);
 	INIT_LIST_HEAD(&ctx->buffers);
+
 	return ctx;
 }
 
@@ -425,10 +494,20 @@ static long upcall_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct event_manager *mgr = file->private_data;
 	void __user *uarg = (void __user *)arg;
 	struct worker_context *ctx;
+	struct event_channel *channel;
+	struct list_head *pos;
+	uint64_t out = 0;
 
 	switch (cmd) {
 	case UPIOGQCNT:
-		if (copy_to_user(uarg, &mgr->queue_cnt, sizeof(uint64_t)))
+		for (uint64_t i = 0; i < mgr->queue_cnt; i++) {
+			channel = mgr->channel_list[i];
+			list_for_each(pos, &(channel->sleeping_workers)) {
+				ctx = container_of(pos, struct worker_context, anchor);
+				out += ctx->spurious_count;
+			}
+		}
+		if (copy_to_user(uarg, &out, sizeof(uint64_t)))
 			return -EFAULT;
 		return 0;
 	case UPWRKINIT:
@@ -500,6 +579,7 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 	int ret = -EINVAL;
 	int cnt;
 	struct worker_context *ctx;
+	unsigned long flags;
 
 	if (in == NULL && in_cnt > 0)
 		goto out;
@@ -516,20 +596,28 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 
 	ret = -ENOMEM;
 
-	if (current->worker_context == NULL) {
-		ctx = build_context();
-		if (!ctx)
-			goto out;
-		ctx->worker = current;
-		current->worker_context = ctx;
-	}
-
 	kitems = kzalloc(sizeof(struct up_event *) * in_cnt, GFP_KERNEL);
 	if (!kitems)
 		goto out;
 	koutput = kzalloc(sizeof(struct up_event *) * out_cnt, GFP_KERNEL);
 	if (!koutput)
 		goto out_free;
+
+	mgr = (struct event_manager *)fd_file(f)->private_data;
+
+	if (current->worker_context == NULL) {
+		ctx = build_context();
+		if (!ctx)
+			goto out;
+		ctx->worker = current;
+		current->worker_context = ctx;
+		local_irq_save(flags);
+		if (mgr->pcpu_workers[smp_processor_id()] == NULL) {
+			mgr->pcpu_workers[smp_processor_id()] = ctx;
+		}
+		local_irq_restore(flags);
+
+	}
 
 	for (int i = 0; i < in_cnt; i++) {
 		struct up_event *item = kmem_cache_zalloc(event_cache, GFP_KERNEL);
@@ -563,8 +651,6 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 			goto out_free;
 		}
 	}
-
-	mgr = (struct event_manager *)fd_file(f)->private_data;
 
 	cnt = do_upcall_submit(mgr, in_cnt, kitems, out_cnt, koutput);
 
@@ -615,12 +701,14 @@ static struct event_manager *create_manager(int flags)
 	switch(concurrency_model) {
 	default:
 	case UPCALL_PCPU:
+
 		for_each_online_cpu(i) {
 			mgr->channels[i] = create_channel();
 			if (!mgr->channels[i])
 				goto out_free;
-		}
+			mgr->channel_list[mgr->queue_cnt] = mgr->channels[i];
 			mgr->queue_cnt++;
+		}
 			break;
 
 	case UPCALL_PCACHE:
@@ -630,6 +718,7 @@ static struct event_manager *create_manager(int flags)
 			mine = create_channel();
 			if (!mine)
 				goto out_free;
+			mgr->channel_list[mgr->queue_cnt] = mine;
 			mgr->queue_cnt++;
 			mgr->channels[i] = mine;
 			for_each_cpu(j, topology_cluster_cpumask(i)) {
@@ -644,12 +733,14 @@ static struct event_manager *create_manager(int flags)
 		mine = create_channel();
 		if (!mine)
 			goto out_free;
+		mgr->channel_list[mgr->queue_cnt] = mine;
 		mgr->queue_cnt++;
 		for_each_online_cpu(i) {
 			mgr->channels[i] = mine;
 		}
 		break;
 	}
+
 
 	kref_init(&mgr->ref_count);
 
@@ -663,7 +754,7 @@ out_free:
 	return NULL;
 }
 
-SYSCALL_DEFINE1(upcall_create, int, flags)
+SYSCALL_DEFINE2(upcall_create, size_t, backlog, int, flags)
 {
 	int fd, error = 0;
 	struct event_manager *mgr;
@@ -672,6 +763,8 @@ SYSCALL_DEFINE1(upcall_create, int, flags)
 	mgr = create_manager(flags);
 	if (!mgr)
 		return -ENOMEM;
+
+	mgr->backlog = backlog;
 
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
 	if (fd < 0) {

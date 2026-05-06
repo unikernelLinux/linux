@@ -31,6 +31,7 @@
 
 typedef enum {
 	UP_READ,        // Requesting a read of the fd
+	UP_WRITE,       // Requesting a write of the fd
 	UP_ACCEPT,      // Requesting an accept4 on the fd (will imply SOCK_NONBLOCK)
 	UP_VEC,         // Give the struct iovec array at buf with len items to the kernel
 	NR_ACTIONS      // Error checking
