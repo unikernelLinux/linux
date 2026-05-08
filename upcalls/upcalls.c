@@ -51,8 +51,6 @@ struct event_manager {
 	struct event_channel	*channels[NR_CPUS];
 	struct worker_context	*pcpu_workers[NR_CPUS];
 	struct event_channel	*channel_list[NR_CPUS];
-	// The number of events we will tolerate in a work queue before working a neighbor core
-	size_t			backlog;
 };
 
 struct event_anchor {
@@ -114,7 +112,7 @@ static void post_event(struct event_anchor *anchor)
 	/* Now, we add this to the wakeup list for this CPU and potentially wake a
 	   waiting thread to process */
 	local_irq_save(flags);
-	channel = get_event_channel(anchor->mgr);
+	channel = anchor->mgr->channels[smp_processor_id()];
 	INIT_LIST_HEAD(&anchor->anchor);
 	scoped_guard(spinlock, &channel->wakeup_lock) {
 		list_add_tail(&anchor->anchor, &channel->wakeups);
@@ -123,7 +121,7 @@ static void post_event(struct event_anchor *anchor)
 
 	// Start by checking if the local worker is sleeping and wake it only.
 	scoped_guard(spinlock, &channel->worker_lock) {
-		ctx = get_local_worker(anchor->mgr);
+		ctx = anchor->mgr->pcpu_workers[smp_processor_id()];
 		if (ctx && !list_empty(&ctx->anchor)) {
 			list_del_init(&ctx->anchor);
 			wake_up_process(ctx->worker);
@@ -151,7 +149,10 @@ static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
 		return 0;
 	}
 
-	remove_wait_queue(anchor->whead, &anchor->wait);
+	/* Called from __wake_up_common with wq_head->lock held; use list_del_init
+	 * directly rather than remove_wait_queue, which would deadlock trying to
+	 * re-acquire the same lock. */
+	list_del_init(&anchor->wait.entry);
 
 	post_event(anchor);
 	return 0;
@@ -218,7 +219,7 @@ static void try_read(struct up_event *evt)
 		ret = file->f_op->read_iter(&kiocb, &iter);
 
 		if (ret <= 0) {
-			evt->result = ret;
+			evt->result = cursor > 0 ? cursor : ret;
 			return;
 		}
 		cursor += ret;
@@ -255,7 +256,7 @@ static void try_write(struct up_event *evt)
 		ret = file->f_op->write_iter(&kiocb, &iter);
 
 		if (ret <= 0) {
-			evt->result = ret;
+			evt->result = cursor > 0 ? cursor : ret;
 			return;
 		}
 		cursor += ret;
@@ -395,12 +396,12 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t
 
 	init_poll_funcptr(&anchor->pt, upcall_poll_init);
 	if (upcall_item_poll(anchor, rdw | EPOLLERR | EPOLLHUP | EPOLLPRI)) {
-		/* There was data waiting, remove the poll linkage now.
-		 * If we win the race and still own the anchor, post it.
+		/* There was data waiting. Only remove the wait queue entry and
+		 * post the event if we still own the anchor.
 		 */
 		armed = atomic_dec_return(&anchor->armed);
-		remove_wait_queue(anchor->whead, &anchor->wait);
 		if (!armed) {
+			remove_wait_queue(anchor->whead, &anchor->wait);
 			post_event(anchor);
 		}
 	}
@@ -754,7 +755,7 @@ out_free:
 	return NULL;
 }
 
-SYSCALL_DEFINE2(upcall_create, size_t, backlog, int, flags)
+SYSCALL_DEFINE1(upcall_create, int, flags)
 {
 	int fd, error = 0;
 	struct event_manager *mgr;
@@ -763,8 +764,6 @@ SYSCALL_DEFINE2(upcall_create, size_t, backlog, int, flags)
 	mgr = create_manager(flags);
 	if (!mgr)
 		return -ENOMEM;
-
-	mgr->backlog = backlog;
 
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
 	if (fd < 0) {
