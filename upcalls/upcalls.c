@@ -36,7 +36,8 @@ struct event_channel {
 	struct list_head	wakeups;
 	struct list_head	sleeping_workers;
 	size_t			event_count;
-	uint8_t			pad[8]; // Pad to a cacheline
+	size_t			active_workers;
+	int			cpu;
 };
 
 struct event_manager {
@@ -103,27 +104,77 @@ static inline struct worker_context *get_local_worker(struct event_manager *mgr)
 	return mgr->pcpu_workers[smp_processor_id()];
 }
 
+/*
+ * Scan LLC siblings for a channel with lower queue depth than local_count.
+ * Reads are hint-quality (READ_ONCE, no lock); the actual post is serialised
+ * by the chosen target's wakeup_lock, so a stale read at worst causes a
+ * suboptimal placement, never a correctness violation.
+ * Returns NULL if no sibling is less loaded than the local channel.
+ */
+static struct event_channel *find_spread_target(struct event_manager *mgr,
+						int my_cpu, size_t local_count)
+{
+	const struct cpumask *llc_mask = topology_cluster_cpumask(my_cpu);
+	struct event_channel *best = NULL;
+	size_t best_count = local_count;
+	int peer_cpu;
+
+	for_each_cpu(peer_cpu, llc_mask) {
+		struct event_channel *peer;
+		size_t count;
+
+		if (peer_cpu == my_cpu)
+			continue;
+		peer = mgr->channels[peer_cpu];
+		if (!peer || !READ_ONCE(mgr->pcpu_workers[peer_cpu]))
+			continue;
+		count = READ_ONCE(peer->event_count);
+		if (count < best_count) {
+			best_count = count;
+			best = peer;
+			if (count == 0)
+				break;
+		}
+	}
+
+	return best;
+}
+
 static void post_event(struct event_anchor *anchor)
 {
 	unsigned long flags;
 	struct worker_context *ctx;
-	struct event_channel *channel;
+	struct event_channel *channel, *target;
+	int my_cpu;
+	size_t local_count;
 
-	/* Now, we add this to the wakeup list for this CPU and potentially wake a
-	   waiting thread to process */
 	local_irq_save(flags);
-	channel = anchor->mgr->channels[smp_processor_id()];
+	my_cpu = smp_processor_id();
+	channel = anchor->mgr->channels[my_cpu];
+
+	/*
+	 * Read the local queue depth before taking any lock.  If work is
+	 * already pending (congestion signal per the Shenango metric), try to
+	 * redirect this event to a less-loaded LLC sibling so that events
+	 * spread across CPUs within the cache domain rather than piling up.
+	 */
+	local_count = READ_ONCE(channel->event_count);
+	if (local_count > 0)
+		target = find_spread_target(anchor->mgr, my_cpu, local_count) ?: channel;
+	else
+		target = channel;
+
 	INIT_LIST_HEAD(&anchor->anchor);
-	scoped_guard(spinlock, &channel->wakeup_lock) {
-		list_add_tail(&anchor->anchor, &channel->wakeups);
-		channel->event_count++;
+	scoped_guard(spinlock, &target->wakeup_lock) {
+		list_add_tail(&anchor->anchor, &target->wakeups);
+		target->event_count++;
 	}
 
-	// Start by checking if the local worker is sleeping and wake it only.
-	scoped_guard(spinlock, &channel->worker_lock) {
-		ctx = anchor->mgr->pcpu_workers[smp_processor_id()];
+	scoped_guard(spinlock, &target->worker_lock) {
+		ctx = anchor->mgr->pcpu_workers[target->cpu];
 		if (ctx && !list_empty(&ctx->anchor)) {
 			list_del_init(&ctx->anchor);
+			target->active_workers++;
 			wake_up_process(ctx->worker);
 		}
 	}
@@ -328,6 +379,7 @@ static void worker_sleep(struct event_manager *mgr)
 	spin_unlock(&channel->wakeup_lock);
 
 	// Okay, we really need to sleep.
+	channel->active_workers--;
 	list_add(&current->worker_context->anchor, &channel->sleeping_workers);
 	set_current_state(TASK_INTERRUPTIBLE);
 	spin_unlock(&channel->worker_lock);
@@ -490,39 +542,6 @@ static struct worker_context *build_context(void)
 	return ctx;
 }
 
-static long upcall_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-	struct event_manager *mgr = file->private_data;
-	void __user *uarg = (void __user *)arg;
-	struct worker_context *ctx;
-	struct event_channel *channel;
-	struct list_head *pos;
-	uint64_t out = 0;
-
-	switch (cmd) {
-	case UPIOGQCNT:
-		for (uint64_t i = 0; i < mgr->queue_cnt; i++) {
-			channel = mgr->channel_list[i];
-			list_for_each(pos, &(channel->sleeping_workers)) {
-				ctx = container_of(pos, struct worker_context, anchor);
-				out += ctx->spurious_count;
-			}
-		}
-		if (copy_to_user(uarg, &out, sizeof(uint64_t)))
-			return -EFAULT;
-		return 0;
-	case UPWRKINIT:
-		ctx = build_context();
-		if (!ctx)
-			return -ENOMEM;
-		ctx->worker = current;
-		current->worker_context = ctx;
-		return 0;
-	default:
-		return -ENOIOCTLCMD;
-	}
-}
-
 static void free_manager(struct event_manager *mgr)
 {
 	struct event_channel *chan;
@@ -556,7 +575,6 @@ static int upcall_tear_down(struct inode *inode, struct file *file)
 static const struct file_operations upcall_fops = {
 	.release		= upcall_tear_down,
 	.llseek			= noop_llseek,
-	.unlocked_ioctl		= upcall_ioctl,
 };
 
 static inline int is_file_upcall(struct file *f)
@@ -607,17 +625,22 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 	mgr = (struct event_manager *)fd_file(f)->private_data;
 
 	if (current->worker_context == NULL) {
+		struct event_channel *reg_channel;
+
 		ctx = build_context();
 		if (!ctx)
 			goto out;
 		ctx->worker = current;
 		current->worker_context = ctx;
 		local_irq_save(flags);
+		reg_channel = mgr->channels[smp_processor_id()];
+		spin_lock(&reg_channel->worker_lock);
 		if (mgr->pcpu_workers[smp_processor_id()] == NULL) {
 			mgr->pcpu_workers[smp_processor_id()] = ctx;
+			reg_channel->active_workers++;
 		}
+		spin_unlock(&reg_channel->worker_lock);
 		local_irq_restore(flags);
-
 	}
 
 	for (int i = 0; i < in_cnt; i++) {
@@ -688,60 +711,23 @@ static struct event_channel *create_channel(void)
 	return ret;
 }
 
-static struct event_manager *create_manager(int flags)
+static struct event_manager *create_manager(void)
 {
-	int i, j;
-	struct event_channel *mine;
+	int i;
 	struct event_manager *mgr;
-	int concurrency_model = flags & UPCALL_MODEL_MASK;
 
 	mgr = kzalloc(sizeof(struct event_manager), GFP_KERNEL);
 	if (!mgr)
 		return mgr;
 
-	switch(concurrency_model) {
-	default:
-	case UPCALL_PCPU:
-
-		for_each_online_cpu(i) {
-			mgr->channels[i] = create_channel();
-			if (!mgr->channels[i])
-				goto out_free;
-			mgr->channel_list[mgr->queue_cnt] = mgr->channels[i];
-			mgr->queue_cnt++;
-		}
-			break;
-
-	case UPCALL_PCACHE:
-		for_each_online_cpu(i) {
-			if (mgr->channels[i]) // We already have one
-				continue;
-			mine = create_channel();
-			if (!mine)
-				goto out_free;
-			mgr->channel_list[mgr->queue_cnt] = mine;
-			mgr->queue_cnt++;
-			mgr->channels[i] = mine;
-			for_each_cpu(j, topology_cluster_cpumask(i)) {
-				if (i == j)
-					continue;
-				mgr->channels[j] = mine;
-			}
-		}
-		break;
-
-	case UPCALL_SINGLE:
-		mine = create_channel();
-		if (!mine)
+	for_each_online_cpu(i) {
+		mgr->channels[i] = create_channel();
+		if (!mgr->channels[i])
 			goto out_free;
-		mgr->channel_list[mgr->queue_cnt] = mine;
+		mgr->channels[i]->cpu = i;
+		mgr->channel_list[mgr->queue_cnt] = mgr->channels[i];
 		mgr->queue_cnt++;
-		for_each_online_cpu(i) {
-			mgr->channels[i] = mine;
-		}
-		break;
 	}
-
 
 	kref_init(&mgr->ref_count);
 
@@ -761,7 +747,7 @@ SYSCALL_DEFINE1(upcall_create, int, flags)
 	struct event_manager *mgr;
 	struct file *file;
 
-	mgr = create_manager(flags);
+	mgr = create_manager();
 	if (!mgr)
 		return -ENOMEM;
 
