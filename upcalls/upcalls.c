@@ -36,22 +36,17 @@ struct event_channel {
 	struct list_head	wakeups;
 	struct list_head	sleeping_workers;
 	size_t			event_count;
-	size_t			active_workers;
 	int			cpu;
+	uint8_t			pad[4];
 };
 
 struct event_manager {
 	struct file		*file;
 	struct kref ref_count;
-	/* Number of channels created during initialization */
-	uint64_t		queue_cnt;
-	/* Each CPU has its own pointer to an event_channel but they
-	 * are not necessarily unique. In the case of per LLC channels,
-	 * all CPUs that share an LLC will also share an event_channel
+	/* Each CPU has its own pointer to an event_channel
 	 */
 	struct event_channel	*channels[NR_CPUS];
 	struct worker_context	*pcpu_workers[NR_CPUS];
-	struct event_channel	*channel_list[NR_CPUS];
 };
 
 struct event_anchor {
@@ -174,7 +169,6 @@ static void post_event(struct event_anchor *anchor)
 		ctx = anchor->mgr->pcpu_workers[target->cpu];
 		if (ctx && !list_empty(&ctx->anchor)) {
 			list_del_init(&ctx->anchor);
-			target->active_workers++;
 			wake_up_process(ctx->worker);
 		}
 	}
@@ -379,7 +373,6 @@ static void worker_sleep(struct event_manager *mgr)
 	spin_unlock(&channel->wakeup_lock);
 
 	// Okay, we really need to sleep.
-	channel->active_workers--;
 	list_add(&current->worker_context->anchor, &channel->sleeping_workers);
 	set_current_state(TASK_INTERRUPTIBLE);
 	spin_unlock(&channel->worker_lock);
@@ -637,7 +630,6 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 		spin_lock(&reg_channel->worker_lock);
 		if (mgr->pcpu_workers[smp_processor_id()] == NULL) {
 			mgr->pcpu_workers[smp_processor_id()] = ctx;
-			reg_channel->active_workers++;
 		}
 		spin_unlock(&reg_channel->worker_lock);
 		local_irq_restore(flags);
@@ -725,8 +717,6 @@ static struct event_manager *create_manager(void)
 		if (!mgr->channels[i])
 			goto out_free;
 		mgr->channels[i]->cpu = i;
-		mgr->channel_list[mgr->queue_cnt] = mgr->channels[i];
-		mgr->queue_cnt++;
 	}
 
 	kref_init(&mgr->ref_count);

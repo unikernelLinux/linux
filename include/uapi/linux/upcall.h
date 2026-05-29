@@ -20,14 +20,7 @@
 #define UPCALL_PACKED
 #endif
 
-#define UPIOGQCNT	0x00000001
-#define UPWRKINIT       0x00000002
-
-#define UPCALL_PCPU		0x00010000
-#define UPCALL_PCACHE		0x00020000
-#define UPCALL_SINGLE		0x00040000
-#define UPCALL_MODEL_MASK	(UPCALL_PCPU | UPCALL_PCACHE | UPCALL_SINGLE)
-#define UPCALL_MASK		(O_CLOEXEC | UPCALL_MODEL_MASK)
+#define UPCALL_MASK		(O_CLOEXEC)
 
 typedef enum {
 	UP_READ,        // Requesting a read of the fd
