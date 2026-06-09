@@ -321,6 +321,9 @@ static __poll_t upcall_item_poll(struct event_anchor *anchor, __poll_t events)
 	poll_table *pt = &anchor->pt;
 	__poll_t res;
 
+	if (!file)
+		return 0;
+
 	anchor->events = pt->_key = events;
 	res = vfs_poll(file, pt);
 
@@ -446,7 +449,14 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t
 		 */
 		armed = atomic_dec_return(&anchor->armed);
 		if (!armed) {
-			remove_wait_queue(anchor->whead, &anchor->wait);
+			/*
+			 * whead is NULL if the file's poll function never called
+			 * poll_wait (e.g. files with no poll op return
+			 * DEFAULT_POLLMASK). Nothing was added to a wait queue,
+			 * so there is nothing to remove.
+			 */
+			if (anchor->whead)
+				remove_wait_queue(anchor->whead, &anchor->wait);
 			post_event(anchor);
 		}
 	}
