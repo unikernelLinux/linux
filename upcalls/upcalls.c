@@ -663,7 +663,7 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 
 		// Check if we have an fd, UP_VEC doesn't need one
 		if (item->fd < 0 && item->type != UP_VEC) {
-			pr_err("Corrupted submission at %d of %d, bad fd\n", i, in_cnt);
+			pr_err("Corrupted submission at %d of %d, bad fd(%d)\n", i, in_cnt, item->fd);
 			clean_kitems(i + 1, kitems);
 			ret = -EINVAL;
 			goto out_free;
