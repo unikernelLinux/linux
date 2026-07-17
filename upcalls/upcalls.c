@@ -27,6 +27,8 @@
 #include <linux/anon_inodes.h>
 #include <linux/upcall.h>
 #include <linux/socket.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 
 #include <linux/sched.h>
 
@@ -47,7 +49,38 @@ struct event_manager {
 	 */
 	struct event_channel	*channels[NR_CPUS];
 	struct worker_context	*pcpu_workers[NR_CPUS];
+	/*
+	 * Cooperative core pool ownership.  owned_mask mirrors the global
+	 * core_pool.owner[] for cheap lock-free reads on the delivery path;
+	 * guaranteed_mask (a subset of owned_mask, ~1 core per LLC domain) is
+	 * never released.  Both masks are only mutated under the relevant
+	 * channel->wakeup_lock (ownership flips) and/or core_pool.lock (free
+	 * core selection); see the locking invariant in claim/release.
+	 */
+	struct cpumask		owned_mask;
+	struct cpumask		guaranteed_mask;
+	atomic_t		owned_count;
+	int			id;		/* small stable id for observability */
 };
+
+/*
+ * Machine-global core pool: the only cross-manager structure.  A core is
+ * owned by at most one manager at any instant (spatial partitioning).
+ * core_pool.lock guards free_mask and the selection of a free core to claim;
+ * it is NOT taken on the per-event delivery path.  owner[] entries flip under
+ * the owning channel's wakeup_lock so they serialise against post_event().
+ */
+struct upcall_core_pool {
+	spinlock_t		lock;
+	struct event_manager	*owner[NR_CPUS];
+	struct cpumask		free_mask;
+};
+
+static struct upcall_core_pool core_pool;
+
+/* Monotonic id source + debugfs handle for observability. */
+static atomic_t upcall_mgr_ids = ATOMIC_INIT(0);
+static struct dentry *upcall_debugfs_dir;
 
 struct event_anchor {
 	struct list_head	anchor;
@@ -100,78 +133,294 @@ static inline struct worker_context *get_local_worker(struct event_manager *mgr)
 }
 
 /*
- * Scan LLC siblings for a channel with lower queue depth than local_count.
- * Reads are hint-quality (READ_ONCE, no lock); the actual post is serialised
- * by the chosen target's wakeup_lock, so a stale read at worst causes a
- * suboptimal placement, never a correctness violation.
- * Returns NULL if no sibling is less loaded than the local channel.
+ * The cache domain used for event spreading and elastic core claiming.  We
+ * want the finest grouping that still contains more than one CPU: prefer the
+ * LLC (L3) sharing domain, then the socket, then the whole machine.  The
+ * fallbacks matter because some topologies (notably QEMU, which reports each
+ * CPU as its own singleton cluster/LLC) would otherwise make every "domain" a
+ * single CPU — which silently breaks spreading and elastic claim (a worker
+ * could never find a free sibling in a domain of size one).
  */
-static struct event_channel *find_spread_target(struct event_manager *mgr,
-						int my_cpu, size_t local_count)
+static const struct cpumask *upcall_domain_mask(int cpu)
 {
-	const struct cpumask *llc_mask = topology_cluster_cpumask(my_cpu);
-	struct event_channel *best = NULL;
-	size_t best_count = local_count;
-	int peer_cpu;
+	const struct cpumask *m = cpu_llc_shared_mask(cpu);
 
-	for_each_cpu(peer_cpu, llc_mask) {
-		struct event_channel *peer;
+	if (m && cpumask_weight(m) > 1)
+		return m;
+	m = topology_core_cpumask(cpu);
+	if (m && cpumask_weight(m) > 1)
+		return m;
+	return cpu_online_mask;
+}
+
+/*
+ * Set the global owner of a physical CPU under that CPU's (this manager's)
+ * channel wakeup_lock, so the store serialises against post_event()'s
+ * ownership re-validation which reads owner[] under the same lock.  Caller
+ * holds core_pool.lock (lock order: pool outer, wakeup_lock inner).
+ */
+static void set_owner_locked(struct event_manager *mgr, int cpu,
+			     struct event_manager *val)
+{
+	struct event_channel *chan = mgr->channels[cpu];
+
+	spin_lock(&chan->wakeup_lock);
+	core_pool.owner[cpu] = val;
+	spin_unlock(&chan->wakeup_lock);
+}
+
+/*
+ * Claim one guaranteed core in cpu's cache (LLC) domain for mgr, if the manager
+ * does not already own a guaranteed core there and a free core is available.
+ * The "already have one?" test and the claim are both performed under
+ * core_pool.lock so concurrent workers in the same domain claim at most one.
+ * A guaranteed core is never released (see worker_sleep()), giving the app a
+ * cache-local, awake-able anchor in every domain it runs in.
+ *
+ * Backstop: if the domain has no free core but this manager owns nothing at
+ * all yet, take any free core machine-wide so post_event() always has an owned
+ * fallback and the app can never strand at zero cores.
+ *
+ * Relies on upcall_domain_mask() grouping more than one CPU per domain; see the
+ * note there about degenerate (QEMU singleton) topologies.
+ */
+static void claim_guaranteed_core(struct event_manager *mgr, int cpu)
+{
+	const struct cpumask *domain = upcall_domain_mask(cpu);
+	unsigned long flags;
+	int c;
+
+	spin_lock_irqsave(&core_pool.lock, flags);
+	if (cpumask_intersects(&mgr->guaranteed_mask, domain))
+		goto out;
+	c = cpumask_any_and(domain, &core_pool.free_mask);
+	if (c >= nr_cpu_ids) {
+		if (atomic_read(&mgr->owned_count) != 0)
+			goto out;	/* contended domain, but we have cores elsewhere */
+		c = cpumask_first(&core_pool.free_mask);
+		if (c >= nr_cpu_ids)
+			goto out;	/* machine fully allocated */
+	}
+	cpumask_clear_cpu(c, &core_pool.free_mask);
+	set_owner_locked(mgr, c, mgr);
+	cpumask_set_cpu(c, &mgr->owned_mask);
+	cpumask_set_cpu(c, &mgr->guaranteed_mask);
+	atomic_inc(&mgr->owned_count);
+out:
+	spin_unlock_irqrestore(&core_pool.lock, flags);
+}
+
+/*
+ * Elastic scale-up: claim any free core in `domain` for mgr.  Returns the
+ * claimed CPU, or -1 if the domain has no free core.
+ */
+static int claim_free_core(struct event_manager *mgr, const struct cpumask *domain)
+{
+	unsigned long flags;
+	int cpu;
+
+	spin_lock_irqsave(&core_pool.lock, flags);
+	cpu = cpumask_any_and(domain, &core_pool.free_mask);
+	if (cpu >= nr_cpu_ids) {
+		spin_unlock_irqrestore(&core_pool.lock, flags);
+		return -1;
+	}
+	cpumask_clear_cpu(cpu, &core_pool.free_mask);
+	set_owner_locked(mgr, cpu, mgr);
+	cpumask_set_cpu(cpu, &mgr->owned_mask);
+	atomic_inc(&mgr->owned_count);
+	spin_unlock_irqrestore(&core_pool.lock, flags);
+	return cpu;
+}
+
+/*
+ * Voluntary scale-down: release cpu back to the pool if it is not a guaranteed
+ * core and its channel has drained.  The event_count==0 test and the ownership
+ * flip happen under the channel wakeup_lock, the same lock post_event() takes
+ * to enqueue + increment event_count, so no event can strand on a core that is
+ * being released (post_event either commits before the flip and blocks the
+ * release, or re-validates after it and falls back to a guaranteed core).
+ */
+static void try_release_core(struct event_manager *mgr, int cpu)
+{
+	struct event_channel *chan = mgr->channels[cpu];
+	unsigned long flags;
+
+	if (cpumask_test_cpu(cpu, &mgr->guaranteed_mask))
+		return;
+
+	spin_lock_irqsave(&core_pool.lock, flags);
+	spin_lock(&chan->wakeup_lock);
+	if (chan->event_count == 0 && core_pool.owner[cpu] == mgr) {
+		core_pool.owner[cpu] = NULL;
+		cpumask_clear_cpu(cpu, &mgr->owned_mask);
+		cpumask_set_cpu(cpu, &core_pool.free_mask);
+		atomic_dec(&mgr->owned_count);
+	}
+	spin_unlock(&chan->wakeup_lock);
+	spin_unlock_irqrestore(&core_pool.lock, flags);
+}
+
+/* Wake the manager's worker on cpu if it is parked.  Caller has IRQs off. */
+static void wake_owned_worker(struct event_manager *mgr, int cpu)
+{
+	struct event_channel *chan = mgr->channels[cpu];
+	struct worker_context *ctx;
+
+	spin_lock(&chan->worker_lock);
+	ctx = mgr->pcpu_workers[cpu];
+	if (ctx && !list_empty(&ctx->anchor)) {
+		list_del_init(&ctx->anchor);
+		wake_up_process(ctx->worker);
+	}
+	spin_unlock(&chan->worker_lock);
+}
+
+/*
+ * Choose an owned channel for mgr to receive an event that arrived on my_cpu.
+ * Prefers the least-loaded core mgr owns within my_cpu's cache domain (fast
+ * path: the local core if it is owned and idle); if the domain has no owned
+ * core, falls back to a guaranteed core (never released, always a valid
+ * target).  Reads owned/guaranteed masks lock-free — hint quality; post_event
+ * re-validates the chosen core's ownership under its wakeup_lock.  Returns NULL
+ * only if the manager owns no cores at all (pathological, fully-allocated
+ * machine).
+ */
+static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
+{
+	const struct cpumask *domain = upcall_domain_mask(my_cpu);
+	struct event_channel *best = NULL;
+	size_t best_count = (size_t)-1;
+	int cpu;
+
+	if (cpumask_test_cpu(my_cpu, &mgr->owned_mask)) {
+		struct event_channel *local = mgr->channels[my_cpu];
+
+		if (local && READ_ONCE(local->event_count) == 0)
+			return local;
+	}
+
+	for_each_cpu_and(cpu, domain, &mgr->owned_mask) {
+		struct event_channel *chan = mgr->channels[cpu];
 		size_t count;
 
-		if (peer_cpu == my_cpu)
+		if (!chan)
 			continue;
-		peer = mgr->channels[peer_cpu];
-		if (!peer || !READ_ONCE(mgr->pcpu_workers[peer_cpu]))
-			continue;
-		count = READ_ONCE(peer->event_count);
+		count = READ_ONCE(chan->event_count);
 		if (count < best_count) {
 			best_count = count;
-			best = peer;
+			best = chan;
 			if (count == 0)
 				break;
 		}
 	}
+	if (best)
+		return best;
 
-	return best;
+	cpu = cpumask_first(&mgr->guaranteed_mask);
+	if (cpu < nr_cpu_ids)
+		return mgr->channels[cpu];
+
+	return NULL;
+}
+
+/*
+ * Discard an event that cannot be delivered because its manager owns no cores
+ * (only reachable on a fully-allocated machine — see pick_target()).  Frees the
+ * event, drops the manager reference the anchor holds, and frees the anchor.
+ */
+static void drop_anchor(struct event_anchor *anchor)
+{
+	pr_warn_once("upcall: manager owns no cores, dropping event\n");
+	kmem_cache_free(event_cache, anchor->event);
+	put_mgr(anchor->mgr);
+	kmem_cache_free(anchor_cache, anchor);
+}
+
+/*
+ * Congestion-driven scale-up, invoked from the event-placement path when an
+ * event is queued onto a core that already has outstanding work.  Claim one
+ * free core in cpu's cache domain for mgr and wake its worker so the backlog
+ * drains in parallel.  Runs with IRQs disabled (placement context); the
+ * lock-free free_mask test avoids taking the pool lock when nothing is free.
+ */
+static void upcall_scale_up(struct event_manager *mgr, int cpu)
+{
+	int claimed;
+
+	if (cpumask_empty(&core_pool.free_mask))
+		return;
+	claimed = claim_free_core(mgr, upcall_domain_mask(cpu));
+	if (claimed >= 0)
+		wake_owned_worker(mgr, claimed);
 }
 
 static void post_event(struct event_anchor *anchor)
 {
 	unsigned long flags;
-	struct worker_context *ctx;
-	struct event_channel *channel, *target;
-	int my_cpu;
-	size_t local_count;
+	struct event_manager *mgr = anchor->mgr;
+	struct event_channel *target;
+	bool enqueued = false;
+	bool congested = false;
+	int my_cpu, gcpu;
 
 	local_irq_save(flags);
 	my_cpu = smp_processor_id();
-	channel = anchor->mgr->channels[my_cpu];
 
 	/*
-	 * Read the local queue depth before taking any lock.  If work is
-	 * already pending (congestion signal per the Shenango metric), try to
-	 * redirect this event to a less-loaded LLC sibling so that events
-	 * spread across CPUs within the cache domain rather than piling up.
+	 * The softirq/poll wakeup fires on whatever CPU ran the network work,
+	 * which under partitioning may not be a core this manager owns.  Choose
+	 * the least-loaded core mgr owns within the local cache domain, spreading
+	 * work across its owned cores (the "Shenango metric" congestion signal).
 	 */
-	local_count = READ_ONCE(channel->event_count);
-	if (local_count > 0)
-		target = find_spread_target(anchor->mgr, my_cpu, local_count) ?: channel;
-	else
-		target = channel;
+	target = pick_target(mgr, my_cpu);
+	if (!target) {
+		local_irq_restore(flags);
+		drop_anchor(anchor);
+		return;
+	}
 
 	INIT_LIST_HEAD(&anchor->anchor);
-	scoped_guard(spinlock, &target->wakeup_lock) {
+
+	/*
+	 * Re-validate ownership under the target's wakeup_lock: if mgr released
+	 * the core between pick_target() and here, owner[] no longer points at
+	 * mgr and we must not enqueue (the core's worker has parked and would
+	 * never drain it).  Fall back to a guaranteed core, which is never
+	 * released and therefore always a valid target.
+	 */
+	spin_lock(&target->wakeup_lock);
+	if (core_pool.owner[target->cpu] == mgr) {
+		/* Congestion: the chosen (least-loaded owned) core already has
+		 * outstanding events, so every owned core in this domain is busy. */
+		congested = target->event_count > 0;
 		list_add_tail(&anchor->anchor, &target->wakeups);
 		target->event_count++;
+		enqueued = true;
+	}
+	spin_unlock(&target->wakeup_lock);
+
+	if (!enqueued) {
+		gcpu = cpumask_first(&mgr->guaranteed_mask);
+		if (gcpu >= nr_cpu_ids) {
+			local_irq_restore(flags);
+			drop_anchor(anchor);
+			return;
+		}
+		target = mgr->channels[gcpu];
+		spin_lock(&target->wakeup_lock);
+		congested = target->event_count > 0;
+		list_add_tail(&anchor->anchor, &target->wakeups);
+		target->event_count++;
+		spin_unlock(&target->wakeup_lock);
 	}
 
-	scoped_guard(spinlock, &target->worker_lock) {
-		ctx = anchor->mgr->pcpu_workers[target->cpu];
-		if (ctx && !list_empty(&ctx->anchor)) {
-			list_del_init(&ctx->anchor);
-			wake_up_process(ctx->worker);
-		}
-	}
+	wake_owned_worker(mgr, target->cpu);
+
+	/* Scaling decision lives here in the placement path: if we just queued
+	 * behind outstanding work, bring another core online to drain it. */
+	if (congested)
+		upcall_scale_up(mgr, my_cpu);
 
 	local_irq_restore(flags);
 }
@@ -356,12 +605,14 @@ static void worker_sleep(struct event_manager *mgr)
 {
 	unsigned long flags;
 	struct event_channel *channel;
+	int cpu;
 
 	local_irq_save(flags);
-	channel = get_event_channel(mgr);
+	cpu = smp_processor_id();
+	channel = mgr->channels[cpu];
 	// There are no events to handle at the moment, mark ourselves
 	// idle and go to sleep
-	
+
 	spin_lock(&channel->worker_lock);
 	// However, we may have raced with the event notifications so double check
 	// before we go to sleep
@@ -380,6 +631,18 @@ static void worker_sleep(struct event_manager *mgr)
 	set_current_state(TASK_INTERRUPTIBLE);
 	spin_unlock(&channel->worker_lock);
 	local_irq_restore(flags);
+
+	/*
+	 * We hold no work and are committed to sleeping.  If this is not a
+	 * guaranteed core, cooperatively release it back to the pool so another
+	 * app can claim it.  try_release_core() only releases when event_count
+	 * is still 0 under the channel wakeup_lock, and post_event() re-validates
+	 * ownership under the same lock, so an event delivered concurrently can
+	 * never strand on the core we are releasing.  A guaranteed core is kept
+	 * (worker parks but retains ownership) so post_event() always has an
+	 * awake-able target.
+	 */
+	try_release_core(mgr, cpu);
 again:
 	schedule();
 
@@ -548,6 +811,19 @@ static struct worker_context *build_context(void)
 static void free_manager(struct event_manager *mgr)
 {
 	struct event_channel *chan;
+	unsigned long flags;
+	int cpu;
+
+	/* Return every core this manager still owns to the global pool. */
+	spin_lock_irqsave(&core_pool.lock, flags);
+	for_each_cpu(cpu, &mgr->owned_mask) {
+		core_pool.owner[cpu] = NULL;
+		cpumask_set_cpu(cpu, &core_pool.free_mask);
+	}
+	cpumask_clear(&mgr->owned_mask);
+	cpumask_clear(&mgr->guaranteed_mask);
+	spin_unlock_irqrestore(&core_pool.lock, flags);
+
 	for (uint64_t i = 0; i < NR_CPUS; i++) {
 		chan = mgr->channels[i];
 		mgr->channels[i] = NULL;
@@ -629,6 +905,7 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 
 	if (current->worker_context == NULL) {
 		struct event_channel *reg_channel;
+		int reg_cpu;
 
 		ctx = build_context();
 		if (!ctx)
@@ -636,13 +913,24 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 		ctx->worker = current;
 		current->worker_context = ctx;
 		local_irq_save(flags);
-		reg_channel = mgr->channels[smp_processor_id()];
+		reg_cpu = smp_processor_id();
+		reg_channel = mgr->channels[reg_cpu];
 		spin_lock(&reg_channel->worker_lock);
-		if (mgr->pcpu_workers[smp_processor_id()] == NULL) {
-			mgr->pcpu_workers[smp_processor_id()] = ctx;
+		if (mgr->pcpu_workers[reg_cpu] == NULL) {
+			mgr->pcpu_workers[reg_cpu] = ctx;
 		}
 		spin_unlock(&reg_channel->worker_lock);
 		local_irq_restore(flags);
+
+		/*
+		 * Ensure the manager owns a guaranteed core in this worker's cache
+		 * domain.  Done after dropping worker_lock so core_pool.lock never
+		 * nests under a channel lock.  libupcall pins one worker per CPU, so
+		 * every domain the app runs in gets exactly one guaranteed core; the
+		 * remaining workers register their context above and park without
+		 * owning a core until one is claimed for them (upcall_scale_up).
+		 */
+		claim_guaranteed_core(mgr, reg_cpu);
 	}
 
 	for (int i = 0; i < in_cnt; i++) {
@@ -730,6 +1018,7 @@ static struct event_manager *create_manager(void)
 	}
 
 	kref_init(&mgr->ref_count);
+	mgr->id = atomic_inc_return(&upcall_mgr_ids);
 
 	return mgr;
 
@@ -775,8 +1064,47 @@ out_free:
 	return error;
 }
 
+/*
+ * debugfs: /sys/kernel/debug/upcall/owners — one line per online CPU showing
+ * which manager (if any) currently owns it, and whether that is a guaranteed
+ * core.  Read under core_pool.lock; a non-NULL owner cannot be freed while the
+ * lock is held (free_manager() clears owner[] under the same lock before any
+ * kfree).
+ */
+static int upcall_owners_show(struct seq_file *s, void *v)
+{
+	unsigned long flags;
+	int cpu;
+
+	spin_lock_irqsave(&core_pool.lock, flags);
+	for_each_online_cpu(cpu) {
+		struct event_manager *mgr = core_pool.owner[cpu];
+
+		if (!mgr)
+			seq_printf(s, "cpu %3d: free\n", cpu);
+		else
+			seq_printf(s, "cpu %3d: mgr %d%s\n", cpu, mgr->id,
+				   cpumask_test_cpu(cpu, &mgr->guaranteed_mask) ?
+				   " (guaranteed)" : "");
+	}
+	spin_unlock_irqrestore(&core_pool.lock, flags);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(upcall_owners);
+
 static int __init upcall_init(void)
 {
+	int cpu;
+
+	spin_lock_init(&core_pool.lock);
+	cpumask_clear(&core_pool.free_mask);
+	for_each_online_cpu(cpu)
+		cpumask_set_cpu(cpu, &core_pool.free_mask);
+
+	upcall_debugfs_dir = debugfs_create_dir("upcall", NULL);
+	debugfs_create_file("owners", 0444, upcall_debugfs_dir, NULL,
+			    &upcall_owners_fops);
+
 	event_cache = kmem_cache_create("upcall_event", sizeof(struct up_event),
 			0, SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);
 	if (!event_cache)
