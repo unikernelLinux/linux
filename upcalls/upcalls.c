@@ -73,7 +73,8 @@ struct event_manager {
 struct upcall_core_pool {
 	spinlock_t		lock;
 	struct event_manager	*owner[NR_CPUS];
-	struct cpumask		free_mask;
+	struct cpumask		free_mask;	/* tier 1: never-owned / returned on exit */
+	struct cpumask		stealable_mask;	/* tier 2: owned but worker parked idle */
 };
 
 static struct upcall_core_pool core_pool;
@@ -170,16 +171,69 @@ static void set_owner_locked(struct event_manager *mgr, int cpu,
 }
 
 /*
- * Claim one guaranteed core in cpu's cache (LLC) domain for mgr, if the manager
- * does not already own a guaranteed core there and a free core is available.
- * The "already have one?" test and the claim are both performed under
- * core_pool.lock so concurrent workers in the same domain claim at most one.
- * A guaranteed core is never released (see worker_sleep()), giving the app a
- * cache-local, awake-able anchor in every domain it runs in.
+ * Acquire a core for mgr within `domain`, preferring a truly free core (tier 1)
+ * and otherwise stealing an idle core another app marked stealable (tier 2).
+ * Caller holds core_pool.lock.  Returns the cpu acquired (now in mgr->owned_mask
+ * and removed from the free/stealable pools) or -1 if none is available.
  *
- * Backstop: if the domain has no free core but this manager owns nothing at
- * all yet, take any free core machine-wide so post_event() always has an owned
- * fallback and the app can never strand at zero cores.
+ * A steal flips owner[cpu] under the *victim's* channel wakeup_lock and only
+ * while that core is still idle (event_count == 0) — the same gate a release
+ * used.  If the victim just got work we back off; its post_event re-validates
+ * ownership under the same lock and routes elsewhere, so no event strands.  A
+ * stealable core whose owner has since been handed work (a stale mark) is simply
+ * dropped from the pool as we pass over it.
+ */
+static int acquire_core_locked(struct event_manager *mgr,
+			       const struct cpumask *domain)
+{
+	int cpu;
+
+	/* Tier 1: a truly free core. */
+	cpu = cpumask_any_and(domain, &core_pool.free_mask);
+	if (cpu < nr_cpu_ids) {
+		cpumask_clear_cpu(cpu, &core_pool.free_mask);
+		set_owner_locked(mgr, cpu, mgr);
+		cpumask_set_cpu(cpu, &mgr->owned_mask);
+		atomic_inc(&mgr->owned_count);
+		return cpu;
+	}
+
+	/* Tier 2: steal an idle core from another app. */
+	while ((cpu = cpumask_any_and(domain, &core_pool.stealable_mask)) < nr_cpu_ids) {
+		struct event_manager *victim = core_pool.owner[cpu];
+		struct event_channel *vchan;
+
+		if (!victim || victim == mgr) {
+			cpumask_clear_cpu(cpu, &core_pool.stealable_mask);
+			continue;
+		}
+		vchan = victim->channels[cpu];
+		spin_lock(&vchan->wakeup_lock);
+		if (vchan->event_count == 0) {
+			core_pool.owner[cpu] = mgr;
+			cpumask_clear_cpu(cpu, &victim->owned_mask);
+			cpumask_set_cpu(cpu, &mgr->owned_mask);
+			atomic_dec(&victim->owned_count);
+			atomic_inc(&mgr->owned_count);
+			cpumask_clear_cpu(cpu, &core_pool.stealable_mask);
+			spin_unlock(&vchan->wakeup_lock);
+			return cpu;
+		}
+		/* Owner is reclaiming it: drop the stale mark and try another. */
+		cpumask_clear_cpu(cpu, &core_pool.stealable_mask);
+		spin_unlock(&vchan->wakeup_lock);
+	}
+	return -1;
+}
+
+/*
+ * Ensure mgr owns a guaranteed (never-released) core in cpu's cache domain if it
+ * does not already.  The "already have one?" test and the acquire happen
+ * together under core_pool.lock so concurrent workers in a domain create at most
+ * one.  Acquires via the two-tier pool, so a late-starting app can steal an idle
+ * incumbent's core for its anchor.  Backstop: if the domain yields nothing and
+ * the app still owns no core at all, acquire anywhere machine-wide so it can
+ * never strand at zero cores.
  *
  * Relies on upcall_domain_mask() grouping more than one CPU per domain; see the
  * note there about degenerate (QEMU singleton) topologies.
@@ -193,55 +247,40 @@ static void claim_guaranteed_core(struct event_manager *mgr, int cpu)
 	spin_lock_irqsave(&core_pool.lock, flags);
 	if (cpumask_intersects(&mgr->guaranteed_mask, domain))
 		goto out;
-	c = cpumask_any_and(domain, &core_pool.free_mask);
-	if (c >= nr_cpu_ids) {
-		if (atomic_read(&mgr->owned_count) != 0)
-			goto out;	/* contended domain, but we have cores elsewhere */
-		c = cpumask_first(&core_pool.free_mask);
-		if (c >= nr_cpu_ids)
-			goto out;	/* machine fully allocated */
-	}
-	cpumask_clear_cpu(c, &core_pool.free_mask);
-	set_owner_locked(mgr, c, mgr);
-	cpumask_set_cpu(c, &mgr->owned_mask);
-	cpumask_set_cpu(c, &mgr->guaranteed_mask);
-	atomic_inc(&mgr->owned_count);
+	c = acquire_core_locked(mgr, domain);
+	if (c < 0 && atomic_read(&mgr->owned_count) == 0)
+		c = acquire_core_locked(mgr, cpu_online_mask);
+	if (c >= 0)
+		cpumask_set_cpu(c, &mgr->guaranteed_mask);
 out:
 	spin_unlock_irqrestore(&core_pool.lock, flags);
 }
 
 /*
- * Elastic scale-up: claim any free core in `domain` for mgr.  Returns the
- * claimed CPU, or -1 if the domain has no free core.
+ * Elastic scale-up: acquire a core in `domain` for mgr (tier-1 free, else steal
+ * a tier-2 stealable core).  Returns the cpu acquired, or -1 if none available.
  */
-static int claim_free_core(struct event_manager *mgr, const struct cpumask *domain)
+static int take_core(struct event_manager *mgr, const struct cpumask *domain)
 {
 	unsigned long flags;
 	int cpu;
 
 	spin_lock_irqsave(&core_pool.lock, flags);
-	cpu = cpumask_any_and(domain, &core_pool.free_mask);
-	if (cpu >= nr_cpu_ids) {
-		spin_unlock_irqrestore(&core_pool.lock, flags);
-		return -1;
-	}
-	cpumask_clear_cpu(cpu, &core_pool.free_mask);
-	set_owner_locked(mgr, cpu, mgr);
-	cpumask_set_cpu(cpu, &mgr->owned_mask);
-	atomic_inc(&mgr->owned_count);
+	cpu = acquire_core_locked(mgr, domain);
 	spin_unlock_irqrestore(&core_pool.lock, flags);
 	return cpu;
 }
 
 /*
- * Voluntary scale-down: release cpu back to the pool if it is not a guaranteed
- * core and its channel has drained.  The event_count==0 test and the ownership
- * flip happen under the channel wakeup_lock, the same lock post_event() takes
- * to enqueue + increment event_count, so no event can strand on a core that is
- * being released (post_event either commits before the flip and blocks the
- * release, or re-validates after it and falls back to a guaranteed core).
+ * Scale-down without releasing: when a non-guaranteed core's worker parks with
+ * an empty queue, mark the core stealable instead of freeing it.  It stays owned
+ * by mgr (so post_event reclaims it the instant work arrives) but becomes a
+ * tier-2 candidate another app may take if it needs a core and none are free.
+ * The event_count==0 / owner==mgr test under the channel wakeup_lock avoids
+ * marking a core that just raced in some work.  A guaranteed core is never
+ * marked — it is the app's permanent anchor.
  */
-static void try_release_core(struct event_manager *mgr, int cpu)
+static void mark_stealable(struct event_manager *mgr, int cpu)
 {
 	struct event_channel *chan = mgr->channels[cpu];
 	unsigned long flags;
@@ -251,12 +290,8 @@ static void try_release_core(struct event_manager *mgr, int cpu)
 
 	spin_lock_irqsave(&core_pool.lock, flags);
 	spin_lock(&chan->wakeup_lock);
-	if (chan->event_count == 0 && core_pool.owner[cpu] == mgr) {
-		core_pool.owner[cpu] = NULL;
-		cpumask_clear_cpu(cpu, &mgr->owned_mask);
-		cpumask_set_cpu(cpu, &core_pool.free_mask);
-		atomic_dec(&mgr->owned_count);
-	}
+	if (chan->event_count == 0 && core_pool.owner[cpu] == mgr)
+		cpumask_set_cpu(cpu, &core_pool.stealable_mask);
 	spin_unlock(&chan->wakeup_lock);
 	spin_unlock_irqrestore(&core_pool.lock, flags);
 }
@@ -339,18 +374,20 @@ static void drop_anchor(struct event_anchor *anchor)
 
 /*
  * Congestion-driven scale-up, invoked from the event-placement path when an
- * event is queued onto a core that already has outstanding work.  Claim one
- * free core in cpu's cache domain for mgr and wake its worker so the backlog
- * drains in parallel.  Runs with IRQs disabled (placement context); the
- * lock-free free_mask test avoids taking the pool lock when nothing is free.
+ * event is queued onto a core that already has outstanding work.  Acquire one
+ * core in cpu's cache domain for mgr (a free core, else steal an idle stealable
+ * one) and wake its worker so the backlog drains in parallel.  Runs with IRQs
+ * disabled (placement context); the lock-free pool tests avoid taking the pool
+ * lock when neither tier has a candidate.
  */
 static void upcall_scale_up(struct event_manager *mgr, int cpu)
 {
 	int claimed;
 
-	if (cpumask_empty(&core_pool.free_mask))
+	if (cpumask_empty(&core_pool.free_mask) &&
+	    cpumask_empty(&core_pool.stealable_mask))
 		return;
-	claimed = claim_free_core(mgr, upcall_domain_mask(cpu));
+	claimed = take_core(mgr, upcall_domain_mask(cpu));
 	if (claimed >= 0)
 		wake_owned_worker(mgr, claimed);
 }
@@ -634,15 +671,14 @@ static void worker_sleep(struct event_manager *mgr)
 
 	/*
 	 * We hold no work and are committed to sleeping.  If this is not a
-	 * guaranteed core, cooperatively release it back to the pool so another
-	 * app can claim it.  try_release_core() only releases when event_count
-	 * is still 0 under the channel wakeup_lock, and post_event() re-validates
-	 * ownership under the same lock, so an event delivered concurrently can
-	 * never strand on the core we are releasing.  A guaranteed core is kept
-	 * (worker parks but retains ownership) so post_event() always has an
-	 * awake-able target.
+	 * guaranteed core, mark it stealable: we keep ownership (so post_event()
+	 * reclaims it the instant work arrives) but another app may take it if it
+	 * needs a core and none are free.  mark_stealable() only marks when
+	 * event_count is still 0 under the channel wakeup_lock, so a concurrently
+	 * delivered event that reclaims us wins the race and we are not marked.
+	 * A guaranteed core is kept unmarked (permanent awake-able anchor).
 	 */
-	try_release_core(mgr, cpu);
+	mark_stealable(mgr, cpu);
 again:
 	schedule();
 
@@ -814,10 +850,15 @@ static void free_manager(struct event_manager *mgr)
 	unsigned long flags;
 	int cpu;
 
-	/* Return every core this manager still owns to the global pool. */
+	/*
+	 * Return every core this manager still owns to the free pool — teardown is
+	 * the only path that produces truly-free cores in steady state.  Cores it
+	 * had marked stealable are dropped from that pool here too.
+	 */
 	spin_lock_irqsave(&core_pool.lock, flags);
 	for_each_cpu(cpu, &mgr->owned_mask) {
 		core_pool.owner[cpu] = NULL;
+		cpumask_clear_cpu(cpu, &core_pool.stealable_mask);
 		cpumask_set_cpu(cpu, &core_pool.free_mask);
 	}
 	cpumask_clear(&mgr->owned_mask);
@@ -1085,7 +1126,9 @@ static int upcall_owners_show(struct seq_file *s, void *v)
 		else
 			seq_printf(s, "cpu %3d: mgr %d%s\n", cpu, mgr->id,
 				   cpumask_test_cpu(cpu, &mgr->guaranteed_mask) ?
-				   " (guaranteed)" : "");
+				   " (guaranteed)" :
+				   cpumask_test_cpu(cpu, &core_pool.stealable_mask) ?
+				   " (stealable)" : "");
 	}
 	spin_unlock_irqrestore(&core_pool.lock, flags);
 	return 0;
@@ -1097,6 +1140,7 @@ static int __init upcall_init(void)
 	int cpu;
 
 	spin_lock_init(&core_pool.lock);
+	cpumask_clear(&core_pool.stealable_mask);
 	cpumask_clear(&core_pool.free_mask);
 	for_each_online_cpu(cpu)
 		cpumask_set_cpu(cpu, &core_pool.free_mask);
