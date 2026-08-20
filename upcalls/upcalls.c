@@ -313,14 +313,18 @@ static void wake_owned_worker(struct event_manager *mgr, int cpu)
 
 /*
  * Choose an owned channel for mgr to receive an event that arrived on my_cpu.
- * Prefers the least-loaded core mgr owns within my_cpu's cache domain (fast
- * path: the local core if it is owned and idle); if the domain has no owned
- * core, falls back to a guaranteed core (never released, always a valid
- * target).  Reads owned/guaranteed masks lock-free — hint quality; post_event
+ * Fast path: the local core, as long as it is owned and its queue depth is
+ * below LOCAL_SPREAD_THRESHOLD.  Past that, spreads to the least-loaded core
+ * mgr owns within my_cpu's cache domain; if the domain has no owned core,
+ * falls back to a guaranteed core (never released, always a valid target).
+ * Reads owned/guaranteed masks lock-free — hint quality; post_event
  * re-validates the chosen core's ownership under its wakeup_lock.  Returns NULL
  * only if the manager owns no cores at all (pathological, fully-allocated
  * machine).
  */
+/* Local core keeps taking events up to this queue depth before we spread. */
+#define LOCAL_SPREAD_THRESHOLD 32
+
 static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 {
 	const struct cpumask *domain = upcall_domain_mask(my_cpu);
@@ -331,7 +335,7 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 	if (cpumask_test_cpu(my_cpu, &mgr->owned_mask)) {
 		struct event_channel *local = mgr->channels[my_cpu];
 
-		if (local && READ_ONCE(local->event_count) == 0)
+		if (local && READ_ONCE(local->event_count) < LOCAL_SPREAD_THRESHOLD)
 			return local;
 	}
 
