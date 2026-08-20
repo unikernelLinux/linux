@@ -59,6 +59,7 @@ struct event_manager {
 	 */
 	struct cpumask		owned_mask;
 	struct cpumask		guaranteed_mask;
+	struct cpumask		guaranteed_electing;	/* per-domain create-once token */
 	atomic_t		owned_count;
 	int			id;		/* small stable id for observability */
 };
@@ -236,9 +237,13 @@ static int acquire_core(struct event_manager *mgr, const struct cpumask *domain)
 
 /*
  * Ensure mgr owns a guaranteed (never-released) core in cpu's cache domain if it
- * does not already.  To keep "one guaranteed core per domain" without a lock, we
- * elect exactly one worker per domain to create it — the one pinned to the
- * domain's first CPU — so two workers of the same manager can't race into two.
+ * does not already.  To keep "one guaranteed core per domain" without a lock,
+ * the *first worker to arrive* for a domain creates its guaranteed core: the
+ * domain's first CPU is a stable per-domain token, and a lock-free
+ * test_and_set on guaranteed_electing elects exactly one worker (the winner) and
+ * makes everyone else skip.  Because this runs before attach_poll() in the same
+ * upcall_submit(), the worker that arms the first fd in a domain has already
+ * brought a core online — so there is never an armed-but-coreless window.
  * Acquires via the two-tier pool, so a late-starting app can steal an idle
  * incumbent's core for its anchor.  Backstop: if the domain yields nothing and
  * the app still owns no core at all, acquire anywhere machine-wide so it can
@@ -252,9 +257,7 @@ static void claim_guaranteed_core(struct event_manager *mgr, int cpu)
 	const struct cpumask *domain = upcall_domain_mask(cpu);
 	int c;
 
-	if (cpu != cpumask_first(domain))
-		return;
-	if (cpumask_intersects(&mgr->guaranteed_mask, domain))
+	if (cpumask_test_and_set_cpu(cpumask_first(domain), &mgr->guaranteed_electing))
 		return;
 	c = acquire_core(mgr, domain);
 	if (c < 0 && atomic_read(&mgr->owned_count) == 0)
@@ -796,6 +799,8 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 		};
 		in[i] = NULL;
 
+		if (ret)
+			return ret;
 	}
 
 again:
