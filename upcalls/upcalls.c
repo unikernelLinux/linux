@@ -61,6 +61,7 @@ struct event_manager {
 	struct cpumask		guaranteed_mask;
 	struct cpumask		guaranteed_electing;	/* per-domain create-once token */
 	atomic_t		owned_count;
+	size_t		batch_size; /* the configured size of events the application is willing to consider a batch */
 	int			id;		/* small stable id for observability */
 };
 
@@ -86,7 +87,7 @@ struct upcall_core_pool {
 static struct upcall_core_pool core_pool;
 
 /* Monotonic id source + debugfs handle for observability. */
-static atomic_t upcall_mgr_ids = ATOMIC_INIT(0);
+static  atomic_t upcall_mgr_ids = ATOMIC_INIT(0);
 static struct dentry *upcall_debugfs_dir;
 
 struct event_anchor {
@@ -314,7 +315,7 @@ static void wake_owned_worker(struct event_manager *mgr, int cpu)
 /*
  * Choose an owned channel for mgr to receive an event that arrived on my_cpu.
  * Fast path: the local core, as long as it is owned and its queue depth is
- * below LOCAL_SPREAD_THRESHOLD.  Past that, spreads to the least-loaded core
+ * below mgr->batch_sz.  Past that, spreads to the least-loaded core
  * mgr owns within my_cpu's cache domain; if the domain has no owned core,
  * falls back to a guaranteed core (never released, always a valid target).
  * Reads owned/guaranteed masks lock-free — hint quality; post_event
@@ -322,8 +323,6 @@ static void wake_owned_worker(struct event_manager *mgr, int cpu)
  * only if the manager owns no cores at all (pathological, fully-allocated
  * machine).
  */
-/* Local core keeps taking events up to this queue depth before we spread. */
-#define LOCAL_SPREAD_THRESHOLD 32
 
 static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 {
@@ -335,7 +334,11 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 	if (cpumask_test_cpu(my_cpu, &mgr->owned_mask)) {
 		struct event_channel *local = mgr->channels[my_cpu];
 
-		if (local && READ_ONCE(local->event_count) < LOCAL_SPREAD_THRESHOLD)
+		/*
+		 * We don't want to spread to a new core until our local queueu is
+		 * larger than the application configured batch size 
+		 */
+		if (local && READ_ONCE(local->event_count) < mgr->batch_size)
 			return local;
 	}
 
@@ -434,7 +437,7 @@ static void post_event(struct event_anchor *anchor)
 	if (READ_ONCE(core_pool.owner[target->cpu]) == mgr) {
 		/* Congestion: the chosen (least-loaded owned) core already has
 		 * outstanding events, so every owned core in this domain is busy. */
-		congested = target->event_count > LOCAL_SPREAD_THRESHOLD;
+		congested = target->event_count > 0;
 		list_add_tail(&anchor->anchor, &target->wakeups);
 		target->event_count++;
 		enqueued = true;
@@ -450,7 +453,7 @@ static void post_event(struct event_anchor *anchor)
 		}
 		target = mgr->channels[gcpu];
 		spin_lock(&target->wakeup_lock);
-		congested = target->event_count > LOCAL_SPREAD_THRESHOLD;
+		congested = target->event_count > 0;
 		list_add_tail(&anchor->anchor, &target->wakeups);
 		target->event_count++;
 		spin_unlock(&target->wakeup_lock);
@@ -1077,15 +1080,20 @@ out_free:
 	return NULL;
 }
 
-SYSCALL_DEFINE1(upcall_create, int, flags)
+SYSCALL_DEFINE2(upcall_create, size_t, batch_sz, int, flags)
 {
 	int fd, error = 0;
 	struct event_manager *mgr;
 	struct file *file;
 
+	if (batch_sz == 0)
+		return -EINVAL;
+
 	mgr = create_manager();
 	if (!mgr)
 		return -ENOMEM;
+
+	mgr->batch_size = batch_sz;
 
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
 	if (fd < 0) {
