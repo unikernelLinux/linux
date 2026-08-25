@@ -8,6 +8,7 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/fdtable.h>
+#include <linux/vmalloc.h>
 #include <linux/errno.h>
 #include <linux/poll.h>
 #include <linux/list.h>
@@ -65,6 +66,15 @@ struct event_manager {
 	atomic_t		owned_count;
 	size_t		batch_size; /* the configured size of events the application is willing to consider a batch */
 	int			id;		/* small stable id for observability */
+	/*
+	 * Cached struct file* per fd, valid from first use (attach or completion)
+	 * until UP_CLOSE invalidates it -- see fdcache_get()/fdcache_invalidate().
+	 * Safe because every close of an fd this manager touches now goes through
+	 * UP_CLOSE (do_upcall_submit's own close_fd() call), so there is no path
+	 * that can close an fd out from under a cached entry.
+	 */
+	struct file		**fd_cache;
+	unsigned int		fd_cache_size;
 };
 
 /*
@@ -137,6 +147,9 @@ struct anchor_pool {
 	struct event_anchor	*free[ANCHOR_POOL_CAP];
 };
 static DEFINE_PER_CPU(struct anchor_pool, anchor_pool);
+
+/* fd -> struct file* cache size; see fdcache_get() near try_read(). */
+#define FD_CACHE_SIZE 65536
 
 /* Buffer cache */
 static struct kmem_cache *buffer_cache __read_mostly;
@@ -524,6 +537,56 @@ static void upcall_poll_init(struct file *file, wait_queue_head_t *whead, poll_t
 	add_wait_queue(whead, &anchor->wait);
 }
 
+/*
+ * fd -> struct file* cache, one reference held per fd from first touch until
+ * UP_CLOSE invalidates it.  Always returns a reference borrowed from the
+ * cache -- callers must never fput() it -- so an fd outside fd_cache_size
+ * (never expected given the fixed, generous sizing) returns NULL rather than
+ * a differently-owned fget() the caller would have to treat specially.
+ * Lock-free: a slot is published with cmpxchg so racing first-touches never
+ * leak more than the one loser's extra fget(), and fdcache_invalidate()
+ * swaps the slot to NULL with xchg before close_fd() actually closes the fd,
+ * so a lookup either sees the live cached file or finds an empty slot and
+ * populates it with a fresh (and, post-close, correctly failing) fget() --
+ * never a stale pointer.
+ */
+static struct file *fdcache_get(struct event_manager *mgr, int fd)
+{
+	struct file *file, *raced;
+
+	if (fd < 0 || (unsigned int)fd >= mgr->fd_cache_size)
+		return NULL;
+
+	file = READ_ONCE(mgr->fd_cache[fd]);
+	if (file)
+		return file;
+
+	file = fget(fd);
+	if (!file)
+		return NULL;
+
+	raced = cmpxchg(&mgr->fd_cache[fd], NULL, file);
+	if (raced) {
+		/* Someone else published first; use theirs, drop our extra ref. */
+		fput(file);
+		return raced;
+	}
+	return file;
+}
+
+/* Called before close_fd() so no lookup can observe a stale cached file. */
+static void fdcache_invalidate(struct event_manager *mgr, int fd)
+{
+	struct file *file;
+
+	if (fd < 0 || (unsigned int)fd >= mgr->fd_cache_size)
+		return;
+
+	file = xchg(&mgr->fd_cache[fd], NULL);
+	if (file)
+		fput(file);
+}
+
 static void get_buffer(struct iovec *iov)
 {
 	struct event_buffer *buf;
@@ -542,7 +605,7 @@ static void get_buffer(struct iovec *iov)
 }
 
 
-static void try_read(struct up_event *evt)
+static void try_read(struct event_manager *mgr, struct up_event *evt)
 {
 	struct file *file;
 	struct kiocb kiocb;
@@ -550,9 +613,9 @@ static void try_read(struct up_event *evt)
 	struct iovec iov;
 	size_t cursor = 0;
 	int ret;
-	CLASS(fd_pos, f)(evt->fd);
 
-	if (fd_empty(f)) {
+	file = fdcache_get(mgr, evt->fd);
+	if (!file) {
 		evt->result = -EBADF;
 		return;
 	}
@@ -566,7 +629,6 @@ static void try_read(struct up_event *evt)
 	evt->buf = iov.iov_base;
 	evt->len = iov.iov_len;
 
-	file = fd_file(f);
 	init_sync_kiocb(&kiocb, file);
 
 	while (cursor < iov.iov_len) {
@@ -585,7 +647,7 @@ static void try_read(struct up_event *evt)
 	evt->result = cursor;
 }
 
-static void try_write(struct up_event *evt)
+static void try_write(struct event_manager *mgr, struct up_event *evt)
 {
 	struct file *file;
 	struct kiocb kiocb;
@@ -593,9 +655,9 @@ static void try_write(struct up_event *evt)
 	struct iovec iov;
 	size_t cursor = 0;
 	int ret;
-	CLASS(fd_pos, f)(evt->fd);
 
-	if (fd_empty(f)) {
+	file = fdcache_get(mgr, evt->fd);
+	if (!file) {
 		evt->result = -EBADF;
 		return;
 	}
@@ -603,7 +665,6 @@ static void try_write(struct up_event *evt)
 	iov.iov_base = evt->buf;
 	iov.iov_len = evt->len;
 
-	file = fd_file(f);
 	init_sync_kiocb(&kiocb, file);
 
 	while (cursor < iov.iov_len) {
@@ -629,7 +690,7 @@ static void try_accept(struct up_event *evt)
 
 static __poll_t upcall_item_poll(struct event_anchor *anchor, __poll_t events)
 {
-	struct file *file = fget(anchor->event->fd);
+	struct file *file = fdcache_get(anchor->mgr, anchor->event->fd);
 	poll_table *pt = &anchor->pt;
 	__poll_t res;
 
@@ -638,8 +699,6 @@ static __poll_t upcall_item_poll(struct event_anchor *anchor, __poll_t events)
 
 	anchor->events = pt->_key = events;
 	res = vfs_poll(file, pt);
-
-	fput(file);
 
 	return res & events;
 }
@@ -850,6 +909,7 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 			break;
 
 		case UP_CLOSE:
+			fdcache_invalidate(mgr, in[i]->fd);
 			ret = close_fd(in[i]->fd);
 			break;
 
@@ -871,10 +931,10 @@ again:
 
 		switch (anchor->event->type) {
 		case UP_READ:
-			try_read(anchor->event);
+			try_read(mgr, anchor->event);
 			break;
 		case UP_WRITE:
-			try_write(anchor->event);
+			try_write(mgr, anchor->event);
 			break;
 		case UP_ACCEPT:
 			try_accept(anchor->event);
@@ -940,6 +1000,15 @@ static void free_manager(struct event_manager *mgr)
 				mgr->channels[j] = NULL;
 		kfree(chan);
 	}
+
+	/* Release any fds this manager never got an explicit UP_CLOSE for
+	 * (app exit without draining every connection). */
+	for (unsigned int i = 0; i < mgr->fd_cache_size; i++) {
+		if (mgr->fd_cache[i])
+			fput(mgr->fd_cache[i]);
+	}
+	vfree(mgr->fd_cache);
+
 	kfree(mgr);
 }
 
@@ -1123,6 +1192,14 @@ static struct event_manager *create_manager(void)
 		mgr->channels[i]->cpu = i;
 	}
 
+	/* Sized to match the ulimit -n 65536 used across the benchmark fleet;
+	 * an fd beyond this just falls back to uncached (fdcache_get() returns
+	 * NULL, callers already handle that as -EBADF). */
+	mgr->fd_cache_size = FD_CACHE_SIZE;
+	mgr->fd_cache = vzalloc(mgr->fd_cache_size * sizeof(struct file *));
+	if (!mgr->fd_cache)
+		goto out_free;
+
 	kref_init(&mgr->ref_count);
 	mgr->id = atomic_inc_return(&upcall_mgr_ids);
 
@@ -1132,6 +1209,7 @@ out_free:
 	for_each_online_cpu(i) {
 		kfree(mgr->channels[i]);
 	}
+	vfree(mgr->fd_cache);
 	kfree(mgr);
 	return NULL;
 }
