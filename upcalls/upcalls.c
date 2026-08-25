@@ -7,6 +7,7 @@
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/fdtable.h>
 #include <linux/errno.h>
 #include <linux/poll.h>
 #include <linux/list.h>
@@ -23,6 +24,7 @@
 #include <linux/atomic.h>
 #include <linux/rculist.h>
 #include <linux/percpu-defs.h>
+#include <linux/percpu.h>
 #include <linux/cpumask.h>
 #include <linux/anon_inodes.h>
 #include <linux/upcall.h>
@@ -118,6 +120,23 @@ static struct kmem_cache *event_cache __read_mostly;
 
 /* Anchor cache */
 static struct kmem_cache *anchor_cache __read_mostly;
+
+/*
+ * Per-CPU recycle pool for event_anchor objects.  build_anchor()/attach_poll()
+ * fully reinitialize every field of a reused anchor (event, list heads, mgr,
+ * armed, wait/whead/pt via upcall_poll_init(), events via upcall_item_poll()),
+ * so a recycled anchor is indistinguishable from a freshly allocated one.
+ * Only touched from upcall_submit()'s task context (never softirq -- the
+ * pathological drop_anchor() path, which can run from softirq, still goes
+ * straight to kmem_cache_free()), so get_cpu_var/put_cpu_var (preempt-disable)
+ * is sufficient without irq-off.
+ */
+#define ANCHOR_POOL_CAP 64
+struct anchor_pool {
+	int			count;
+	struct event_anchor	*free[ANCHOR_POOL_CAP];
+};
+static DEFINE_PER_CPU(struct anchor_pool, anchor_pool);
 
 /* Buffer cache */
 static struct kmem_cache *buffer_cache __read_mostly;
@@ -706,11 +725,44 @@ out:
 	return;
 }
 
+/* Pop a recycled anchor for this CPU, or NULL if the pool is empty. */
+static struct event_anchor *anchor_pool_get(void)
+{
+	struct anchor_pool *pool;
+	struct event_anchor *anchor = NULL;
+
+	pool = &get_cpu_var(anchor_pool);
+	if (pool->count)
+		anchor = pool->free[--pool->count];
+	put_cpu_var(anchor_pool);
+
+	return anchor;
+}
+
+/* Push a freed anchor onto this CPU's pool, or free it to the slab if full. */
+static void anchor_pool_put(struct event_anchor *anchor)
+{
+	struct anchor_pool *pool;
+	bool queued = false;
+
+	pool = &get_cpu_var(anchor_pool);
+	if (pool->count < ANCHOR_POOL_CAP) {
+		pool->free[pool->count++] = anchor;
+		queued = true;
+	}
+	put_cpu_var(anchor_pool);
+
+	if (!queued)
+		kmem_cache_free(anchor_cache, anchor);
+}
+
 static struct event_anchor *build_anchor(struct event_manager *mgr, struct up_event *evt)
 {
 	struct event_anchor *anchor;
 
-	anchor = kmem_cache_alloc(anchor_cache, GFP_KERNEL);
+	anchor = anchor_pool_get();
+	if (!anchor)
+		anchor = kmem_cache_alloc(anchor_cache, GFP_KERNEL);
 	if (!anchor) {
 		// Not sure what to do here, needs thinking
 		return NULL;
@@ -797,6 +849,10 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 			ret = attach_poll(mgr, in[i], EPOLLOUT | POLLWRNORM);
 			break;
 
+		case UP_CLOSE:
+			ret = close_fd(in[i]->fd);
+			break;
+
 		default:
 			return -EINVAL;
 		};
@@ -829,7 +885,7 @@ again:
 		out[out_idx] = anchor->event;
 		out_idx++;
 		put_mgr(mgr);
-		kmem_cache_free(anchor_cache, anchor);
+		anchor_pool_put(anchor);
 	}
 
 	// Finally, if we have no active wakeups and no output, we need to sleep here and try again.
@@ -1007,8 +1063,8 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 			goto out_free;
 		}
 
-		// Check if we have a continuation, UP_VEC doesn't need one
-		if (item->work_fn == NULL && item->type != UP_VEC) {
+		// Check if we have a continuation, neither UP_VEC nor UP_CLOSE don't need one
+		if (item->work_fn == NULL && !(item->type == UP_VEC || item->type == UP_CLOSE)) {
 			pr_err("Corrupted submission at %d of %d, missing continuation\n", i, in_cnt);
 			clean_kitems(i + 1, kitems);
 			ret = -EINVAL;

@@ -27,6 +27,7 @@ typedef enum {
 	UP_WRITE,       // Requesting a write of the fd
 	UP_ACCEPT,      // Requesting an accept4 on the fd (will imply SOCK_NONBLOCK)
 	UP_VEC,         // Give the struct iovec array at buf with len items to the kernel
+	UP_CLOSE,		// Requesting the close of the fd
 	NR_ACTIONS      // Error checking
 } up_action_t;
 
