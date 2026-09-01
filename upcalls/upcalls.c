@@ -65,6 +65,9 @@ struct event_manager {
 	struct cpumask		guaranteed_electing;	/* per-domain create-once token */
 	atomic_t		owned_count;
 	size_t		batch_size; /* the configured size of events the application is willing to consider a batch */
+	/* Scale-up congestion threshold. Deliberately separate from batch_size
+	 * -- coupling this to the placement threshold caused a regression before. */
+	size_t		spread_threshold;
 	int			id;		/* small stable id for observability */
 	/*
 	 * Cached struct file* per fd, valid from first use (attach or completion)
@@ -467,9 +470,7 @@ static void post_event(struct event_anchor *anchor)
 	 */
 	spin_lock(&target->wakeup_lock);
 	if (READ_ONCE(core_pool.owner[target->cpu]) == mgr) {
-		/* Congestion: the chosen (least-loaded owned) core already has
-		 * outstanding events, so every owned core in this domain is busy. */
-		congested = target->event_count > 0;
+		congested = target->event_count > mgr->spread_threshold;
 		list_add_tail(&anchor->anchor, &target->wakeups);
 		target->event_count++;
 		enqueued = true;
@@ -485,7 +486,7 @@ static void post_event(struct event_anchor *anchor)
 		}
 		target = mgr->channels[gcpu];
 		spin_lock(&target->wakeup_lock);
-		congested = target->event_count > 0;
+		congested = target->event_count > mgr->spread_threshold;
 		list_add_tail(&anchor->anchor, &target->wakeups);
 		target->event_count++;
 		spin_unlock(&target->wakeup_lock);
@@ -1228,6 +1229,7 @@ SYSCALL_DEFINE2(upcall_create, size_t, batch_sz, int, flags)
 		return -ENOMEM;
 
 	mgr->batch_size = batch_sz;
+	mgr->spread_threshold = (batch_sz * 3) / 4;
 
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
 	if (fd < 0) {
