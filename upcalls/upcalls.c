@@ -30,6 +30,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/upcall.h>
 #include <linux/socket.h>
+#include <net/busy_poll.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 
@@ -95,7 +96,8 @@ struct event_anchor {
 	struct list_head	anchor;
 	struct up_event		*event;
 	struct event_manager	*mgr;
-	atomic_t		armed;
+	atomic_t		armed;	/* arbiter: who completes/posts the event */
+	struct kref		refs;	/* lifetime: recycled when this hits 0 */
 	wait_queue_entry_t	wait;
 	wait_queue_head_t	*whead;
 	poll_table		pt;
@@ -140,6 +142,12 @@ static DEFINE_PER_CPU(struct anchor_pool, anchor_pool);
 static struct kmem_cache *buffer_cache __read_mostly;
 
 static void free_manager_kref(struct kref *kref);
+
+/* anchor->refs release callbacks: recycle to the per-CPU pool (task context)
+ * or free straight to the slab (drop_anchor, which is softirq-reachable and
+ * must not touch the pool). */
+static void anchor_release_pool(struct kref *kref);
+static void anchor_release_slab(struct kref *kref);
 
 static inline void put_mgr(struct event_manager *mgr)
 {
@@ -349,7 +357,10 @@ static void drop_anchor(struct event_anchor *anchor)
 	pr_warn_once("upcall: manager owns no cores, dropping event\n");
 	kmem_cache_free(event_cache, anchor->event);
 	put_mgr(anchor->mgr);
-	kmem_cache_free(anchor_cache, anchor);
+	/* Drop the event reference. anchor_release_slab frees straight to the slab
+	 * (this path is softirq-reachable and must not touch the pool); if the
+	 * arming path still holds its reference it frees the anchor itself later. */
+	kref_put(&anchor->refs, anchor_release_slab);
 }
 
 /* Runs with IRQs disabled (placement context). */
@@ -433,10 +444,8 @@ static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
 		return 0;
 
 	armed = atomic_dec_return(&anchor->armed);
-	if (armed) {
-		/* We raced with another wake up, and they won */
-		return 0;
-	}
+	if (armed)
+		return 0;	/* raced with another wakeup path; they won */
 
 	/* Called from __wake_up_common with wq_head->lock held; use list_del_init
 	 * directly rather than remove_wait_queue, which would deadlock trying to
@@ -712,6 +721,20 @@ static void anchor_pool_put(struct event_anchor *anchor)
 		kmem_cache_free(anchor_cache, anchor);
 }
 
+/* kref release: recycle to the per-CPU pool. Only reached from task context
+ * (attach_poll / the drain loop), where the pool is safe to touch. */
+static void anchor_release_pool(struct kref *kref)
+{
+	anchor_pool_put(container_of(kref, struct event_anchor, refs));
+}
+
+/* kref release: free straight to the slab. Used by drop_anchor(), which is
+ * softirq-reachable and must not touch the per-CPU pool. */
+static void anchor_release_slab(struct kref *kref)
+{
+	kmem_cache_free(anchor_cache, container_of(kref, struct event_anchor, refs));
+}
+
 static struct event_anchor *build_anchor(struct event_manager *mgr, struct up_event *evt)
 {
 	struct event_anchor *anchor;
@@ -729,6 +752,16 @@ static struct event_anchor *build_anchor(struct event_manager *mgr, struct up_ev
 	anchor->mgr = mgr;
 	kref_get(&mgr->ref_count);
 	atomic_set(&anchor->armed, 1);
+	/*
+	 * Two lifetime references: one for the arming path (attach_poll, dropped
+	 * when it returns) and one for the event itself (dropped when the event
+	 * is delivered by the drain, or discarded by drop_anchor).  The anchor is
+	 * recycled only when both are gone, so attach_poll's armed-arbitration can
+	 * never touch an anchor that the async path already completed and another
+	 * worker recycled.  kref_init() gives the first ref; kref_get() the second.
+	 */
+	kref_init(&anchor->refs);
+	kref_get(&anchor->refs);
 	return anchor;
 }
 
@@ -768,6 +801,15 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t
 		}
 	}
 
+	/*
+	 * Drop the arming-path reference.  Until here we held a ref, so no drain
+	 * worker could recycle the anchor out from under the armed dec above.  If
+	 * the event is already done (drained/dropped), this recycles it; else it
+	 * stays alive for the async wakeup path.  Must be last -- `anchor` may be
+	 * freed the instant kref_put() drops the final reference.
+	 */
+	kref_put(&anchor->refs, anchor_release_pool);
+
 	return 0;
 }
 
@@ -776,6 +818,8 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 {
 	int out_idx = 0;
 	int ret = 0;
+	int last_fd = -1;
+	bool polled = false;
 	struct event_anchor *anchor;
 
 	for (int i = 0; i < in_cnt; i++) {
@@ -831,9 +875,26 @@ again:
 			return -EINVAL;
 		}
 		out[out_idx] = anchor->event;
+		last_fd = anchor->event->fd;
 		out_idx++;
 		put_mgr(mgr);
-		anchor_pool_put(anchor);
+		/* Drop the event reference; recycled once the arming path is done
+		 * with the anchor too. */
+		kref_put(&anchor->refs, anchor_release_pool);
+	}
+
+	if (!polled && out_idx > 0 && (size_t)out_idx < mgr->napi_poll_threshold) {
+		struct file *file = fdcache_get(mgr, last_fd);
+		struct socket *sock = file ? sock_from_file(file) : NULL;
+
+		polled = true;
+		if (sock && sock->sk) {
+			unsigned int napi_id = READ_ONCE(sock->sk->sk_napi_id);
+
+			if (napi_id_valid(napi_id))
+				napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
+		}
+		goto again;
 	}
 
 	if (!out_idx && out_cnt > 0) {
@@ -1101,6 +1162,7 @@ SYSCALL_DEFINE2(upcall_create, size_t, batch_sz, int, flags)
 
 	mgr->batch_size = batch_sz;
 	mgr->spread_threshold = (batch_sz * 3) / 4;
+	mgr->napi_poll_threshold = batch_sz / 4;
 
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
 	if (fd < 0) {
