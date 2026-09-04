@@ -42,7 +42,9 @@ struct event_channel {
 	struct list_head	sleeping_workers;
 	size_t			event_count;
 	int			cpu;
-	uint8_t			pad[4];
+	u32			idle_count;
+	u32			spread_count;
+	u32			saturated_count;
 };
 
 struct event_manager {
@@ -66,6 +68,7 @@ struct event_manager {
 	atomic_t		owned_count;
 	size_t		batch_size; /* the configured size of events the application is willing to consider a batch */
 	int			id;		/* small stable id for observability */
+	struct dentry		*debugfs_dir;
 	/*
 	 * Cached struct file* per fd, valid from first use (attach or completion)
 	 * until UP_CLOSE invalidates it -- see fdcache_get()/fdcache_invalidate().
@@ -424,11 +427,17 @@ static void upcall_scale_up(struct event_manager *mgr, int cpu)
 	int claimed;
 
 	if (cpumask_empty(&core_pool.free_mask) &&
-	    cpumask_empty(&core_pool.stealable_mask))
+	    cpumask_empty(&core_pool.stealable_mask)) {
+		mgr->channels[cpu]->saturated_count++;
 		return;
+	}
 	claimed = acquire_core(mgr, upcall_domain_mask(cpu));
-	if (claimed >= 0)
+	if (claimed >= 0) {
+		mgr->channels[cpu]->spread_count++;
 		wake_owned_worker(mgr, claimed);
+	} else {
+		mgr->channels[cpu]->saturated_count++;
+	}
 }
 
 static void post_event(struct event_anchor *anchor)
@@ -751,6 +760,7 @@ static void worker_sleep(struct event_manager *mgr)
 	// Okay, we really need to sleep.
 	list_add(&current->worker_context->anchor, &channel->sleeping_workers);
 	set_current_state(TASK_INTERRUPTIBLE);
+	channel->idle_count++;
 	spin_unlock(&channel->worker_lock);
 	local_irq_restore(flags);
 
@@ -975,6 +985,8 @@ static void free_manager(struct event_manager *mgr)
 	unsigned long flags;
 	int cpu;
 
+	debugfs_remove(mgr->debugfs_dir);
+
 	/*
 	 * Return every core this manager still owns to the free pool — teardown is
 	 * the only path that produces truly-free cores in steady state.  Cores it
@@ -1172,6 +1184,9 @@ static struct event_channel *create_channel(void)
 	INIT_LIST_HEAD(&ret->sleeping_workers);
 	spin_lock_init(&ret->wakeup_lock);
 	spin_lock_init(&ret->worker_lock);
+	ret->idle_count = 0;
+	ret->spread_count = 0;
+	ret->saturated_count = 0;
 
 	return ret;
 }
@@ -1214,6 +1229,36 @@ out_free:
 	return NULL;
 }
 
+static int upcall_counters_show(struct seq_file *s, void *v)
+{
+	struct event_manager *mgr = s->private;
+	int cpu;
+
+	for_each_online_cpu(cpu) {
+		struct event_channel *channel = mgr->channels[cpu];
+
+		if (!channel)
+			continue;
+		seq_printf(s, "cpu %3d: idle %u spread %u saturated %u\n",
+			   cpu, READ_ONCE(channel->idle_count),
+			   READ_ONCE(channel->spread_count),
+			   READ_ONCE(channel->saturated_count));
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(upcall_counters);
+
+static void create_manager_debugfs(struct event_manager *mgr)
+{
+	char name[32];
+
+	snprintf(name, sizeof(name), "manager-%d", mgr->id);
+	mgr->debugfs_dir = debugfs_create_dir(name, upcall_debugfs_dir);
+	debugfs_create_file("counters", 0444, mgr->debugfs_dir, mgr,
+			    &upcall_counters_fops);
+}
+
 SYSCALL_DEFINE2(upcall_create, size_t, batch_sz, int, flags)
 {
 	int fd, error = 0;
@@ -1243,6 +1288,7 @@ SYSCALL_DEFINE2(upcall_create, size_t, batch_sz, int, flags)
 	}
 
 	mgr->file = file;
+	create_manager_debugfs(mgr);
 	fd_install(fd, file);
 	return fd;
 
@@ -1316,4 +1362,3 @@ static int __init upcall_init(void)
 }
 
 __initcall(upcall_init);
-
