@@ -1161,8 +1161,8 @@ SYSCALL_DEFINE2(upcall_create, size_t, batch_sz, int, flags)
 		return -ENOMEM;
 
 	mgr->batch_size = batch_sz;
-	mgr->spread_threshold = (batch_sz * 3) / 4;
-	mgr->napi_poll_threshold = batch_sz / 4;
+	mgr->spread_threshold = batch_sz - 2;
+	mgr->napi_poll_threshold = batch_sz / 2;
 
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
 	if (fd < 0) {
