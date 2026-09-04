@@ -184,6 +184,41 @@ static const struct cpumask *upcall_domain_mask(int cpu)
 }
 
 /*
+ * completion_partner[cpu] is the core that processes cpu's events. Within each
+ * domain the cores are ranked in enumeration order and paired (rank 0 -> rank 1,
+ * rank 2 -> rank 3, ...): an even-rank core forwards to the next odd-rank core,
+ * which is a completion core and keeps its own events. The odd-rank cores --
+ * half of each domain -- do all completion processing. Ranks are positions
+ * within the domain mask, not CPU ids, so a pair is always in the same domain
+ * regardless of how firmware numbers CPUs. A domain with an odd core count
+ * leaves its last even-rank core mapped to itself (its own completion core).
+ */
+static int completion_partner[NR_CPUS];
+
+static void build_completion_partners(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		completion_partner[cpu] = cpu;
+
+	for_each_online_cpu(cpu) {
+		const struct cpumask *dom = upcall_domain_mask(cpu);
+		int rank = 0, forwarder = -1, c;
+
+		for_each_cpu(c, dom) {
+			if (!(rank & 1)) {
+				forwarder = c;
+			} else {
+				completion_partner[forwarder] = c;
+				completion_partner[c] = c;
+			}
+			rank++;
+		}
+	}
+}
+
+/*
  * Acquire a core for mgr within `domain`. Lock-free except for a genuine
  * cross-app steal (tier 2), which takes core_pool.lock so the victim can't
  * be freed under us, then gates on the victim being idle (event_count == 0)
@@ -298,57 +333,13 @@ static void wake_owned_worker(struct event_manager *mgr, int cpu)
 }
 
 /*
- * Choose an owned channel for mgr to receive an event that arrived on my_cpu.
- * Fast path: the local core, as long as it is owned and its queue depth is
- * below mgr->batch_sz.  Past that, spreads to the least-loaded core
- * mgr owns within my_cpu's cache domain; if the domain has no owned core,
- * falls back to a guaranteed core (never released, always a valid target).
- * Reads owned/guaranteed masks lock-free — hint quality; post_event
- * re-validates the chosen core's ownership under its wakeup_lock.  Returns NULL
- * only if the manager owns no cores at all (pathological, fully-allocated
- * machine).
+ * Fixed placement via the precomputed partner table: an event is processed on
+ * its core's paired completion core (see build_completion_partners()). No
+ * scanning -- a single lookup.
  */
-
 static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 {
-	const struct cpumask *domain = upcall_domain_mask(my_cpu);
-	struct event_channel *best = NULL;
-	size_t best_count = (size_t)-1;
-	int cpu;
-
-	if (cpumask_test_cpu(my_cpu, &mgr->owned_mask)) {
-		struct event_channel *local = mgr->channels[my_cpu];
-
-		/*
-		 * We don't want to spread to a new core until our local queueu is
-		 * larger than the application configured batch size 
-		 */
-		if (local && READ_ONCE(local->event_count) < mgr->batch_size)
-			return local;
-	}
-
-	for_each_cpu_and(cpu, domain, &mgr->owned_mask) {
-		struct event_channel *chan = mgr->channels[cpu];
-		size_t count;
-
-		if (!chan)
-			continue;
-		count = READ_ONCE(chan->event_count);
-		if (count < best_count) {
-			best_count = count;
-			best = chan;
-			if (count == 0)
-				break;
-		}
-	}
-	if (best)
-		return best;
-
-	cpu = cpumask_first(&mgr->guaranteed_mask);
-	if (cpu < nr_cpu_ids)
-		return mgr->channels[cpu];
-
-	return NULL;
+	return mgr->channels[completion_partner[my_cpu]];
 }
 
 /* Only reachable when mgr owns no cores at all (fully-allocated machine). */
@@ -388,7 +379,7 @@ static void post_event(struct event_anchor *anchor)
 	local_irq_save(flags);
 	my_cpu = smp_processor_id();
 
-	/* Softirq may run on a CPU this manager doesn't own. */
+	/* pick_target() maps my_cpu to its paired odd-rank completion core. */
 	target = pick_target(mgr, my_cpu);
 	if (!target) {
 		local_irq_restore(flags);
@@ -1114,6 +1105,7 @@ static struct event_channel *create_channel(void)
 static struct event_manager *create_manager(void)
 {
 	int i;
+	unsigned long flags;
 	struct event_manager *mgr;
 
 	mgr = kzalloc(sizeof(struct event_manager), GFP_KERNEL);
@@ -1126,6 +1118,22 @@ static struct event_manager *create_manager(void)
 			goto out_free;
 		mgr->channels[i]->cpu = i;
 	}
+
+	/*
+	 * Single-application experiment: seize the whole machine up front so the
+	 * owned and guaranteed masks cover every core. This keeps the steal/scale
+	 * machinery inert (mark_stealable() no-ops on guaranteed cores) -- core
+	 * allocation is out of scope here; pick_target() decides placement.
+	 */
+	spin_lock_irqsave(&core_pool.lock, flags);
+	for_each_online_cpu(i) {
+		WRITE_ONCE(core_pool.owner[i], mgr);
+		cpumask_clear_cpu(i, &core_pool.free_mask);
+		cpumask_set_cpu(i, &mgr->owned_mask);
+		cpumask_set_cpu(i, &mgr->guaranteed_mask);
+	}
+	atomic_set(&mgr->owned_count, num_online_cpus());
+	spin_unlock_irqrestore(&core_pool.lock, flags);
 
 	/* An fd beyond this just falls back to uncached (-EBADF). */
 	mgr->fd_cache_size = FD_CACHE_SIZE;
@@ -1221,6 +1229,8 @@ static int __init upcall_init(void)
 	cpumask_clear(&core_pool.free_mask);
 	for_each_online_cpu(cpu)
 		cpumask_set_cpu(cpu, &core_pool.free_mask);
+
+	build_completion_partners();
 
 	upcall_debugfs_dir = debugfs_create_dir("upcall", NULL);
 	debugfs_create_file("owners", 0444, upcall_debugfs_dir, NULL,
