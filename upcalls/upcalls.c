@@ -921,7 +921,9 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 	int out_idx = 0;
 	int ret = 0;
 	int last_fd = -1;
+	int presleep_fd = -1;		/* first readable arm: queue to poll before sleeping */
 	bool polled = false;
+	bool presleep_polled = false;
 	struct event_anchor *anchor;
 
 	for (int i = 0; i < in_cnt; i++) {
@@ -932,10 +934,11 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 			break;
 
 		case UP_ACCEPT:
-			ret = attach_poll(mgr, in[i], EPOLLIN | POLLRDNORM);
-			break;
-
 		case UP_READ:
+			/* Remember the first readable fd so the pre-sleep poll below
+			 * knows which RX queue we're waiting on. */
+			if (presleep_fd < 0)
+				presleep_fd = in[i]->fd;
 			ret = attach_poll(mgr, in[i], EPOLLIN | POLLRDNORM);
 			break;
 
@@ -1000,7 +1003,32 @@ again:
 	}
 
 	if (!out_idx && out_cnt > 0) {
+		/*
+		 * About to sleep with nothing ready. Do one busy-poll pass on the
+		 * RX queue of a connection we're waiting on (presleep_fd) first: a
+		 * packet may already be sitting in that ring unprocessed. The poll
+		 * runs the full stack, and sk_data_ready() posts any resulting event
+		 * into our channel, so the re-drain finds it and we skip the
+		 * sleep/softirq-wake round trip. napi_busy_loop polls the whole NAPI
+		 * instance, so siblings on the same queue are drained too. One pass
+		 * per sleep attempt (presleep_polled), then actually sleep.
+		 */
+		if (!presleep_polled && presleep_fd >= 0) {
+			struct fd_cache_entry *e = fdcache_get(mgr, presleep_fd);
+			struct sock *sk = e ? e->sk : NULL;
+
+			presleep_polled = true;
+			if (sk) {
+				unsigned int napi_id = READ_ONCE(sk->sk_napi_id);
+
+				if (napi_id_valid(napi_id))
+					napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
+			}
+			goto again;
+		}
+
 		worker_sleep(mgr);
+		presleep_polled = false;	/* fresh poll allowed on the next sleep */
 		goto again;
 	}
 
