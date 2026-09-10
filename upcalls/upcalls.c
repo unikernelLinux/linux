@@ -31,6 +31,9 @@
 #include <linux/upcall.h>
 #include <linux/socket.h>
 #include <net/busy_poll.h>
+#include <net/sock.h>
+#include <net/tcp.h>
+#include <net/udp.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 
@@ -44,6 +47,27 @@ struct event_channel {
 	size_t			event_count;
 	int			cpu;
 	uint8_t			pad[4];
+};
+
+/*
+ * How to run read/write on a cached fd. Resolved once when the fd is first
+ * cached (see fdcache_get) so the hot path skips the read()/write() demux
+ * (fdget -> f_op->read_iter -> LSM -> ops->recvmsg -> sk_prot->recvmsg) and
+ * calls the protocol endpoint directly. TCP/UDP get a direct (retpoline-free)
+ * call; any other socket goes through sk_prot; a non-socket fd falls back to
+ * f_op->read_iter/write_iter.
+ */
+enum fd_io_kind {
+	FD_IO_NONSOCK = 0,	/* not a socket -- use f_op->read_iter/write_iter */
+	FD_IO_TCP,
+	FD_IO_UDP,
+	FD_IO_SOCK_OTHER,	/* socket, but not TCP/UDP -- via sk->sk_prot */
+};
+
+struct fd_cache_entry {
+	struct file		*file;	/* borrowed ref; slot empty when NULL */
+	struct sock		*sk;	/* set before file is published; NULL if non-socket */
+	enum fd_io_kind		kind;
 };
 
 struct event_manager {
@@ -66,9 +90,9 @@ struct event_manager {
 	/* Below this completion count, do one NAPI poll budget before returning. */
 	size_t		napi_poll_threshold;
 	int			id;		/* small stable id for observability */
-	/* fd -> struct file* cache; entries only clear via UP_CLOSE, which is
+	/* fd -> cached {file, sk, io kind}; entries only clear via UP_CLOSE,
 	 * the only path that closes an fd this manager touches. */
-	struct file		**fd_cache;
+	struct fd_cache_entry	*fd_cache;
 	unsigned int		fd_cache_size;
 };
 
@@ -465,33 +489,57 @@ static void upcall_poll_init(struct file *file, wait_queue_head_t *whead, poll_t
 	add_wait_queue(whead, &anchor->wait);
 }
 
-/*
- * Returns a reference borrowed from the cache -- callers must never fput()
- * it. fdcache_invalidate() runs before close_fd() actually closes the fd, so
- * a lookup never observes a stale pointer.
- */
-static struct file *fdcache_get(struct event_manager *mgr, int fd)
+static enum fd_io_kind classify_sk(struct sock *sk)
 {
+	if (sk->sk_prot->recvmsg == tcp_recvmsg)
+		return FD_IO_TCP;
+	if (sk->sk_prot->recvmsg == udp_recvmsg)
+		return FD_IO_UDP;
+	return FD_IO_SOCK_OTHER;
+}
+
+/*
+ * Returns the cache entry for fd (file reference borrowed -- callers must
+ * never fput() it), or NULL. On the first lookup the fd's socket and I/O kind
+ * are resolved and stored before the file pointer is published, so any reader
+ * that sees entry->file also sees a consistent sk/kind. fdcache_invalidate()
+ * runs before close_fd() actually closes the fd, so a lookup never observes a
+ * stale pointer.
+ */
+static struct fd_cache_entry *fdcache_get(struct event_manager *mgr, int fd)
+{
+	struct fd_cache_entry *e;
 	struct file *file, *raced;
+	struct socket *sock;
 
 	if (fd < 0 || (unsigned int)fd >= mgr->fd_cache_size)
 		return NULL;
 
-	file = READ_ONCE(mgr->fd_cache[fd]);
-	if (file)
-		return file;
+	e = &mgr->fd_cache[fd];
+	if (smp_load_acquire(&e->file))
+		return e;
 
 	file = fget(fd);
 	if (!file)
 		return NULL;
 
-	raced = cmpxchg(&mgr->fd_cache[fd], NULL, file);
-	if (raced) {
-		/* Someone else published first; use theirs, drop our extra ref. */
-		fput(file);
-		return raced;
+	sock = sock_from_file(file);
+	if (sock && sock->sk) {
+		e->sk = sock->sk;
+		e->kind = classify_sk(sock->sk);
+	} else {
+		e->sk = NULL;
+		e->kind = FD_IO_NONSOCK;
 	}
-	return file;
+
+	/* Publish file last (cmpxchg is a full barrier) so the sk/kind stores
+	 * above are visible to any reader that observes e->file. A racing filler
+	 * resolves the same fd to identical sk/kind, so the loser's stores are
+	 * harmless. */
+	raced = cmpxchg(&e->file, NULL, file);
+	if (raced)
+		fput(file);	/* someone published first; drop our extra ref */
+	return e;
 }
 
 /* Called before close_fd() so no lookup can observe a stale cached file. */
@@ -502,7 +550,7 @@ static void fdcache_invalidate(struct event_manager *mgr, int fd)
 	if (fd < 0 || (unsigned int)fd >= mgr->fd_cache_size)
 		return;
 
-	file = xchg(&mgr->fd_cache[fd], NULL);
+	file = xchg(&mgr->fd_cache[fd].file, NULL);
 	if (file)
 		fput(file);
 }
@@ -525,20 +573,61 @@ static void get_buffer(struct iovec *iov)
 }
 
 
+/*
+ * One recvmsg into base[0..len). TCP/UDP are called directly (no retpoline);
+ * any other socket goes through sk_prot. The protocol manages its own socket
+ * locking.
+ */
+static int sock_recv_one(struct fd_cache_entry *e, void *base, size_t len, int flags)
+{
+	struct msghdr msg = {};
+	int addr_len = 0;
+
+	iov_iter_ubuf(&msg.msg_iter, ITER_DEST, base, len);
+
+	switch (e->kind) {
+	case FD_IO_TCP:
+		return tcp_recvmsg(e->sk, &msg, len, flags, &addr_len);
+	case FD_IO_UDP:
+		return udp_recvmsg(e->sk, &msg, len, flags, &addr_len);
+	default:
+		return e->sk->sk_prot->recvmsg(e->sk, &msg, len, flags, &addr_len);
+	}
+}
+
+/* One sendmsg from base[0..len); flags travel in msg_flags (MSG_DONTWAIT). */
+static int sock_send_one(struct fd_cache_entry *e, void *base, size_t len, int flags)
+{
+	struct msghdr msg = { .msg_flags = flags };
+
+	iov_iter_ubuf(&msg.msg_iter, ITER_SOURCE, base, len);
+
+	switch (e->kind) {
+	case FD_IO_TCP:
+		return tcp_sendmsg(e->sk, &msg, len);
+	case FD_IO_UDP:
+		return udp_sendmsg(e->sk, &msg, len);
+	default:
+		return e->sk->sk_prot->sendmsg(e->sk, &msg, len);
+	}
+}
+
 static void try_read(struct event_manager *mgr, struct up_event *evt)
 {
+	struct fd_cache_entry *e;
 	struct file *file;
 	struct kiocb kiocb;
 	struct iov_iter iter;
 	struct iovec iov;
 	size_t cursor = 0;
-	int ret;
+	int flags, ret;
 
-	file = fdcache_get(mgr, evt->fd);
-	if (!file) {
+	e = fdcache_get(mgr, evt->fd);
+	if (!e) {
 		evt->result = -EBADF;
 		return;
 	}
+	file = e->file;
 
 	get_buffer(&iov);
 	if (iov.iov_base == NULL) {
@@ -549,13 +638,18 @@ static void try_read(struct event_manager *mgr, struct up_event *evt)
 	evt->buf = iov.iov_base;
 	evt->len = iov.iov_len;
 
+	flags = (file->f_flags & O_NONBLOCK) ? MSG_DONTWAIT : 0;
 	init_sync_kiocb(&kiocb, file);
 
 	while (cursor < iov.iov_len) {
-
-		iov_iter_ubuf(&iter, ITER_DEST, iov.iov_base + cursor, iov.iov_len - cursor);
-
-		ret = file->f_op->read_iter(&kiocb, &iter);
+		if (e->kind == FD_IO_NONSOCK) {
+			iov_iter_ubuf(&iter, ITER_DEST, iov.iov_base + cursor,
+				      iov.iov_len - cursor);
+			ret = file->f_op->read_iter(&kiocb, &iter);
+		} else {
+			ret = sock_recv_one(e, iov.iov_base + cursor,
+					    iov.iov_len - cursor, flags);
+		}
 
 		if (ret <= 0) {
 			evt->result = cursor > 0 ? cursor : ret;
@@ -569,29 +663,36 @@ static void try_read(struct event_manager *mgr, struct up_event *evt)
 
 static void try_write(struct event_manager *mgr, struct up_event *evt)
 {
+	struct fd_cache_entry *e;
 	struct file *file;
 	struct kiocb kiocb;
 	struct iov_iter iter;
 	struct iovec iov;
 	size_t cursor = 0;
-	int ret;
+	int flags, ret;
 
-	file = fdcache_get(mgr, evt->fd);
-	if (!file) {
+	e = fdcache_get(mgr, evt->fd);
+	if (!e) {
 		evt->result = -EBADF;
 		return;
 	}
+	file = e->file;
 
 	iov.iov_base = evt->buf;
 	iov.iov_len = evt->len;
 
+	flags = (file->f_flags & O_NONBLOCK) ? MSG_DONTWAIT : 0;
 	init_sync_kiocb(&kiocb, file);
 
 	while (cursor < iov.iov_len) {
-
-		iov_iter_ubuf(&iter, ITER_SOURCE, iov.iov_base + cursor, iov.iov_len - cursor);
-
-		ret = file->f_op->write_iter(&kiocb, &iter);
+		if (e->kind == FD_IO_NONSOCK) {
+			iov_iter_ubuf(&iter, ITER_SOURCE, iov.iov_base + cursor,
+				      iov.iov_len - cursor);
+			ret = file->f_op->write_iter(&kiocb, &iter);
+		} else {
+			ret = sock_send_one(e, iov.iov_base + cursor,
+					    iov.iov_len - cursor, flags);
+		}
 
 		if (ret <= 0) {
 			evt->result = cursor > 0 ? cursor : ret;
@@ -610,7 +711,8 @@ static void try_accept(struct up_event *evt)
 
 static __poll_t upcall_item_poll(struct event_anchor *anchor, __poll_t events)
 {
-	struct file *file = fdcache_get(anchor->mgr, anchor->event->fd);
+	struct fd_cache_entry *e = fdcache_get(anchor->mgr, anchor->event->fd);
+	struct file *file = e ? e->file : NULL;
 	poll_table *pt = &anchor->pt;
 	__poll_t res;
 
@@ -884,12 +986,12 @@ again:
 	}
 
 	if (!polled && out_idx > 0 && (size_t)out_idx < mgr->napi_poll_threshold) {
-		struct file *file = fdcache_get(mgr, last_fd);
-		struct socket *sock = file ? sock_from_file(file) : NULL;
+		struct fd_cache_entry *e = fdcache_get(mgr, last_fd);
+		struct sock *sk = e ? e->sk : NULL;
 
 		polled = true;
-		if (sock && sock->sk) {
-			unsigned int napi_id = READ_ONCE(sock->sk->sk_napi_id);
+		if (sk) {
+			unsigned int napi_id = READ_ONCE(sk->sk_napi_id);
 
 			if (napi_id_valid(napi_id))
 				napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
@@ -947,8 +1049,8 @@ static void free_manager(struct event_manager *mgr)
 	/* Release any fds this manager never got an explicit UP_CLOSE for
 	 * (app exit without draining every connection). */
 	for (unsigned int i = 0; i < mgr->fd_cache_size; i++) {
-		if (mgr->fd_cache[i])
-			fput(mgr->fd_cache[i]);
+		if (mgr->fd_cache[i].file)
+			fput(mgr->fd_cache[i].file);
 	}
 	vfree(mgr->fd_cache);
 
@@ -1129,7 +1231,7 @@ static struct event_manager *create_manager(void)
 
 	/* An fd beyond this just falls back to uncached (-EBADF). */
 	mgr->fd_cache_size = FD_CACHE_SIZE;
-	mgr->fd_cache = vzalloc(mgr->fd_cache_size * sizeof(struct file *));
+	mgr->fd_cache = vzalloc(mgr->fd_cache_size * sizeof(struct fd_cache_entry));
 	if (!mgr->fd_cache)
 		goto out_free;
 
