@@ -322,36 +322,24 @@ static void wake_owned_worker(struct event_manager *mgr, int cpu)
 }
 
 /*
- * Choose an owned channel for mgr to receive an event that arrived on my_cpu.
- * Fast path: the local core, as long as it is owned and its queue depth is
- * below mgr->batch_sz.  Past that, spreads to the least-loaded core
- * mgr owns within my_cpu's cache domain; if the domain has no owned core,
- * falls back to a guaranteed core (never released, always a valid target).
- * Reads owned/guaranteed masks lock-free — hint quality; post_event
- * re-validates the chosen core's ownership under its wakeup_lock.  Returns NULL
- * only if the manager owns no cores at all (pathological, fully-allocated
- * machine).
+ * Shared placement: no core ownership -- every app may place work on every
+ * CPU.  Keep an event on the local core (its data is cache-hot there) as long
+ * as the local queue depth is below mgr->batch_size; past that, spill to the
+ * least-loaded channel in my_cpu's cache domain.  Every online CPU has a
+ * channel and a per-CPU worker for this mgr, so this never returns NULL.
  */
-
 static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 {
 	const struct cpumask *domain = upcall_domain_mask(my_cpu);
+	struct event_channel *local = mgr->channels[my_cpu];
 	struct event_channel *best = NULL;
 	size_t best_count = (size_t)-1;
 	int cpu;
 
-	if (cpumask_test_cpu(my_cpu, &mgr->owned_mask)) {
-		struct event_channel *local = mgr->channels[my_cpu];
+	if (local && READ_ONCE(local->event_count) < mgr->batch_size)
+		return local;
 
-		/*
-		 * We don't want to spread to a new core until our local queueu is
-		 * larger than the application configured batch size 
-		 */
-		if (local && READ_ONCE(local->event_count) < mgr->batch_size)
-			return local;
-	}
-
-	for_each_cpu_and(cpu, domain, &mgr->owned_mask) {
+	for_each_cpu(cpu, domain) {
 		struct event_channel *chan = mgr->channels[cpu];
 		size_t count;
 
@@ -365,18 +353,12 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 				break;
 		}
 	}
-	if (best)
-		return best;
-
-	cpu = cpumask_first(&mgr->guaranteed_mask);
-	if (cpu < nr_cpu_ids)
-		return mgr->channels[cpu];
-
-	return NULL;
+	return best ? best : local;
 }
 
-/* Only reachable when mgr owns no cores at all (fully-allocated machine). */
-static void drop_anchor(struct event_anchor *anchor)
+/* Unused under shared placement (kept, bypassed): the exclusive model's
+ * "mgr owns no cores" discard path. */
+static void __maybe_unused drop_anchor(struct event_anchor *anchor)
 {
 	pr_warn_once("upcall: manager owns no cores, dropping event\n");
 	kmem_cache_free(event_cache, anchor->event);
@@ -387,8 +369,9 @@ static void drop_anchor(struct event_anchor *anchor)
 	kref_put(&anchor->refs, anchor_release_slab);
 }
 
-/* Runs with IRQs disabled (placement context). */
-static void upcall_scale_up(struct event_manager *mgr, int cpu)
+/* Unused under shared placement (kept, bypassed): the exclusive model's
+ * congestion-driven core acquisition. Runs with IRQs disabled. */
+static void __maybe_unused upcall_scale_up(struct event_manager *mgr, int cpu)
 {
 	int claimed;
 
@@ -405,54 +388,20 @@ static void post_event(struct event_anchor *anchor)
 	unsigned long flags;
 	struct event_manager *mgr = anchor->mgr;
 	struct event_channel *target;
-	bool enqueued = false;
-	bool congested = false;
-	int my_cpu, gcpu;
 
 	local_irq_save(flags);
-	my_cpu = smp_processor_id();
 
-	/* Softirq may run on a CPU this manager doesn't own. */
-	target = pick_target(mgr, my_cpu);
-	if (!target) {
-		local_irq_restore(flags);
-		drop_anchor(anchor);
-		return;
-	}
+	/* Shared placement: any app may enqueue to any CPU, so there is no
+	 * ownership to re-validate and no scale-up/steal. */
+	target = pick_target(mgr, smp_processor_id());
 
 	INIT_LIST_HEAD(&anchor->anchor);
-
-	/* If mgr released the core since pick_target(), owner[] no longer
-	 * points at mgr; fall back to a guaranteed core instead of enqueuing
-	 * onto a channel nothing will ever drain. */
 	spin_lock(&target->wakeup_lock);
-	if (READ_ONCE(core_pool.owner[target->cpu]) == mgr) {
-		congested = target->event_count > mgr->spread_threshold;
-		list_add_tail(&anchor->anchor, &target->wakeups);
-		target->event_count++;
-		enqueued = true;
-	}
+	list_add_tail(&anchor->anchor, &target->wakeups);
+	target->event_count++;
 	spin_unlock(&target->wakeup_lock);
 
-	if (!enqueued) {
-		gcpu = cpumask_first(&mgr->guaranteed_mask);
-		if (gcpu >= nr_cpu_ids) {
-			local_irq_restore(flags);
-			drop_anchor(anchor);
-			return;
-		}
-		target = mgr->channels[gcpu];
-		spin_lock(&target->wakeup_lock);
-		congested = target->event_count > mgr->spread_threshold;
-		list_add_tail(&anchor->anchor, &target->wakeups);
-		target->event_count++;
-		spin_unlock(&target->wakeup_lock);
-	}
-
 	wake_owned_worker(mgr, target->cpu);
-
-	if (congested)
-		upcall_scale_up(mgr, my_cpu);
 
 	local_irq_restore(flags);
 }
@@ -745,7 +694,9 @@ out:
 	return anchor;
 }
 
-static void worker_sleep(struct event_manager *mgr)
+/* Unused under shared placement (kept, bypassed): the parking path, replaced
+ * by the cooperative napi-poll/cond_resched spin loop in do_upcall_submit. */
+static void __maybe_unused worker_sleep(struct event_manager *mgr)
 {
 	unsigned long flags;
 	struct event_channel *channel;
@@ -921,9 +872,8 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 	int out_idx = 0;
 	int ret = 0;
 	int last_fd = -1;
-	int presleep_fd = -1;		/* first readable arm: queue to poll before sleeping */
+	int presleep_fd = -1;		/* first readable arm: queue to busy-poll when idle */
 	bool polled = false;
-	bool presleep_polled = false;
 	struct event_anchor *anchor;
 
 	for (int i = 0; i < in_cnt; i++) {
@@ -961,6 +911,10 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 	}
 
 again:
+	/* Shared placement co-locates other apps' workers on this CPU; yield so
+	 * a busy drain doesn't starve them of their fair slice. */
+	cond_resched();
+
 	while (out_idx < out_cnt) {
 		anchor = get_next_wakeup(mgr);
 		if (!anchor)
@@ -1004,31 +958,24 @@ again:
 
 	if (!out_idx && out_cnt > 0) {
 		/*
-		 * About to sleep with nothing ready. Do one busy-poll pass on the
-		 * RX queue of a connection we're waiting on (presleep_fd) first: a
-		 * packet may already be sitting in that ring unprocessed. The poll
-		 * runs the full stack, and sk_data_ready() posts any resulting event
-		 * into our channel, so the re-drain finds it and we skip the
-		 * sleep/softirq-wake round trip. napi_busy_loop polls the whole NAPI
-		 * instance, so siblings on the same queue are drained too. One pass
-		 * per sleep attempt (presleep_polled), then actually sleep.
+		 * Shared placement: never park. Busy-poll the RX queue of a
+		 * connection we're waiting on -- napi_busy_loop runs the stack and
+		 * sk_data_ready() posts any resulting event into our channel -- then
+		 * yield (cond_resched) so co-located co-tenant workers get their
+		 * slice, and re-drain. Loops until work appears.
 		 */
-		if (!presleep_polled && presleep_fd >= 0) {
+		if (presleep_fd >= 0) {
 			struct fd_cache_entry *e = fdcache_get(mgr, presleep_fd);
 			struct sock *sk = e ? e->sk : NULL;
 
-			presleep_polled = true;
 			if (sk) {
 				unsigned int napi_id = READ_ONCE(sk->sk_napi_id);
 
 				if (napi_id_valid(napi_id))
 					napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
 			}
-			goto again;
 		}
-
-		worker_sleep(mgr);
-		presleep_polled = false;	/* fresh poll allowed on the next sleep */
+		cond_resched();
 		goto again;
 	}
 
