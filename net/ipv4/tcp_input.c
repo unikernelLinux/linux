@@ -72,6 +72,7 @@
 #include <linux/prefetch.h>
 #include <net/dst.h>
 #include <net/tcp.h>
+#include <net/tx_lat.h>
 #include <net/proto_memory.h>
 #include <net/inet_common.h>
 #include <linux/ipsec.h>
@@ -3451,6 +3452,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		if (unlikely(skb == tp->lost_skb_hint))
 			tp->lost_skb_hint = NULL;
 		tcp_highest_sack_replace(sk, skb, next);
+		tx_lat_free(skb);
 		tcp_rtx_queue_unlink_and_free(skb, sk);
 	}
 
@@ -5191,6 +5193,8 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 {
 	int eaten;
 	struct sk_buff *tail = skb_peek_tail(&sk->sk_receive_queue);
+
+	tx_lat_rx_done(skb);	/* RX: data queued to socket (~post_event) */
 
 	eaten = (tail &&
 		 tcp_try_coalesce(sk, tail,

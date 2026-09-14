@@ -1094,6 +1094,11 @@ struct sk_buff {
 	/* only usable after checking ->active_extensions != 0 */
 	struct skb_ext		*extensions;
 #endif
+
+	/* Outbound-path latency instrumentation (experiment, see net/core/tx_lat.c).
+	 * Appended at the very end so no existing field's cacheline placement
+	 * shifts. Rolling per-stage timestamp: creation -> xmit -> free-on-ACK. */
+	u64			tx_lat_ns;
 };
 
 /* if you move pkt_type around you also must adapt those constants */

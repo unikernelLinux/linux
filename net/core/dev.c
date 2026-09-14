@@ -99,6 +99,7 @@
 #include <linux/bpf_trace.h>
 #include <net/net_namespace.h>
 #include <net/sock.h>
+#include <net/tx_lat.h>
 #include <net/busy_poll.h>
 #include <linux/rtnetlink.h>
 #include <linux/stat.h>
@@ -5756,6 +5757,8 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 	bool deliver_exact = false;
 	int ret = NET_RX_DROP;
 	__be16 type;
+
+	tx_lat_rx_stamp(skb);	/* RX arrival at the stack (experiment) */
 
 	net_timestamp_check(!READ_ONCE(net_hotdata.tstamp_prequeue), skb);
 
