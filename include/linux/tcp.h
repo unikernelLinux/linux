@@ -506,6 +506,12 @@ struct tcp_sock {
 	 */
 	struct request_sock __rcu *fastopen_rsk;
 	struct saved_syn *saved_syn;
+
+	/* Outbound-latency experiment (tx_lat): mono time of the last data-ready
+	 * on this socket; read+cleared when the response skb is allocated, giving
+	 * the per-request data-ready -> response-created interval. Appended last
+	 * to avoid shifting hot fields. */
+	u64			app_ready_ns;
 };
 
 enum tsq_enum {

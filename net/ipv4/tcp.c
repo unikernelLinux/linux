@@ -908,6 +908,7 @@ struct sk_buff *tcp_stream_alloc_skb(struct sock *sk, gfp_t gfp,
 			skb->ip_summed = CHECKSUM_PARTIAL;
 			INIT_LIST_HEAD(&skb->tcp_tsorted_anchor);
 			tx_lat_stamp(skb);
+			tx_lat_app_done(&tcp_sk(sk)->app_ready_ns);	/* data-ready -> response created */
 			return skb;
 		}
 		__kfree_skb(skb);

@@ -5195,6 +5195,7 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 	struct sk_buff *tail = skb_peek_tail(&sk->sk_receive_queue);
 
 	tx_lat_rx_done(skb);	/* RX: data queued to socket (~post_event) */
+	tx_lat_app_ready(&tcp_sk(sk)->app_ready_ns);	/* start per-request app clock */
 
 	eaten = (tail &&
 		 tcp_try_coalesce(sk, tail,

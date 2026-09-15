@@ -22,4 +22,11 @@ void tx_lat_free(struct sk_buff *skb);	/* TX: freed on ACK */
 void tx_lat_rx_stamp(struct sk_buff *skb);
 void tx_lat_rx_done(struct sk_buff *skb);
 
+/* App side: data-ready on a socket -> response skb allocated for it, i.e. the
+ * full per-request "sk_data_ready -> worker woken -> processed -> sendmsg"
+ * path. `slot` is &tcp_sk(sk)->app_ready_ns; done clears it (one sample per
+ * data-ready). */
+void tx_lat_app_ready(u64 *slot);
+void tx_lat_app_done(u64 *slot);
+
 #endif /* _NET_TX_LAT_H */
