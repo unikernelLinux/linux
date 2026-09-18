@@ -29,4 +29,18 @@ void tx_lat_rx_done(struct sk_buff *skb);
 void tx_lat_app_ready(u64 *slot);
 void tx_lat_app_done(u64 *slot);
 
+/* NAPI dispatch delay: a napi instance queued for polling (____napi_schedule)
+ * -> its poll actually running (__napi_poll). Measures the softirq/ksoftirqd
+ * dispatch gap -- how long a "packet ready" signal waits for the CPU to run
+ * the poll, which is deferred when a pinned worker occupies the core. `slot`
+ * is &napi->sched_ns; dispatch clears it (one sample per idle->scheduled). */
+void tx_lat_napi_sched(u64 *slot);
+void tx_lat_napi_dispatch(u64 *slot);
+
+/* Upcall event delivery delay: post_event (event ready, enqueued to a channel)
+ * -> dequeue in do_upcall_submit (picked up by the worker). The pure wait
+ * before processing. `slot` is &anchor->post_ns; done clears it. */
+void tx_lat_deliver_stamp(u64 *slot);
+void tx_lat_deliver_done(u64 *slot);
+
 #endif /* _NET_TX_LAT_H */

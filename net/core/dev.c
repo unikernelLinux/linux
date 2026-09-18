@@ -4797,6 +4797,10 @@ static inline void ____napi_schedule(struct softnet_data *sd,
 
 	lockdep_assert_irqs_disabled();
 
+	/* tx_lat: mark when this napi became pending, read at __napi_poll.
+	 * Before the threaded branch so both softirq and thread paths count. */
+	tx_lat_napi_sched(&napi->sched_ns);
+
 	if (test_bit(NAPI_STATE_THREADED, &napi->state)) {
 		/* Paired with smp_mb__before_atomic() in
 		 * napi_enable()/dev_set_threaded().
@@ -7414,6 +7418,7 @@ static int __napi_poll(struct napi_struct *n, bool *repoll)
 	 */
 	work = 0;
 	if (napi_is_scheduled(n)) {
+		tx_lat_napi_dispatch(&n->sched_ns);	/* schedule -> poll gap */
 		work = n->poll(n, weight);
 		trace_napi_poll(n, work, weight);
 

@@ -31,6 +31,8 @@ static u64 tx_lat_create_hist[NR_CPUS][TX_LAT_BUCKETS];
 static u64 tx_lat_ack_hist[NR_CPUS][TX_LAT_BUCKETS];
 static u64 tx_lat_rx_hist[NR_CPUS][TX_LAT_BUCKETS];
 static u64 tx_lat_app_hist[NR_CPUS][TX_LAT_BUCKETS];
+static u64 tx_lat_napi_hist[NR_CPUS][TX_LAT_BUCKETS];
+static u64 tx_lat_deliver_hist[NR_CPUS][TX_LAT_BUCKETS];
 
 static void tx_lat_bump(u64 (*hist)[TX_LAT_BUCKETS], u64 delta)
 {
@@ -98,6 +100,36 @@ void tx_lat_app_done(u64 *slot)
 	*slot = 0;	/* one sample per data-ready */
 }
 
+void tx_lat_napi_sched(u64 *slot)
+{
+	if (!READ_ONCE(tx_lat_on))
+		return;
+	*slot = ktime_get_mono_fast_ns();
+}
+
+void tx_lat_napi_dispatch(u64 *slot)
+{
+	if (!READ_ONCE(tx_lat_on) || !*slot)
+		return;
+	tx_lat_bump(tx_lat_napi_hist, ktime_get_mono_fast_ns() - *slot);
+	*slot = 0;	/* one sample per idle->scheduled; repolls skipped */
+}
+
+void tx_lat_deliver_stamp(u64 *slot)
+{
+	if (!READ_ONCE(tx_lat_on))
+		return;
+	*slot = ktime_get_mono_fast_ns();
+}
+
+void tx_lat_deliver_done(u64 *slot)
+{
+	if (!READ_ONCE(tx_lat_on) || !*slot)
+		return;
+	tx_lat_bump(tx_lat_deliver_hist, ktime_get_mono_fast_ns() - *slot);
+	*slot = 0;
+}
+
 static void tx_lat_dump(struct seq_file *s, u64 (*hist)[TX_LAT_BUCKETS])
 {
 	u64 sum[TX_LAT_BUCKETS] = {0};
@@ -122,6 +154,10 @@ static int tx_lat_show(struct seq_file *s, void *v)
 	tx_lat_dump(s, tx_lat_rx_hist);
 	seq_puts(s, "=app upper_ns count\n");
 	tx_lat_dump(s, tx_lat_app_hist);
+	seq_puts(s, "=napi upper_ns count\n");
+	tx_lat_dump(s, tx_lat_napi_hist);
+	seq_puts(s, "=deliver upper_ns count\n");
+	tx_lat_dump(s, tx_lat_deliver_hist);
 	return 0;
 }
 
@@ -144,6 +180,8 @@ static ssize_t tx_lat_write(struct file *file, const char __user *ubuf,
 	memset(tx_lat_ack_hist, 0, sizeof(tx_lat_ack_hist));
 	memset(tx_lat_rx_hist, 0, sizeof(tx_lat_rx_hist));
 	memset(tx_lat_app_hist, 0, sizeof(tx_lat_app_hist));
+	memset(tx_lat_napi_hist, 0, sizeof(tx_lat_napi_hist));
+	memset(tx_lat_deliver_hist, 0, sizeof(tx_lat_deliver_hist));
 	WRITE_ONCE(tx_lat_on, !!on);
 	return len;
 }

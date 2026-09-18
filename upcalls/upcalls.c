@@ -34,6 +34,7 @@
 #include <net/sock.h>
 #include <net/tcp.h>
 #include <net/udp.h>
+#include <net/tx_lat.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 
@@ -126,6 +127,7 @@ struct event_anchor {
 	wait_queue_head_t	*whead;
 	poll_table		pt;
 	__poll_t		events;
+	u64			post_ns;	/* tx_lat: post_event -> dequeue delay */
 };
 
 struct event_buffer {
@@ -421,6 +423,10 @@ static void post_event(struct event_anchor *anchor)
 	}
 
 	INIT_LIST_HEAD(&anchor->anchor);
+
+	/* tx_lat: start the delivery clock the instant the event is ready to
+	 * enqueue; read at dequeue in do_upcall_submit (post -> picked-up wait). */
+	tx_lat_deliver_stamp(&anchor->post_ns);
 
 	/* If mgr released the core since pick_target(), owner[] no longer
 	 * points at mgr; fall back to a guaranteed core instead of enqueuing
@@ -922,8 +928,8 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 	int ret = 0;
 	int last_fd = -1;
 	int presleep_fd = -1;		/* first readable arm: queue to poll before sleeping */
-	bool polled = false;
-	bool presleep_polled = false;
+	//bool polled = false;
+	//bool presleep_polled = false;
 	struct event_anchor *anchor;
 
 	for (int i = 0; i < in_cnt; i++) {
@@ -966,6 +972,9 @@ again:
 		if (!anchor)
 			break;
 
+		/* Delivery delay: post_event -> here (picked up by the worker). */
+		tx_lat_deliver_done(&anchor->post_ns);
+
 		switch (anchor->event->type) {
 		case UP_READ:
 			try_read(mgr, anchor->event);
@@ -987,7 +996,7 @@ again:
 		 * with the anchor too. */
 		kref_put(&anchor->refs, anchor_release_pool);
 	}
-
+#if 0
 	if (!polled && out_idx > 0 && (size_t)out_idx < mgr->napi_poll_threshold) {
 		struct fd_cache_entry *e = fdcache_get(mgr, last_fd);
 		struct sock *sk = e ? e->sk : NULL;
@@ -1001,8 +1010,10 @@ again:
 		}
 		goto again;
 	}
+#endif
 
 	if (!out_idx && out_cnt > 0) {
+#if 0
 		/*
 		 * About to sleep with nothing ready. Do one busy-poll pass on the
 		 * RX queue of a connection we're waiting on (presleep_fd) first: a
@@ -1026,9 +1037,12 @@ again:
 			}
 			goto again;
 		}
+#endif
 
 		worker_sleep(mgr);
+#if 0
 		presleep_polled = false;	/* fresh poll allowed on the next sleep */
+#endif
 		goto again;
 	}
 

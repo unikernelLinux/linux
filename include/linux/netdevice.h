@@ -394,6 +394,7 @@ struct napi_struct {
 #endif
 	/* CPU on which NAPI has been scheduled for processing */
 	int			list_owner;
+	u64			sched_ns;	/* tx_lat: napi dispatch-delay slot */
 	struct net_device	*dev;
 	struct sk_buff		*skb;
 	struct gro_node		gro;
