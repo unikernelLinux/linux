@@ -65,14 +65,14 @@ enum fd_io_kind {
 };
 
 struct fd_cache_entry {
-	struct file		*file;	/* borrowed ref; slot empty when NULL */
-	struct sock		*sk;	/* set before file is published; NULL if non-socket */
-	enum fd_io_kind		kind;
+	struct file	*file;	/* borrowed ref; slot empty when NULL */
+	struct sock	*sk;	/* set before file is published; NULL if non-socket */
+	enum fd_io_kind	kind;
 };
 
 struct event_manager {
 	struct file		*file;
-	struct kref ref_count;
+	struct kref		ref_count;
 	struct event_channel	*channels[NR_CPUS];
 	struct worker_context	*pcpu_workers[NR_CPUS];
 	/* owned_mask mirrors core_pool.owner[] for lock-free reads on the
@@ -83,12 +83,12 @@ struct event_manager {
 	struct cpumask		guaranteed_mask;
 	struct cpumask		guaranteed_electing;	/* per-domain create-once token */
 	atomic_t		owned_count;
-	size_t		batch_size;
+	size_t			batch_size;
 	/* Kept separate from batch_size -- coupling scale-up to the placement
 	 * threshold caused a regression before. */
-	size_t		spread_threshold;
+	size_t			spread_threshold;
 	/* Below this completion count, do one NAPI poll budget before returning. */
-	size_t		napi_poll_threshold;
+	size_t			napi_poll_threshold;
 	int			id;		/* small stable id for observability */
 	/* fd -> cached {file, sk, io kind}; entries only clear via UP_CLOSE,
 	 * the only path that closes an fd this manager touches. */
@@ -345,7 +345,7 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 
 		/*
 		 * We don't want to spread to a new core until our local queueu is
-		 * larger than the application configured batch size 
+		 * larger than the application configured batch size
 		 */
 		if (local && READ_ONCE(local->event_count) < mgr->batch_size)
 			return local;
@@ -480,7 +480,6 @@ static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
 	return 0;
 }
 
-
 static void upcall_poll_init(struct file *file, wait_queue_head_t *whead, poll_table *pt)
 {
 	struct event_anchor *anchor = container_of(pt, struct event_anchor, pt);
@@ -571,7 +570,6 @@ static void get_buffer(struct iovec *iov)
 	iov->iov_len = buf->iovec.iov_len;
 	kmem_cache_free(buffer_cache, buf);
 }
-
 
 /*
  * One recvmsg into base[0..len). TCP/UDP are called directly (no retpoline);
@@ -881,7 +879,7 @@ static void attach_buffers(uint64_t cnt, struct iovec __user *bufs)
 	}
 }
 
-static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t rdw) 
+static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t rdw)
 {
 	struct event_anchor *anchor;
 	int armed;
@@ -1095,7 +1093,7 @@ static int upcall_tear_down(struct inode *inode, struct file *file)
 {
 	struct event_manager *mgr = file->private_data;
 	if (mgr)
-		kref_put(&mgr->ref_count, free_manager_kref);	
+		kref_put(&mgr->ref_count, free_manager_kref);
 	return 0;
 }
 
@@ -1183,7 +1181,7 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 		item->fd = -1;
 
 		kitems[i] = item;
-			
+
 		if (copy_from_user(item, &in[i], sizeof(*item))) {
 			clean_kitems(i + 1, kitems);
 			ret = -EFAULT;
@@ -1214,7 +1212,6 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 			goto out_clean;
 		}
 	}
-
 
 	ret = cnt;
 out_clean:
@@ -1375,4 +1372,3 @@ static int __init upcall_init(void)
 }
 
 __initcall(upcall_init);
-
