@@ -29,7 +29,7 @@ struct TscLog {
 struct TscBuf
 {
 	void *allocated;
-	struct TcsLog *log;
+	struct TscLog *log;
 } __attribute__ ((aligned (L1_CACHE_BYTES)));
 
 struct KernelTscLog
@@ -59,7 +59,7 @@ static inline void write_nti32(void *p, const u32 v)
 			: "memory");
 }
 
-static u64 inline __attribute__((always_inline)) now(void)
+inline static u64 __attribute__((always_inline)) now(void)
 {
 	u32 high, low;
 	asm volatile(	"rdtsc;"
@@ -71,7 +71,7 @@ static u64 inline __attribute__((always_inline)) now(void)
 	return (((u64)high << 32 | low));
 }
 
-static u64 inline __attribute__((always_inline)) now_with_procid(u32 *cpuid)
+inline static u64 __attribute__((always_inline)) now_with_procid(u32 *cpuid)
 {
 	u32 high, low, tsc_sig;
 	asm volatile(	"rdtscp;"
