@@ -324,8 +324,9 @@ static void wake_owned_worker(struct event_manager *mgr, int cpu)
 /*
  * Choose an owned channel for mgr to receive an event that arrived on my_cpu.
  * Fast path: the local core, as long as it is owned and its queue depth is
- * below mgr->batch_sz.  Past that, spreads to the least-loaded core
- * mgr owns within my_cpu's cache domain; if the domain has no owned core,
+ * below mgr->batch_sz.  Past that, spreads to the first owned core (scanning
+ * from my_cpu and wrapping, not always from the domain's lowest cpu) that
+ * already has queued work and isn't full; if the domain has no such core,
  * falls back to a guaranteed core (never released, always a valid target).
  * Reads owned/guaranteed masks lock-free — hint quality; post_event
  * re-validates the chosen core's ownership under its wakeup_lock.  Returns NULL
@@ -336,8 +337,7 @@ static void wake_owned_worker(struct event_manager *mgr, int cpu)
 static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 {
 	const struct cpumask *domain = upcall_domain_mask(my_cpu);
-	struct event_channel *best = NULL;
-	size_t best_count = (size_t)-1;
+	struct event_channel *idle = NULL;
 	int cpu;
 
 	if (cpumask_test_cpu(my_cpu, &mgr->owned_mask)) {
@@ -351,22 +351,30 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 			return local;
 	}
 
-	for_each_cpu_and(cpu, domain, &mgr->owned_mask) {
-		struct event_channel *chan = mgr->channels[cpu];
+	/* First-fit, not least-loaded: a core with event_count > 0 already has
+	 * work queued (and so is very likely already running, not parked), so
+	 * placing here shouldn't need wake_owned_worker() to call
+	 * try_to_wake_up() on a remote core. Stop at the first match. Remember
+	 * the first idle owned core we pass over so we can use it instead of
+	 * the guaranteed core if the scan finds no active match. */
+	for_each_cpu_wrap(cpu, domain, my_cpu) {
+		struct event_channel *chan;
 		size_t count;
 
+		if (!cpumask_test_cpu(cpu, &mgr->owned_mask))
+			continue;
+		chan = mgr->channels[cpu];
 		if (!chan)
 			continue;
 		count = READ_ONCE(chan->event_count);
-		if (count < best_count) {
-			best_count = count;
-			best = chan;
-			if (count == 0)
-				break;
-		}
+		if (count > 0 && count < mgr->batch_size)
+			return chan;
+		if (count == 0 && !idle)
+			idle = chan;
 	}
-	if (best)
-		return best;
+
+	if (idle)
+		return idle;
 
 	cpu = cpumask_first(&mgr->guaranteed_mask);
 	if (cpu < nr_cpu_ids)
