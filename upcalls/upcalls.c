@@ -785,6 +785,9 @@ again:
 		goto again;
 	}
 	spin_unlock(&channel->worker_lock);
+	/* Running again: no longer a steal candidate (symmetric with the
+	 * mark_stealable() on the way to sleep). */
+	cpumask_clear_cpu(cpu, &core_pool.stealable_mask);
 	local_irq_restore(flags);
 out:
 	return;
