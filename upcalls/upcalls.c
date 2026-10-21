@@ -36,6 +36,8 @@
 #include <net/udp.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/log2.h>
+#include <linux/timekeeping.h>
 
 #include <linux/sched.h>
 
@@ -95,6 +97,12 @@ struct event_manager {
 	 * the only path that closes an fd this manager touches. */
 	struct fd_cache_entry	*fd_cache;
 	unsigned int		fd_cache_size;
+	/* Placement observability (atomic: many CPUs post for one mgr). */
+	atomic64_t		place_local;
+	atomic64_t		place_remote_not_ours;
+	atomic64_t		place_remote_full;
+	atomic64_t		place_lost;	/* target stolen between pick and enqueue */
+	struct dentry		*dbg;		/* /sys/kernel/debug/upcall/managers/<id> */
 };
 
 /*
@@ -116,6 +124,22 @@ static struct upcall_core_pool core_pool;
 /* Monotonic id source + debugfs handle for observability. */
 static  atomic_t upcall_mgr_ids = ATOMIC_INIT(0);
 static struct dentry *upcall_debugfs_dir;
+static struct dentry *upcall_mgr_dbg_dir;	/* .../upcall/managers */
+
+/* Histogram of whole-syscall upcall_submit() time, log2(ns), summed at read. */
+#define UPCALL_SUBMIT_BUCKETS 40
+static u64 upcall_submit_hist[NR_CPUS][UPCALL_SUBMIT_BUCKETS];
+
+static void upcall_submit_record(u64 delta)
+{
+	int cpu, b = delta ? ilog2(delta) : 0;
+
+	if (b >= UPCALL_SUBMIT_BUCKETS)
+		b = UPCALL_SUBMIT_BUCKETS - 1;
+	cpu = get_cpu();
+	upcall_submit_hist[cpu][b]++;
+	put_cpu();
+}
 
 struct event_anchor {
 	struct list_head	anchor;
@@ -173,6 +197,10 @@ static void free_manager_kref(struct kref *kref);
  * must not touch the pool). */
 static void anchor_release_pool(struct kref *kref);
 static void anchor_release_slab(struct kref *kref);
+
+/* Per-manager debugfs (placement counters); defined with the debugfs section. */
+static void upcall_mgr_debugfs_add(struct event_manager *mgr);
+static void upcall_mgr_debugfs_del(struct event_manager *mgr);
 
 static inline void put_mgr(struct event_manager *mgr)
 {
@@ -348,8 +376,15 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 		 * We don't want to spread to a new core until our local queueu is
 		 * larger than the application configured batch size
 		 */
-		if (local && READ_ONCE(local->event_count) < mgr->batch_size)
+		if (local && READ_ONCE(local->event_count) < mgr->batch_size) {
+			atomic64_inc(&mgr->place_local);
 			return local;
+		}
+		/* Owned but full -> spread remote. */
+		atomic64_inc(&mgr->place_remote_full);
+	} else {
+		/* Local core isn't ours -> spread remote. */
+		atomic64_inc(&mgr->place_remote_not_ours);
 	}
 
 	/* First-fit, not least-loaded: a core with event_count > 0 already has
@@ -444,6 +479,8 @@ static void post_event(struct event_anchor *anchor)
 	spin_unlock(&target->wakeup_lock);
 
 	if (!enqueued) {
+		/* Chosen target was stolen between pick_target() and the lock. */
+		atomic64_inc(&mgr->place_lost);
 		gcpu = cpumask_first(&mgr->guaranteed_mask);
 		if (gcpu >= nr_cpu_ids) {
 			local_irq_restore(flags);
@@ -1106,6 +1143,7 @@ static void free_manager(struct event_manager *mgr)
 	}
 	vfree(mgr->fd_cache);
 
+	upcall_mgr_debugfs_del(mgr);
 	kfree(mgr);
 }
 
@@ -1150,6 +1188,7 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 	int cnt;
 	struct worker_context *ctx;
 	unsigned long flags;
+	u64 t0 = ktime_get_mono_fast_ns();
 
 	if (in == NULL && in_cnt > 0)
 		goto out;
@@ -1246,6 +1285,7 @@ out_free:
 	kfree(kitems);
 	kfree(koutput);
 out:
+	upcall_submit_record(ktime_get_mono_fast_ns() - t0);
 	return ret;
 }
 
@@ -1288,6 +1328,7 @@ static struct event_manager *create_manager(void)
 
 	kref_init(&mgr->ref_count);
 	mgr->id = atomic_inc_return(&upcall_mgr_ids);
+	upcall_mgr_debugfs_add(mgr);
 
 	return mgr;
 
@@ -1365,6 +1406,77 @@ static int upcall_owners_show(struct seq_file *s, void *v)
 }
 DEFINE_SHOW_ATTRIBUTE(upcall_owners);
 
+/* debugfs: /sys/kernel/debug/upcall/submit_ns -- whole-syscall upcall_submit()
+ * time histogram.  Read dumps "upper_ns count" log2 buckets; any write resets. */
+static int upcall_submit_show(struct seq_file *s, void *v)
+{
+	u64 sum[UPCALL_SUBMIT_BUCKETS] = {0};
+	int cpu, b;
+
+	for_each_possible_cpu(cpu)
+		for (b = 0; b < UPCALL_SUBMIT_BUCKETS; b++)
+			sum[b] += upcall_submit_hist[cpu][b];
+	for (b = 0; b < UPCALL_SUBMIT_BUCKETS; b++)
+		if (sum[b])
+			seq_printf(s, "%llu %llu\n", 1ULL << (b + 1), sum[b]);
+	return 0;
+}
+
+static int upcall_submit_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, upcall_submit_show, NULL);
+}
+
+static ssize_t upcall_submit_write(struct file *file, const char __user *ubuf,
+				   size_t len, loff_t *off)
+{
+	memset(upcall_submit_hist, 0, sizeof(upcall_submit_hist));
+	return len;
+}
+
+static const struct file_operations upcall_submit_fops = {
+	.owner		= THIS_MODULE,
+	.open		= upcall_submit_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= upcall_submit_write,
+};
+
+/* debugfs: /sys/kernel/debug/upcall/managers/<id> -- per-manager placement. */
+static int upcall_mgr_show(struct seq_file *s, void *v)
+{
+	struct event_manager *mgr = s->private;
+
+	seq_printf(s, "local            %llu\n",
+		   (unsigned long long)atomic64_read(&mgr->place_local));
+	seq_printf(s, "remote_not_ours  %llu\n",
+		   (unsigned long long)atomic64_read(&mgr->place_remote_not_ours));
+	seq_printf(s, "remote_full      %llu\n",
+		   (unsigned long long)atomic64_read(&mgr->place_remote_full));
+	seq_printf(s, "place_lost       %llu\n",
+		   (unsigned long long)atomic64_read(&mgr->place_lost));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(upcall_mgr);
+
+static void upcall_mgr_debugfs_add(struct event_manager *mgr)
+{
+	char name[16];
+
+	if (!upcall_mgr_dbg_dir)
+		return;
+	snprintf(name, sizeof(name), "%d", mgr->id);
+	mgr->dbg = debugfs_create_file(name, 0444, upcall_mgr_dbg_dir, mgr,
+				       &upcall_mgr_fops);
+}
+
+static void upcall_mgr_debugfs_del(struct event_manager *mgr)
+{
+	debugfs_remove(mgr->dbg);	/* blocks on active readers; safe before kfree */
+	mgr->dbg = NULL;
+}
+
 static int __init upcall_init(void)
 {
 	int cpu;
@@ -1378,6 +1490,9 @@ static int __init upcall_init(void)
 	upcall_debugfs_dir = debugfs_create_dir("upcall", NULL);
 	debugfs_create_file("owners", 0444, upcall_debugfs_dir, NULL,
 			    &upcall_owners_fops);
+	debugfs_create_file("submit_ns", 0644, upcall_debugfs_dir, NULL,
+			    &upcall_submit_fops);
+	upcall_mgr_dbg_dir = debugfs_create_dir("managers", upcall_debugfs_dir);
 
 	event_cache = kmem_cache_create("upcall_event", sizeof(struct up_event),
 			0, SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);
