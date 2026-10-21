@@ -44,6 +44,7 @@ struct event_channel {
 	spinlock_t		worker_lock;
 	struct list_head	wakeups;
 	struct list_head	sleeping_workers;
+	/* Used to measure available slots in the next trip to userspace */
 	size_t			event_count;
 	int			cpu;
 	uint8_t			pad[4];
@@ -731,6 +732,19 @@ static __poll_t upcall_item_poll(struct event_anchor *anchor, __poll_t events)
 	return res & events;
 }
 
+static void mark_handled_events(struct event_manager *mgr, unsigned int cnt)
+{
+	unsigned long flags;
+	struct event_channel *channel;
+
+	local_irq_save(flags);
+	channel = get_event_channel(mgr);
+	scoped_guard(spinlock, &channel->wakeup_lock) {
+		channel->event_count -= cnt;
+	}
+	local_irq_restore(flags);
+}
+
 static struct event_anchor *get_next_wakeup(struct event_manager *mgr)
 {
 	unsigned long flags;
@@ -744,7 +758,6 @@ static struct event_anchor *get_next_wakeup(struct event_manager *mgr)
 		if (!anchor)
 			goto out;
 		list_del_init(&anchor->anchor);
-		channel->event_count--;
 	}
 out:
 	local_irq_restore(flags);
@@ -927,7 +940,7 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t
 static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 		struct up_event **in, int out_cnt, struct up_event **out)
 {
-	int out_idx = 0;
+	unsigned int out_idx = 0;
 	int ret = 0;
 	int last_fd = -1;
 	int presleep_fd = -1;		/* first readable arm: queue to poll before sleeping */
@@ -1040,6 +1053,8 @@ again:
 		presleep_polled = false;	/* fresh poll allowed on the next sleep */
 		goto again;
 	}
+
+	mark_handled_events(mgr, out_idx);
 
 	return out_idx;
 }
