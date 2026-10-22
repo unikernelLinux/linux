@@ -73,6 +73,13 @@ struct fd_cache_entry {
 	enum fd_io_kind	kind;
 };
 
+struct upcall_place_stats {
+	u64	local;			/* placed on the local core (fast path) */
+	u64	remote_not_ours;	/* local core not owned -> spread remote */
+	u64	remote_full;		/* local core owned but full -> spread remote */
+	u64	lost;			/* target stolen between pick and enqueue */
+};
+
 struct event_manager {
 	struct file		*file;
 	struct kref		ref_count;
@@ -97,11 +104,9 @@ struct event_manager {
 	 * the only path that closes an fd this manager touches. */
 	struct fd_cache_entry	*fd_cache;
 	unsigned int		fd_cache_size;
-	/* Placement observability (atomic: many CPUs post for one mgr). */
-	atomic64_t		place_local;
-	atomic64_t		place_remote_not_ours;
-	atomic64_t		place_remote_full;
-	atomic64_t		place_lost;	/* target stolen between pick and enqueue */
+	/* Placement observability: per-CPU to avoid bouncing a shared cacheline
+	 * across every posting CPU; summed only at debugfs read. */
+	struct upcall_place_stats __percpu *place_stats;
 	struct dentry		*dbg;		/* /sys/kernel/debug/upcall/managers/<id> */
 };
 
@@ -377,14 +382,14 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 		 * larger than the application configured batch size
 		 */
 		if (local && READ_ONCE(local->event_count) < mgr->batch_size) {
-			atomic64_inc(&mgr->place_local);
+			this_cpu_inc(mgr->place_stats->local);
 			return local;
 		}
 		/* Owned but full -> spread remote. */
-		atomic64_inc(&mgr->place_remote_full);
+		this_cpu_inc(mgr->place_stats->remote_full);
 	} else {
 		/* Local core isn't ours -> spread remote. */
-		atomic64_inc(&mgr->place_remote_not_ours);
+		this_cpu_inc(mgr->place_stats->remote_not_ours);
 	}
 
 	/* First-fit, not least-loaded: a core with event_count > 0 already has
@@ -480,7 +485,7 @@ static void post_event(struct event_anchor *anchor)
 
 	if (!enqueued) {
 		/* Chosen target was stolen between pick_target() and the lock. */
-		atomic64_inc(&mgr->place_lost);
+		this_cpu_inc(mgr->place_stats->lost);
 		gcpu = cpumask_first(&mgr->guaranteed_mask);
 		if (gcpu >= nr_cpu_ids) {
 			local_irq_restore(flags);
@@ -1143,7 +1148,8 @@ static void free_manager(struct event_manager *mgr)
 	}
 	vfree(mgr->fd_cache);
 
-	upcall_mgr_debugfs_del(mgr);
+	upcall_mgr_debugfs_del(mgr);	/* blocks readers before we free place_stats */
+	free_percpu(mgr->place_stats);
 	kfree(mgr);
 }
 
@@ -1326,6 +1332,10 @@ static struct event_manager *create_manager(void)
 	if (!mgr->fd_cache)
 		goto out_free;
 
+	mgr->place_stats = alloc_percpu(struct upcall_place_stats);
+	if (!mgr->place_stats)
+		goto out_free;
+
 	kref_init(&mgr->ref_count);
 	mgr->id = atomic_inc_return(&upcall_mgr_ids);
 	upcall_mgr_debugfs_add(mgr);
@@ -1337,6 +1347,7 @@ out_free:
 		kfree(mgr->channels[i]);
 	}
 	vfree(mgr->fd_cache);
+	free_percpu(mgr->place_stats);
 	kfree(mgr);
 	return NULL;
 }
@@ -1447,15 +1458,21 @@ static const struct file_operations upcall_submit_fops = {
 static int upcall_mgr_show(struct seq_file *s, void *v)
 {
 	struct event_manager *mgr = s->private;
+	u64 local = 0, not_ours = 0, full = 0, lost = 0;
+	int cpu;
 
-	seq_printf(s, "local            %llu\n",
-		   (unsigned long long)atomic64_read(&mgr->place_local));
-	seq_printf(s, "remote_not_ours  %llu\n",
-		   (unsigned long long)atomic64_read(&mgr->place_remote_not_ours));
-	seq_printf(s, "remote_full      %llu\n",
-		   (unsigned long long)atomic64_read(&mgr->place_remote_full));
-	seq_printf(s, "place_lost       %llu\n",
-		   (unsigned long long)atomic64_read(&mgr->place_lost));
+	for_each_possible_cpu(cpu) {
+		struct upcall_place_stats *st = per_cpu_ptr(mgr->place_stats, cpu);
+
+		local    += st->local;
+		not_ours += st->remote_not_ours;
+		full     += st->remote_full;
+		lost     += st->lost;
+	}
+	seq_printf(s, "local            %llu\n", (unsigned long long)local);
+	seq_printf(s, "remote_not_ours  %llu\n", (unsigned long long)not_ours);
+	seq_printf(s, "remote_full      %llu\n", (unsigned long long)full);
+	seq_printf(s, "place_lost       %llu\n", (unsigned long long)lost);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(upcall_mgr);
