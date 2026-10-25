@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Upcall event handler implementaion
+ * Upcall event handler implementation
  */
 
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/build_bug.h>
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/fdtable.h>
@@ -48,9 +49,14 @@ struct event_channel {
 	struct list_head	sleeping_workers;
 	/* Used to measure available slots in the next trip to userspace */
 	size_t			event_count;
-	int			cpu;
-	uint8_t			pad[4];
+	uint32_t		cpu;
+	uint8_t			pad[12];
 };
+/* Pad to a cacheline so each channel's hot wakeup_lock/event_count don't
+ * share a line with an adjacent channel's allocation. Only holds for the
+ * perf-build config (no lockdep/debug spinlocks); catch any drift here
+ * instead of silently losing the alignment. */
+static_assert(sizeof(struct event_channel) == 64);
 
 /*
  * How to run read/write on a cached fd. Resolved once when the fd is first
@@ -424,16 +430,16 @@ static void wake_owned_worker(struct event_manager *mgr, int cpu)
 /*
  * Choose an owned channel for mgr to receive an event that arrived on my_cpu.
  * Fast path: the local core, as long as it is owned and its queue depth is
- * below mgr->batch_sz.  Past that, spreads to the first owned core (scanning
- * from my_cpu and wrapping, not always from the domain's lowest cpu) that
- * already has queued work and isn't full; if the domain has no such core,
- * falls back to a guaranteed core (never released, always a valid target).
- * Reads owned/guaranteed masks lock-free — hint quality; post_event
- * re-validates the chosen core's ownership under its wakeup_lock.  Returns NULL
- * only if the manager owns no cores at all (pathological, fully-allocated
- * machine).
+ * below mgr->batch_sz. Past that, scans the domain starting at my_cpu and
+ * wrapping (not always from the domain's lowest cpu), in two passes merged
+ * into one loop: prefer the first owned core that already has queued work
+ * and isn't full; failing that, fall back to the first owned core seen
+ * sitting completely idle. If neither exists, fall back to a guaranteed
+ * core (never released, always a valid target). Reads owned/guaranteed
+ * masks lock-free — hint quality; post_event re-validates the chosen core's
+ * ownership under its wakeup_lock. Returns NULL only if the manager owns no
+ * cores at all (pathological, fully-allocated machine).
  */
-
 static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 {
 	const struct cpumask *domain = upcall_domain_mask(my_cpu);
@@ -443,10 +449,6 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 	if (cpumask_test_cpu(my_cpu, &mgr->owned_mask)) {
 		struct event_channel *local = mgr->channels[my_cpu];
 
-		/*
-		 * We don't want to spread to a new core until our local queueu is
-		 * larger than the application configured batch size
-		 */
 		if (local && READ_ONCE(local->event_count) < mgr->batch_size) {
 			place_stat_local(mgr);
 			return local;
@@ -515,6 +517,11 @@ static void upcall_scale_up(struct event_manager *mgr, int cpu)
 		wake_owned_worker(mgr, claimed);
 }
 
+/*
+ * Softirq-reachable: places anchor on a target channel's wakeup queue and
+ * wakes its worker. May run on a CPU this manager doesn't own (NAPI softirq
+ * follows the interrupt, not mgr's ownership).
+ */
 static void post_event(struct event_anchor *anchor)
 {
 	unsigned long flags;
@@ -527,7 +534,6 @@ static void post_event(struct event_anchor *anchor)
 	local_irq_save(flags);
 	my_cpu = smp_processor_id();
 
-	/* Softirq may run on a CPU this manager doesn't own. */
 	target = pick_target(mgr, my_cpu);
 	if (!target) {
 		local_irq_restore(flags);
@@ -767,6 +773,9 @@ static void try_read(struct event_manager *mgr, struct up_event *evt)
 		}
 
 		if (ret <= 0) {
+			/* Report bytes already read on this call, not the error/EAGAIN
+			 * that stopped it -- discarding them here would silently drop
+			 * data for payloads that span multiple reads. */
 			evt->result = cursor > 0 ? cursor : ret;
 			return;
 		}
@@ -810,6 +819,8 @@ static void try_write(struct event_manager *mgr, struct up_event *evt)
 		}
 
 		if (ret <= 0) {
+			/* Report bytes already written on this call, not the error/EAGAIN
+			 * that stopped it -- same reasoning as try_read(). */
 			evt->result = cursor > 0 ? cursor : ret;
 			return;
 		}
@@ -872,6 +883,9 @@ out:
 	return anchor;
 }
 
+/* Park the calling worker until an event arrives or a spurious wakeup
+ * retries. Re-checks event_count under lock immediately before parking to
+ * close the race with a concurrent post_event(). */
 static void worker_sleep(struct event_manager *mgr)
 {
 	unsigned long flags;
@@ -922,7 +936,6 @@ out:
 	return;
 }
 
-/* Pop a recycled anchor for this CPU, or NULL if the pool is empty. */
 static struct event_anchor *anchor_pool_get(void)
 {
 	struct anchor_pool *pool;
@@ -936,7 +949,6 @@ static struct event_anchor *anchor_pool_get(void)
 	return anchor;
 }
 
-/* Push a freed anchor onto this CPU's pool, or free it to the slab if full. */
 static void anchor_pool_put(struct event_anchor *anchor)
 {
 	struct anchor_pool *pool;
@@ -1004,9 +1016,15 @@ static void attach_buffers(uint64_t cnt, struct iovec __user *bufs)
 
 	for (uint64_t i = 0; i < cnt; i++) {
 		buf = kmem_cache_alloc(buffer_cache, GFP_KERNEL);
-		INIT_LIST_HEAD(&buf->anchor);
-		if (copy_from_user(&buf->iovec, &bufs[i], sizeof(struct iovec)))
+		if (!buf) {
+			pr_warn("Failed to allocate buffer cached object, dropping remaining buffers");
 			return;
+		}
+		INIT_LIST_HEAD(&buf->anchor);
+		if (copy_from_user(&buf->iovec, &bufs[i], sizeof(struct iovec))) {
+			kmem_cache_free(buffer_cache, buf);
+			return;
+		}
 		list_add(&buf->anchor, &ctx->buffers);
 	}
 }
@@ -1045,6 +1063,13 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t
 	return 0;
 }
 
+/*
+ * Two phases: arm every input (attach_poll/attach_buffers/UP_CLOSE), then
+ * drain up to out_cnt completions. The drain loop (`again:`) can re-enter
+ * itself via busy-poll or worker_sleep when nothing is ready yet, so it
+ * only returns once it has output, has slept, or the caller asked for
+ * nothing (out_cnt == 0).
+ */
 static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 		struct up_event **in, int out_cnt, struct up_event **out)
 {
@@ -1198,11 +1223,6 @@ static void free_manager(struct event_manager *mgr)
 	for (uint64_t i = 0; i < NR_CPUS; i++) {
 		chan = mgr->channels[i];
 		mgr->channels[i] = NULL;
-		if (!chan)
-			continue;
-		for (uint64_t j = i + 1; j < NR_CPUS; j++)
-			if (mgr->channels[j] == chan)
-				mgr->channels[j] = NULL;
 		kfree(chan);
 	}
 
@@ -1299,6 +1319,11 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 		reg_cpu = smp_processor_id();
 		reg_channel = mgr->channels[reg_cpu];
 		spin_lock(&reg_channel->worker_lock);
+		/* Assumes one worker thread per CPU. If a second task ever registers
+		 * here, this slot already belongs to the first, so this ctx never
+		 * gets published to pcpu_workers[]; wake_owned_worker() only ever
+		 * targets the published ctx, so the second task's own parks
+		 * (worker_sleep) would never be woken by it. */
 		if (mgr->pcpu_workers[reg_cpu] == NULL) {
 			mgr->pcpu_workers[reg_cpu] = ctx;
 		}
