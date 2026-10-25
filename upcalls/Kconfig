@@ -9,4 +9,14 @@ config UPCALLS
 	help
 	  Support for the upcall event handler.
 
+config UPCALLS_STATS
+	bool "Upcall placement and latency statistics"
+	depends on UPCALLS
+	default n
+	help
+	  Track per-manager event placement counters and a kernel-time
+	  histogram for upcall_submit(), exposed under debugfs. Adds
+	  per-event overhead on the submission hot path; leave disabled
+	  unless actively profiling placement.
+
 #depends on NET_RX_BUSY_POLL

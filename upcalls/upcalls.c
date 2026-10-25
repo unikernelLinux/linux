@@ -73,12 +73,14 @@ struct fd_cache_entry {
 	enum fd_io_kind	kind;
 };
 
+#ifdef CONFIG_UPCALLS_STATS
 struct upcall_place_stats {
 	u64	local;			/* placed on the local core (fast path) */
 	u64	remote_not_ours;	/* local core not owned -> spread remote */
 	u64	remote_full;		/* local core owned but full -> spread remote */
 	u64	lost;			/* target stolen between pick and enqueue */
 };
+#endif
 
 struct event_manager {
 	struct file		*file;
@@ -104,11 +106,59 @@ struct event_manager {
 	 * the only path that closes an fd this manager touches. */
 	struct fd_cache_entry	*fd_cache;
 	unsigned int		fd_cache_size;
+#ifdef CONFIG_UPCALLS_STATS
 	/* Placement observability: per-CPU to avoid bouncing a shared cacheline
 	 * across every posting CPU; summed only at debugfs read. */
 	struct upcall_place_stats __percpu *place_stats;
 	struct dentry		*dbg;		/* /sys/kernel/debug/upcall/managers/<id> */
+#endif
 };
+
+/*
+ * Event placement counters: always called unconditionally from the
+ * placement/submit paths; the real bodies only exist when
+ * CONFIG_UPCALLS_STATS is enabled, otherwise these are no-op stubs so no
+ * #ifdef is needed at any call site.
+ */
+#ifdef CONFIG_UPCALLS_STATS
+static inline void place_stat_local(struct event_manager *mgr)
+{
+	this_cpu_inc(mgr->place_stats->local);
+}
+
+static inline void place_stat_remote_full(struct event_manager *mgr)
+{
+	this_cpu_inc(mgr->place_stats->remote_full);
+}
+
+static inline void place_stat_remote_not_ours(struct event_manager *mgr)
+{
+	this_cpu_inc(mgr->place_stats->remote_not_ours);
+}
+
+static inline void place_stat_lost(struct event_manager *mgr)
+{
+	this_cpu_inc(mgr->place_stats->lost);
+}
+
+static inline bool upcall_place_stats_alloc(struct event_manager *mgr)
+{
+	mgr->place_stats = alloc_percpu(struct upcall_place_stats);
+	return mgr->place_stats != NULL;
+}
+
+static inline void upcall_place_stats_free(struct event_manager *mgr)
+{
+	free_percpu(mgr->place_stats);
+}
+#else
+static inline void place_stat_local(struct event_manager *mgr) { }
+static inline void place_stat_remote_full(struct event_manager *mgr) { }
+static inline void place_stat_remote_not_ours(struct event_manager *mgr) { }
+static inline void place_stat_lost(struct event_manager *mgr) { }
+static inline bool upcall_place_stats_alloc(struct event_manager *mgr) { return true; }
+static inline void upcall_place_stats_free(struct event_manager *mgr) { }
+#endif
 
 /*
  * Machine-global core pool: the only cross-manager structure. A core is
@@ -129,6 +179,7 @@ static struct upcall_core_pool core_pool;
 /* Monotonic id source + debugfs handle for observability. */
 static  atomic_t upcall_mgr_ids = ATOMIC_INIT(0);
 static struct dentry *upcall_debugfs_dir;
+#ifdef CONFIG_UPCALLS_STATS
 static struct dentry *upcall_mgr_dbg_dir;	/* .../upcall/managers */
 
 /* Histogram of whole-syscall upcall_submit() time, log2(ns), summed at read. */
@@ -145,6 +196,20 @@ static void upcall_submit_record(u64 delta)
 	upcall_submit_hist[cpu][b]++;
 	put_cpu();
 }
+
+static inline u64 upcall_submit_time_start(void)
+{
+	return ktime_get_mono_fast_ns();
+}
+
+static inline void upcall_submit_time_end(u64 t0)
+{
+	upcall_submit_record(ktime_get_mono_fast_ns() - t0);
+}
+#else
+static inline u64 upcall_submit_time_start(void) { return 0; }
+static inline void upcall_submit_time_end(u64 t0) { }
+#endif
 
 struct event_anchor {
 	struct list_head	anchor;
@@ -203,7 +268,8 @@ static void free_manager_kref(struct kref *kref);
 static void anchor_release_pool(struct kref *kref);
 static void anchor_release_slab(struct kref *kref);
 
-/* Per-manager debugfs (placement counters); defined with the debugfs section. */
+/* Per-manager debugfs (placement counters); defined with the debugfs section.
+ * Always called unconditionally -- no-op stubs when stats are disabled. */
 static void upcall_mgr_debugfs_add(struct event_manager *mgr);
 static void upcall_mgr_debugfs_del(struct event_manager *mgr);
 
@@ -382,14 +448,14 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 		 * larger than the application configured batch size
 		 */
 		if (local && READ_ONCE(local->event_count) < mgr->batch_size) {
-			this_cpu_inc(mgr->place_stats->local);
+			place_stat_local(mgr);
 			return local;
 		}
 		/* Owned but full -> spread remote. */
-		this_cpu_inc(mgr->place_stats->remote_full);
+		place_stat_remote_full(mgr);
 	} else {
 		/* Local core isn't ours -> spread remote. */
-		this_cpu_inc(mgr->place_stats->remote_not_ours);
+		place_stat_remote_not_ours(mgr);
 	}
 
 	/* First-fit, not least-loaded: a core with event_count > 0 already has
@@ -485,7 +551,7 @@ static void post_event(struct event_anchor *anchor)
 
 	if (!enqueued) {
 		/* Chosen target was stolen between pick_target() and the lock. */
-		this_cpu_inc(mgr->place_stats->lost);
+		place_stat_lost(mgr);
 		gcpu = cpumask_first(&mgr->guaranteed_mask);
 		if (gcpu >= nr_cpu_ids) {
 			local_irq_restore(flags);
@@ -1149,7 +1215,7 @@ static void free_manager(struct event_manager *mgr)
 	vfree(mgr->fd_cache);
 
 	upcall_mgr_debugfs_del(mgr);	/* blocks readers before we free place_stats */
-	free_percpu(mgr->place_stats);
+	upcall_place_stats_free(mgr);
 	kfree(mgr);
 }
 
@@ -1194,7 +1260,7 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 	int cnt;
 	struct worker_context *ctx;
 	unsigned long flags;
-	u64 t0 = ktime_get_mono_fast_ns();
+	u64 t0 = upcall_submit_time_start();
 
 	if (in == NULL && in_cnt > 0)
 		goto out;
@@ -1291,7 +1357,7 @@ out_free:
 	kfree(kitems);
 	kfree(koutput);
 out:
-	upcall_submit_record(ktime_get_mono_fast_ns() - t0);
+	upcall_submit_time_end(t0);
 	return ret;
 }
 
@@ -1332,8 +1398,7 @@ static struct event_manager *create_manager(void)
 	if (!mgr->fd_cache)
 		goto out_free;
 
-	mgr->place_stats = alloc_percpu(struct upcall_place_stats);
-	if (!mgr->place_stats)
+	if (!upcall_place_stats_alloc(mgr))
 		goto out_free;
 
 	kref_init(&mgr->ref_count);
@@ -1347,7 +1412,7 @@ out_free:
 		kfree(mgr->channels[i]);
 	}
 	vfree(mgr->fd_cache);
-	free_percpu(mgr->place_stats);
+	upcall_place_stats_free(mgr);
 	kfree(mgr);
 	return NULL;
 }
@@ -1417,6 +1482,7 @@ static int upcall_owners_show(struct seq_file *s, void *v)
 }
 DEFINE_SHOW_ATTRIBUTE(upcall_owners);
 
+#ifdef CONFIG_UPCALLS_STATS
 /* debugfs: /sys/kernel/debug/upcall/submit_ns -- whole-syscall upcall_submit()
  * time histogram.  Read dumps "upper_ns count" log2 buckets; any write resets. */
 static int upcall_submit_show(struct seq_file *s, void *v)
@@ -1494,6 +1560,17 @@ static void upcall_mgr_debugfs_del(struct event_manager *mgr)
 	mgr->dbg = NULL;
 }
 
+static void upcall_stats_debugfs_init(struct dentry *parent)
+{
+	debugfs_create_file("submit_ns", 0644, parent, NULL, &upcall_submit_fops);
+	upcall_mgr_dbg_dir = debugfs_create_dir("managers", parent);
+}
+#else
+static void upcall_mgr_debugfs_add(struct event_manager *mgr) { }
+static void upcall_mgr_debugfs_del(struct event_manager *mgr) { }
+static void upcall_stats_debugfs_init(struct dentry *parent) { }
+#endif /* CONFIG_UPCALLS_STATS */
+
 static int __init upcall_init(void)
 {
 	int cpu;
@@ -1507,9 +1584,7 @@ static int __init upcall_init(void)
 	upcall_debugfs_dir = debugfs_create_dir("upcall", NULL);
 	debugfs_create_file("owners", 0444, upcall_debugfs_dir, NULL,
 			    &upcall_owners_fops);
-	debugfs_create_file("submit_ns", 0644, upcall_debugfs_dir, NULL,
-			    &upcall_submit_fops);
-	upcall_mgr_dbg_dir = debugfs_create_dir("managers", upcall_debugfs_dir);
+	upcall_stats_debugfs_init(upcall_debugfs_dir);
 
 	event_cache = kmem_cache_create("upcall_event", sizeof(struct up_event),
 			0, SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);
