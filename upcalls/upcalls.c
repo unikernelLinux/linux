@@ -38,21 +38,22 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/log2.h>
+#include <linux/hash.h>
 #include <linux/timekeeping.h>
 
 #include <linux/sched.h>
 
 struct event_channel {
-	spinlock_t		wakeup_lock;
+	spinlock_t		event_lock;
 	spinlock_t		worker_lock;
-	struct list_head	wakeups;
+	struct list_head	event_list;
 	struct list_head	sleeping_workers;
 	/* Used to measure available slots in the next trip to userspace */
 	size_t			event_count;
 	uint32_t		cpu;
 	uint8_t			pad[12];
 };
-/* Pad to a cacheline so each channel's hot wakeup_lock/event_count don't
+/* Pad to a cacheline so each channel's hot event_lock/event_count don't
  * share a line with an adjacent channel's allocation. Only holds for the
  * perf-build config (no lockdep/debug spinlocks); catch any drift here
  * instead of silently losing the alignment. */
@@ -73,7 +74,7 @@ enum fd_io_kind {
 	FD_IO_SOCK_OTHER,	/* socket, but not TCP/UDP -- via sk->sk_prot */
 };
 
-struct fd_cache_entry {
+struct filep_cache {
 	struct file	*file;	/* borrowed ref; slot empty when NULL */
 	struct sock	*sk;	/* set before file is published; NULL if non-socket */
 	enum fd_io_kind	kind;
@@ -95,7 +96,7 @@ struct event_manager {
 	struct worker_context	*pcpu_workers[NR_CPUS];
 	/* owned_mask mirrors core_pool.owner[] for lock-free reads on the
 	 * delivery path; a stolen owner[] flip is serialised against
-	 * post_event() by the owning channel's wakeup_lock. guaranteed_mask
+	 * post_event() by the owning channel's event_lock. guaranteed_mask
 	 * (subset of owned_mask, ~1 core per LLC domain) is never released. */
 	struct cpumask		owned_mask;
 	struct cpumask		guaranteed_mask;
@@ -110,8 +111,11 @@ struct event_manager {
 	int			id;		/* small stable id for observability */
 	/* fd -> cached {file, sk, io kind}; entries only clear via UP_CLOSE,
 	 * the only path that closes an fd this manager touches. */
-	struct fd_cache_entry	*fd_cache;
-	unsigned int		fd_cache_size;
+	struct filep_cache	*filep_cache;
+	unsigned int		filer_cache_sz;
+	/* (fd,type) -> live event_anchor, for re-arm find-or-create and teardown. */
+	struct hlist_head	*anchor_hash;
+	spinlock_t		anchor_lock;
 #ifdef CONFIG_UPCALLS_STATS
 	/* Placement observability: per-CPU to avoid bouncing a shared cacheline
 	 * across every posting CPU; summed only at debugfs read. */
@@ -217,11 +221,33 @@ static inline u64 upcall_submit_time_start(void) { return 0; }
 static inline void upcall_submit_time_end(u64 t0) { }
 #endif
 
+/*
+ * Anchor lifecycle (atomic). One-shot today: the ARMED -> QUEUED claim is won
+ * by exactly one poster (the wakeup callback or the arming-path poll), after
+ * which the drain recycles the anchor. IDLE (delivered, awaiting re-arm) and
+ * DEAD (closing) are reserved for the persistent/teardown stages.
+ */
+enum anchor_state {
+	ANCHOR_ARMED,
+	ANCHOR_QUEUED,
+	ANCHOR_IDLE,
+	ANCHOR_DEAD,
+};
+
+/* Per-manager (fd,type) -> live anchor registry. Touched only at subscribe
+ * and anchor free (syscall/softirq frequency, not per-packet), so one lock. */
+#define UPCALL_ANCHOR_HASH_BITS	10
+#define UPCALL_ANCHOR_HASH_SZ	(1u << UPCALL_ANCHOR_HASH_BITS)
+
 struct event_anchor {
 	struct list_head	anchor;
-	struct up_event		*event;
+	struct up_event		event;
 	struct event_manager	*mgr;
-	atomic_t		armed;	/* arbiter: who completes/posts the event */
+	struct file		*file;	/* own fget; resolved at build, fput at release */
+	struct sock		*sk;	/* from file; NULL if non-socket */
+	enum fd_io_kind		kind;
+	struct hlist_node	hash_node;	/* (fd,type) registry membership */
+	atomic_t		state;	/* enum anchor_state */
 	struct kref		refs;	/* lifetime: recycled when this hits 0 */
 	wait_queue_entry_t	wait;
 	wait_queue_head_t	*whead;
@@ -249,9 +275,10 @@ static struct kmem_cache *anchor_cache __read_mostly;
 
 /*
  * Per-CPU recycle pool for event_anchor objects; build_anchor()/attach_poll()
- * reinitialize every field on reuse. Only touched from task context (the
- * softirq-reachable drop_anchor() path frees straight to the slab instead),
- * so preempt-disable (get_cpu_var/put_cpu_var) is enough without irq-off.
+ * reinitialize every field on reuse. Every free runs through anchor_release_pool
+ * in task context (drain, UP_CLOSE, teardown) -- the softirq-reachable
+ * drop_anchor() only un-claims and never frees -- so preempt-disable
+ * (get_cpu_var/put_cpu_var) is enough without irq-off.
  */
 #define ANCHOR_POOL_CAP 64
 struct anchor_pool {
@@ -268,11 +295,10 @@ static struct kmem_cache *buffer_cache __read_mostly;
 
 static void free_manager_kref(struct kref *kref);
 
-/* anchor->refs release callbacks: recycle to the per-CPU pool (task context)
- * or free straight to the slab (drop_anchor, which is softirq-reachable and
- * must not touch the pool). */
+/* anchor->refs release callback: recycle to the per-CPU pool. Only ever called
+ * from task context (drain, UP_CLOSE, teardown), never from the softirq
+ * post_event/drop_anchor path. */
 static void anchor_release_pool(struct kref *kref);
-static void anchor_release_slab(struct kref *kref);
 
 /* Per-manager debugfs (placement counters); defined with the debugfs section.
  * Always called unconditionally -- no-op stubs when stats are disabled. */
@@ -317,7 +343,7 @@ static const struct cpumask *upcall_domain_mask(int cpu)
  * Acquire a core for mgr within `domain`. Lock-free except for a genuine
  * cross-app steal (tier 2), which takes core_pool.lock so the victim can't
  * be freed under us, then gates on the victim being idle (event_count == 0)
- * under its own channel wakeup_lock and flips owner[cpu] with cmpxchg -- the
+ * under its own channel event_lock and flips owner[cpu] with cmpxchg -- the
  * same lock post_event() uses to re-validate ownership, so no event strands.
  * Returns the cpu acquired (now in mgr->owned_mask) or -1.
  */
@@ -352,18 +378,18 @@ static int acquire_core(struct event_manager *mgr, const struct cpumask *domain)
 		victim = READ_ONCE(core_pool.owner[cpu]);
 		if (victim && victim != mgr) {
 			vchan = victim->channels[cpu];
-			spin_lock(&vchan->wakeup_lock);
+			spin_lock(&vchan->event_lock);
 			if (vchan->event_count == 0 &&
 			    cmpxchg(&core_pool.owner[cpu], victim, mgr) == victim) {
 				cpumask_clear_cpu(cpu, &victim->owned_mask);
 				cpumask_set_cpu(cpu, &mgr->owned_mask);
 				atomic_dec(&victim->owned_count);
 				atomic_inc(&mgr->owned_count);
-				spin_unlock(&vchan->wakeup_lock);
+				spin_unlock(&vchan->event_lock);
 				spin_unlock_irqrestore(&core_pool.lock, flags);
 				return cpu;
 			}
-			spin_unlock(&vchan->wakeup_lock);
+			spin_unlock(&vchan->event_lock);
 		}
 		spin_unlock_irqrestore(&core_pool.lock, flags);
 		/* victim reclaimed it or ownership moved; mark already cleared */
@@ -406,10 +432,10 @@ static void mark_stealable(struct event_manager *mgr, int cpu)
 	if (cpumask_test_cpu(cpu, &mgr->guaranteed_mask))
 		return;
 
-	spin_lock_irqsave(&chan->wakeup_lock, flags);
+	spin_lock_irqsave(&chan->event_lock, flags);
 	if (chan->event_count == 0 && READ_ONCE(core_pool.owner[cpu]) == mgr)
 		cpumask_set_cpu(cpu, &core_pool.stealable_mask);
-	spin_unlock_irqrestore(&chan->wakeup_lock, flags);
+	spin_unlock_irqrestore(&chan->event_lock, flags);
 }
 
 /* Wake the manager's worker on cpu if it is parked.  Caller has IRQs off. */
@@ -437,7 +463,7 @@ static void wake_owned_worker(struct event_manager *mgr, int cpu)
  * sitting completely idle. If neither exists, fall back to a guaranteed
  * core (never released, always a valid target). Reads owned/guaranteed
  * masks lock-free — hint quality; post_event re-validates the chosen core's
- * ownership under its wakeup_lock. Returns NULL only if the manager owns no
+ * ownership under its event_lock. Returns NULL only if the manager owns no
  * cores at all (pathological, fully-allocated machine).
  */
 static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
@@ -496,12 +522,11 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 static void drop_anchor(struct event_anchor *anchor)
 {
 	pr_warn_once("upcall: manager owns no cores, dropping event\n");
-	kmem_cache_free(event_cache, anchor->event);
-	put_mgr(anchor->mgr);
-	/* Drop the event reference. anchor_release_slab frees straight to the slab
-	 * (this path is softirq-reachable and must not touch the pool); if the
-	 * arming path still holds its reference it frees the anchor itself later. */
-	kref_put(&anchor->refs, anchor_release_slab);
+	/* Persistent: keep the subscription (its refs, mgr ref, and wait-queue
+	 * entry) and just drop this event by un-claiming, so a later wakeup or
+	 * re-arm retries. Freeing here would be unsafe -- the anchor is still on
+	 * the wait queue and this path can run under the waker's lock. */
+	atomic_cmpxchg(&anchor->state, ANCHOR_QUEUED, ANCHOR_ARMED);
 }
 
 /* Runs with IRQs disabled (placement context). */
@@ -546,14 +571,19 @@ static void post_event(struct event_anchor *anchor)
 	/* If mgr released the core since pick_target(), owner[] no longer
 	 * points at mgr; fall back to a guaranteed core instead of enqueuing
 	 * onto a channel nothing will ever drain. */
-	spin_lock(&target->wakeup_lock);
+	spin_lock(&target->event_lock);
 	if (READ_ONCE(core_pool.owner[target->cpu]) == mgr) {
 		congested = target->event_count > mgr->spread_threshold;
-		list_add_tail(&anchor->anchor, &target->wakeups);
+		/* Queued ref: held while on the channel list and across the drain;
+		 * the worker drops it. Keeps the anchor alive against a concurrent
+		 * UP_CLOSE that drops the subscription ref. Taken before the anchor
+		 * is visible to a draining worker. */
+		kref_get(&anchor->refs);
+		list_add_tail(&anchor->anchor, &target->event_list);
 		target->event_count++;
 		enqueued = true;
 	}
-	spin_unlock(&target->wakeup_lock);
+	spin_unlock(&target->event_lock);
 
 	if (!enqueued) {
 		/* Chosen target was stolen between pick_target() and the lock. */
@@ -565,11 +595,12 @@ static void post_event(struct event_anchor *anchor)
 			return;
 		}
 		target = mgr->channels[gcpu];
-		spin_lock(&target->wakeup_lock);
+		spin_lock(&target->event_lock);
 		congested = target->event_count > mgr->spread_threshold;
-		list_add_tail(&anchor->anchor, &target->wakeups);
+		kref_get(&anchor->refs);	/* queued ref (see above) */
+		list_add_tail(&anchor->anchor, &target->event_list);
 		target->event_count++;
-		spin_unlock(&target->wakeup_lock);
+		spin_unlock(&target->event_lock);
 	}
 
 	wake_owned_worker(mgr, target->cpu);
@@ -580,25 +611,27 @@ static void post_event(struct event_anchor *anchor)
 	local_irq_restore(flags);
 }
 
+/* Claim the anchor for posting: exactly one caller wins ARMED -> QUEUED. */
+static inline bool anchor_claim(struct event_anchor *anchor)
+{
+	return atomic_cmpxchg(&anchor->state, ANCHOR_ARMED, ANCHOR_QUEUED) == ANCHOR_ARMED;
+}
+
 static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
 		int flags, void *key)
 {
 	struct event_anchor *anchor = container_of(wq_entry, struct event_anchor, wait);
 	__poll_t pollflags = key_to_poll(key);
-	int armed;
 
 	if (pollflags && !(pollflags & anchor->events))
 		return 0;
 
-	armed = atomic_dec_return(&anchor->armed);
-	if (armed)
-		return 0;	/* raced with another wakeup path; they won */
+	if (!anchor_claim(anchor))
+		return 0;	/* another poster won the ARMED->QUEUED claim */
 
-	/* Called from __wake_up_common with wq_head->lock held; use list_del_init
-	 * directly rather than remove_wait_queue, which would deadlock trying to
-	 * re-acquire the same lock. */
-	list_del_init(&anchor->wait.entry);
-
+	/* Persistent waiter: the anchor stays on the wait queue across posts.
+	 * The claim above gates double-posting (wakeups while QUEUED/IDLE no-op),
+	 * so there is nothing to remove here. */
 	post_event(anchor);
 	return 0;
 }
@@ -628,16 +661,16 @@ static enum fd_io_kind classify_sk(struct sock *sk)
  * runs before close_fd() actually closes the fd, so a lookup never observes a
  * stale pointer.
  */
-static struct fd_cache_entry *fdcache_get(struct event_manager *mgr, int fd)
+static struct filep_cache *fdcache_get(struct event_manager *mgr, int fd)
 {
-	struct fd_cache_entry *e;
+	struct filep_cache *e;
 	struct file *file, *raced;
 	struct socket *sock;
 
-	if (fd < 0 || (unsigned int)fd >= mgr->fd_cache_size)
+	if (fd < 0 || (unsigned int)fd >= mgr->filer_cache_sz)
 		return NULL;
 
-	e = &mgr->fd_cache[fd];
+	e = &mgr->filep_cache[fd];
 	if (smp_load_acquire(&e->file))
 		return e;
 
@@ -669,10 +702,10 @@ static void fdcache_invalidate(struct event_manager *mgr, int fd)
 {
 	struct file *file;
 
-	if (fd < 0 || (unsigned int)fd >= mgr->fd_cache_size)
+	if (fd < 0 || (unsigned int)fd >= mgr->filer_cache_sz)
 		return;
 
-	file = xchg(&mgr->fd_cache[fd].file, NULL);
+	file = xchg(&mgr->filep_cache[fd].file, NULL);
 	if (file)
 		fput(file);
 }
@@ -699,56 +732,54 @@ static void get_buffer(struct iovec *iov)
  * any other socket goes through sk_prot. The protocol manages its own socket
  * locking.
  */
-static int sock_recv_one(struct fd_cache_entry *e, void *base, size_t len, int flags)
+static int sock_recv_one(struct sock *sk, enum fd_io_kind kind, void *base, size_t len, int flags)
 {
 	struct msghdr msg = {};
 	int addr_len = 0;
 
 	iov_iter_ubuf(&msg.msg_iter, ITER_DEST, base, len);
 
-	switch (e->kind) {
+	switch (kind) {
 	case FD_IO_TCP:
-		return tcp_recvmsg(e->sk, &msg, len, flags, &addr_len);
+		return tcp_recvmsg(sk, &msg, len, flags, &addr_len);
 	case FD_IO_UDP:
-		return udp_recvmsg(e->sk, &msg, len, flags, &addr_len);
+		return udp_recvmsg(sk, &msg, len, flags, &addr_len);
 	default:
-		return e->sk->sk_prot->recvmsg(e->sk, &msg, len, flags, &addr_len);
+		return sk->sk_prot->recvmsg(sk, &msg, len, flags, &addr_len);
 	}
 }
 
 /* One sendmsg from base[0..len); flags travel in msg_flags (MSG_DONTWAIT). */
-static int sock_send_one(struct fd_cache_entry *e, void *base, size_t len, int flags)
+static int sock_send_one(struct sock *sk, enum fd_io_kind kind, void *base, size_t len, int flags)
 {
 	struct msghdr msg = { .msg_flags = flags };
 
 	iov_iter_ubuf(&msg.msg_iter, ITER_SOURCE, base, len);
 
-	switch (e->kind) {
+	switch (kind) {
 	case FD_IO_TCP:
-		return tcp_sendmsg(e->sk, &msg, len);
+		return tcp_sendmsg(sk, &msg, len);
 	case FD_IO_UDP:
-		return udp_sendmsg(e->sk, &msg, len);
+		return udp_sendmsg(sk, &msg, len);
 	default:
-		return e->sk->sk_prot->sendmsg(e->sk, &msg, len);
+		return sk->sk_prot->sendmsg(sk, &msg, len);
 	}
 }
 
-static void try_read(struct event_manager *mgr, struct up_event *evt)
+static void try_read(struct event_anchor *anchor)
 {
-	struct fd_cache_entry *e;
-	struct file *file;
+	struct up_event *evt = &anchor->event;
+	struct file *file = anchor->file;
 	struct kiocb kiocb;
 	struct iov_iter iter;
 	struct iovec iov;
 	size_t cursor = 0;
 	int flags, ret;
 
-	e = fdcache_get(mgr, evt->fd);
-	if (!e) {
+	if (!file) {
 		evt->result = -EBADF;
 		return;
 	}
-	file = e->file;
 
 	get_buffer(&iov);
 	if (iov.iov_base == NULL) {
@@ -763,12 +794,13 @@ static void try_read(struct event_manager *mgr, struct up_event *evt)
 	init_sync_kiocb(&kiocb, file);
 
 	while (cursor < iov.iov_len) {
-		if (e->kind == FD_IO_NONSOCK) {
+		if (anchor->kind == FD_IO_NONSOCK) {
 			iov_iter_ubuf(&iter, ITER_DEST, iov.iov_base + cursor,
 				      iov.iov_len - cursor);
 			ret = file->f_op->read_iter(&kiocb, &iter);
 		} else {
-			ret = sock_recv_one(e, iov.iov_base + cursor,
+			ret = sock_recv_one(anchor->sk, anchor->kind,
+					    iov.iov_base + cursor,
 					    iov.iov_len - cursor, flags);
 		}
 
@@ -785,22 +817,20 @@ static void try_read(struct event_manager *mgr, struct up_event *evt)
 	evt->result = cursor;
 }
 
-static void try_write(struct event_manager *mgr, struct up_event *evt)
+static void try_write(struct event_anchor *anchor)
 {
-	struct fd_cache_entry *e;
-	struct file *file;
+	struct up_event *evt = &anchor->event;
+	struct file *file = anchor->file;
 	struct kiocb kiocb;
 	struct iov_iter iter;
 	struct iovec iov;
 	size_t cursor = 0;
 	int flags, ret;
 
-	e = fdcache_get(mgr, evt->fd);
-	if (!e) {
+	if (!file) {
 		evt->result = -EBADF;
 		return;
 	}
-	file = e->file;
 
 	iov.iov_base = evt->buf;
 	iov.iov_len = evt->len;
@@ -809,12 +839,13 @@ static void try_write(struct event_manager *mgr, struct up_event *evt)
 	init_sync_kiocb(&kiocb, file);
 
 	while (cursor < iov.iov_len) {
-		if (e->kind == FD_IO_NONSOCK) {
+		if (anchor->kind == FD_IO_NONSOCK) {
 			iov_iter_ubuf(&iter, ITER_SOURCE, iov.iov_base + cursor,
 				      iov.iov_len - cursor);
 			ret = file->f_op->write_iter(&kiocb, &iter);
 		} else {
-			ret = sock_send_one(e, iov.iov_base + cursor,
+			ret = sock_send_one(anchor->sk, anchor->kind,
+					    iov.iov_base + cursor,
 					    iov.iov_len - cursor, flags);
 		}
 
@@ -837,8 +868,7 @@ static void try_accept(struct up_event *evt)
 
 static __poll_t upcall_item_poll(struct event_anchor *anchor, __poll_t events)
 {
-	struct fd_cache_entry *e = fdcache_get(anchor->mgr, anchor->event->fd);
-	struct file *file = e ? e->file : NULL;
+	struct file *file = anchor->file;
 	poll_table *pt = &anchor->pt;
 	__poll_t res;
 
@@ -858,7 +888,7 @@ static void mark_handled_events(struct event_manager *mgr, unsigned int cnt)
 
 	local_irq_save(flags);
 	channel = get_event_channel(mgr);
-	scoped_guard(spinlock, &channel->wakeup_lock) {
+	scoped_guard(spinlock, &channel->event_lock) {
 		channel->event_count -= cnt;
 	}
 	local_irq_restore(flags);
@@ -872,8 +902,8 @@ static struct event_anchor *get_next_wakeup(struct event_manager *mgr)
 
 	local_irq_save(flags);
 	channel = get_event_channel(mgr);
-	scoped_guard(spinlock, &channel->wakeup_lock) {
-		anchor = list_first_entry_or_null(&channel->wakeups, struct event_anchor, anchor);
+	scoped_guard(spinlock, &channel->event_lock) {
+		anchor = list_first_entry_or_null(&channel->event_list, struct event_anchor, anchor);
 		if (!anchor)
 			goto out;
 		list_del_init(&anchor->anchor);
@@ -898,14 +928,14 @@ static void worker_sleep(struct event_manager *mgr)
 
 	spin_lock(&channel->worker_lock);
 	/* Double-check under lock: may have raced with a delivered event. */
-	spin_lock(&channel->wakeup_lock);
+	spin_lock(&channel->event_lock);
 	if (channel->event_count > 0) {
-		spin_unlock(&channel->wakeup_lock);
+		spin_unlock(&channel->event_lock);
 		spin_unlock(&channel->worker_lock);
 		local_irq_restore(flags);
 		goto out;
 	}
-	spin_unlock(&channel->wakeup_lock);
+	spin_unlock(&channel->event_lock);
 
 	list_add(&current->worker_context->anchor, &channel->sleeping_workers);
 	set_current_state(TASK_INTERRUPTIBLE);
@@ -965,18 +995,94 @@ static void anchor_pool_put(struct event_anchor *anchor)
 		kmem_cache_free(anchor_cache, anchor);
 }
 
-/* kref release: recycle to the per-CPU pool. Only reached from task context
- * (attach_poll / the drain loop), where the pool is safe to touch. */
-static void anchor_release_pool(struct kref *kref)
+static inline unsigned int anchor_bucket(int fd)
 {
-	anchor_pool_put(container_of(kref, struct event_anchor, refs));
+	return hash_32((u32)fd, UPCALL_ANCHOR_HASH_BITS);
 }
 
-/* kref release: free straight to the slab. Used by drop_anchor(), which is
- * softirq-reachable and must not touch the per-CPU pool. */
-static void anchor_release_slab(struct kref *kref)
+static void anchor_insert(struct event_manager *mgr, struct event_anchor *anchor)
 {
-	kmem_cache_free(anchor_cache, container_of(kref, struct event_anchor, refs));
+	unsigned long flags;
+
+	spin_lock_irqsave(&mgr->anchor_lock, flags);
+	hlist_add_head(&anchor->hash_node,
+		       &mgr->anchor_hash[anchor_bucket(anchor->event.fd)]);
+	spin_unlock_irqrestore(&mgr->anchor_lock, flags);
+}
+
+/* Find the live anchor for (fd,type) and take a reference so the caller can use
+ * it safely against a concurrent close that drops the subscription ref. Caller
+ * must kref_put(anchor_release_pool) when done. */
+static struct event_anchor *anchor_lookup(struct event_manager *mgr,
+					  int fd, int type)
+{
+	struct event_anchor *a;
+	unsigned long flags;
+	struct event_anchor *found = NULL;
+
+	spin_lock_irqsave(&mgr->anchor_lock, flags);
+	hlist_for_each_entry(a, &mgr->anchor_hash[anchor_bucket(fd)], hash_node) {
+		if (a->event.fd == fd && a->event.type == type) {
+			kref_get(&a->refs);
+			found = a;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&mgr->anchor_lock, flags);
+	return found;
+}
+
+/*
+ * Tear down every (fd, *) subscription at UP_CLOSE, before close_fd() drops the
+ * fd. Under anchor_lock, mark each matching anchor DEAD (this gates
+ * handle_poll_event's ARMED->QUEUED claim, so no new event posts, and makes the
+ * drain suppress any event already in flight) and unhash it, re-chaining it onto
+ * a local list via the now-free hash_node. After dropping the lock -- so we are
+ * not under the waker's whead->lock -- detach from the wait queue and drop the
+ * subscription ref. A queued ref may still keep the anchor alive until a
+ * draining worker sees DEAD and releases it; the last ref frees it.
+ */
+static void close_fd_anchors(struct event_manager *mgr, int fd)
+{
+	struct event_anchor *a;
+	struct hlist_node *tmp;
+	unsigned long flags;
+	HLIST_HEAD(dying);
+
+	spin_lock_irqsave(&mgr->anchor_lock, flags);
+	hlist_for_each_entry_safe(a, tmp,
+				  &mgr->anchor_hash[anchor_bucket(fd)], hash_node) {
+		if (a->event.fd != fd)
+			continue;
+		atomic_set(&a->state, ANCHOR_DEAD);
+		hlist_del(&a->hash_node);
+		hlist_add_head(&a->hash_node, &dying);
+	}
+	spin_unlock_irqrestore(&mgr->anchor_lock, flags);
+
+	hlist_for_each_entry_safe(a, tmp, &dying, hash_node) {
+		hlist_del(&a->hash_node);
+		if (a->whead)
+			remove_wait_queue(a->whead, &a->wait);
+		kref_put(&a->refs, anchor_release_pool);	/* drop subscription ref */
+	}
+}
+
+/*
+ * Final free, once both refs (subscription + any queued) are gone. The closer
+ * (close_fd_anchors / manager teardown) has already removed the anchor from the
+ * hash and the wait queue before the last ref could drop, so there is no hash
+ * work here. Runs in task context (drain or UP_CLOSE), so the per-CPU pool and
+ * put_mgr()'s possible free_manager() are both safe.
+ */
+static void anchor_release_pool(struct kref *kref)
+{
+	struct event_anchor *anchor = container_of(kref, struct event_anchor, refs);
+
+	put_mgr(anchor->mgr);
+	if (anchor->file)
+		fput(anchor->file);
+	anchor_pool_put(anchor);
 }
 
 static struct event_anchor *build_anchor(struct event_manager *mgr, struct up_event *evt)
@@ -990,22 +1096,41 @@ static struct event_anchor *build_anchor(struct event_manager *mgr, struct up_ev
 		// Not sure what to do here, needs thinking
 		return NULL;
 	}
-	anchor->event = evt;
+	anchor->event = *evt;	/* embedded copy; input stays owned by the caller */
+
+	/* The anchor owns its own file reference for its entire lifetime, so the
+	 * drain path (try_*) and poll can use anchor->file/sk without racing a
+	 * concurrent fdcache invalidate/close. fput happens at anchor release. */
+	anchor->file = fget(evt->fd);
+	if (!anchor->file) {
+		kmem_cache_free(anchor_cache, anchor);
+		return NULL;
+	}
+	{
+		struct socket *sock = sock_from_file(anchor->file);
+
+		if (sock && sock->sk) {
+			anchor->sk = sock->sk;
+			anchor->kind = classify_sk(sock->sk);
+		} else {
+			anchor->sk = NULL;
+			anchor->kind = FD_IO_NONSOCK;
+		}
+	}
+
 	INIT_LIST_HEAD(&anchor->anchor);
 	INIT_LIST_HEAD(&anchor->wait.entry);
+	anchor->whead = NULL;	/* set by upcall_poll_init; keeps the close guard honest */
 	anchor->mgr = mgr;
 	kref_get(&mgr->ref_count);
-	atomic_set(&anchor->armed, 1);
+	atomic_set(&anchor->state, ANCHOR_ARMED);
 	/*
-	 * Two lifetime references: one for the arming path (attach_poll, dropped
-	 * when it returns) and one for the event itself (dropped when the event
-	 * is delivered by the drain, or discarded by drop_anchor).  The anchor is
-	 * recycled only when both are gone, so attach_poll's armed-arbitration can
-	 * never touch an anchor that the async path already completed and another
-	 * worker recycled.  kref_init() gives the first ref; kref_get() the second.
+	 * One "subscription" reference: the anchor lives from first subscribe
+	 * until teardown (UP_CLOSE / manager exit, stage 5). Delivery moves it to
+	 * IDLE and re-arm back to ARMED -- it is never recycled per event.
 	 */
 	kref_init(&anchor->refs);
-	kref_get(&anchor->refs);
+	anchor_insert(mgr, anchor);
 	return anchor;
 }
 
@@ -1032,33 +1157,48 @@ static void attach_buffers(uint64_t cnt, struct iovec __user *bufs)
 static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t rdw)
 {
 	struct event_anchor *anchor;
-	int armed;
 
-	anchor = build_anchor(mgr, evt);
-	if (!anchor) {
-		return -ENOMEM;
+	/* Re-arm an existing (fd,type) subscription if one is live. anchor_lookup
+	 * returns with a reference held; drop it before returning. */
+	anchor = anchor_lookup(mgr, evt->fd, evt->type);
+	if (anchor) {
+		int rc = 0;
+
+		/* Valid only from IDLE: a non-IDLE anchor is still armed or has an
+		 * event in flight, so refreshing its payload would race the drain. */
+		if (atomic_read(&anchor->state) != ANCHOR_IDLE) {
+			rc = -EBUSY;
+		} else {
+			/* Refresh payload while IDLE (no concurrent reader), then
+			 * publish ARMED (the cmpxchg is the release) so a claimer
+			 * sees it whole. */
+			anchor->event = *evt;
+			if (atomic_cmpxchg(&anchor->state, ANCHOR_IDLE, ANCHOR_ARMED) != ANCHOR_IDLE) {
+				rc = -EBUSY;	/* raced a teardown; drop the re-arm */
+			} else if (vfs_poll(anchor->file, NULL) & anchor->events) {
+				/* Re-check readiness WITHOUT re-adding to the wait
+				 * queue (already registered): vfs_poll(file, NULL)
+				 * polls without poll_wait(). Closes the
+				 * delivered-then-ready-before-rearm stranding window. */
+				if (anchor_claim(anchor))
+					post_event(anchor);
+			}
+		}
+		kref_put(&anchor->refs, anchor_release_pool);	/* drop lookup ref */
+		return rc;
 	}
+
+	/* First subscribe: build, register on the wait queue, post if ready. */
+	anchor = build_anchor(mgr, evt);
+	if (!anchor)
+		return -ENOMEM;
 
 	init_poll_funcptr(&anchor->pt, upcall_poll_init);
 	if (upcall_item_poll(anchor, rdw | EPOLLERR | EPOLLHUP | EPOLLPRI)) {
-		armed = atomic_dec_return(&anchor->armed);
-		if (!armed) {
-			/* whead is NULL if the poll op never called poll_wait()
-			 * (e.g. DEFAULT_POLLMASK files) -- nothing to remove. */
-			if (anchor->whead)
-				remove_wait_queue(anchor->whead, &anchor->wait);
+		/* Stays on the wait queue (persistent); the claim gates posting. */
+		if (anchor_claim(anchor))
 			post_event(anchor);
-		}
 	}
-
-	/*
-	 * Drop the arming-path reference.  Until here we held a ref, so no drain
-	 * worker could recycle the anchor out from under the armed dec above.  If
-	 * the event is already done (drained/dropped), this recycles it; else it
-	 * stays alive for the async wakeup path.  Must be last -- `anchor` may be
-	 * freed the instant kref_put() drops the final reference.
-	 */
-	kref_put(&anchor->refs, anchor_release_pool);
 
 	return 0;
 }
@@ -1071,9 +1211,10 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t
  * nothing (out_cnt == 0).
  */
 static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
-		struct up_event **in, int out_cnt, struct up_event **out)
+		struct up_event **in, int out_cnt, struct up_event *out)
 {
 	unsigned int out_idx = 0;
+	unsigned int drained = 0;	/* anchors popped off the channel this call */
 	int ret = 0;
 	int last_fd = -1;
 	int presleep_fd = -1;		/* first readable arm: queue to poll before sleeping */
@@ -1082,10 +1223,10 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 	struct event_anchor *anchor;
 
 	for (int i = 0; i < in_cnt; i++) {
+		ret = 0;
 		switch (in[i]->type) {
 		case UP_VEC:
 			attach_buffers(in[i]->len, (struct iovec*)in[i]->buf);
-			kmem_cache_free(event_cache, in[i]);
 			break;
 
 		case UP_ACCEPT:
@@ -1102,17 +1243,28 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 			break;
 
 		case UP_CLOSE:
+			close_fd_anchors(mgr, in[i]->fd);
 			fdcache_invalidate(mgr, in[i]->fd);
 			ret = close_fd(in[i]->fd);
 			break;
 
 		default:
-			return -EINVAL;
+			ret = -EINVAL;
+			break;
 		};
-		in[i] = NULL;
+		/* build_anchor() copied the event; the input array stays owned by
+		 * the syscall wrapper, which frees every kitems[] entry uniformly. */
 
-		if (ret)
-			return ret;
+		/* A failed arm is terminal for that input: report it as a completion
+		 * carrying the errno (result < 0) so the app learns exactly which
+		 * input failed, rather than aborting the whole batch on the first
+		 * error. Written in the arm phase, before any drained completion, so
+		 * errors take the out[] slots ahead of ready events. */
+		if (ret < 0 && out_idx < out_cnt) {
+			out[out_idx] = *in[i];
+			out[out_idx].result = ret;
+			out_idx++;
+		}
 	}
 
 again:
@@ -1120,31 +1272,43 @@ again:
 		anchor = get_next_wakeup(mgr);
 		if (!anchor)
 			break;
+		drained++;	/* popped off the channel; event_count owes a decrement */
 
-		switch (anchor->event->type) {
+		/* Closing: a concurrent UP_CLOSE marked it DEAD. Suppress -- no I/O,
+		 * no delivery -- and drop the queued ref (may free it now). */
+		if (atomic_read(&anchor->state) == ANCHOR_DEAD) {
+			kref_put(&anchor->refs, anchor_release_pool);
+			continue;
+		}
+
+		switch (anchor->event.type) {
 		case UP_READ:
-			try_read(mgr, anchor->event);
+			try_read(anchor);
 			break;
 		case UP_WRITE:
-			try_write(mgr, anchor->event);
+			try_write(anchor);
 			break;
 		case UP_ACCEPT:
-			try_accept(anchor->event);
+			try_accept(&anchor->event);
 			break;
 		default:
+			kref_put(&anchor->refs, anchor_release_pool);
+			mark_handled_events(mgr, drained);
 			return -EINVAL;
 		}
-		out[out_idx] = anchor->event;
-		last_fd = anchor->event->fd;
-		out_idx++;
-		put_mgr(mgr);
-		/* Drop the event reference; recycled once the arming path is done
-		 * with the anchor too. */
-		kref_put(&anchor->refs, anchor_release_pool);
+		/* Deliver iff still ours: QUEUED -> IDLE. A close that raced in
+		 * during try_* set DEAD, so the cmpxchg fails and we suppress the
+		 * now-stale event. Copy out by value before dropping the ref. */
+		if (atomic_cmpxchg(&anchor->state, ANCHOR_QUEUED, ANCHOR_IDLE) == ANCHOR_QUEUED) {
+			out[out_idx] = anchor->event;
+			last_fd = anchor->event.fd;
+			out_idx++;
+		}
+		kref_put(&anchor->refs, anchor_release_pool);	/* drop queued ref */
 	}
 
 	if (!polled && out_idx > 0 && (size_t)out_idx < mgr->napi_poll_threshold) {
-		struct fd_cache_entry *e = fdcache_get(mgr, last_fd);
+		struct filep_cache *e = fdcache_get(mgr, last_fd);
 		struct sock *sk = e ? e->sk : NULL;
 
 		polled = true;
@@ -1169,7 +1333,7 @@ again:
 		 * per sleep attempt (presleep_polled), then actually sleep.
 		 */
 		if (!presleep_polled && presleep_fd >= 0) {
-			struct fd_cache_entry *e = fdcache_get(mgr, presleep_fd);
+			struct filep_cache *e = fdcache_get(mgr, presleep_fd);
 			struct sock *sk = e ? e->sk : NULL;
 
 			presleep_polled = true;
@@ -1187,7 +1351,10 @@ again:
 		goto again;
 	}
 
-	mark_handled_events(mgr, out_idx);
+	/* Decrement by anchors actually dequeued, not out_idx: the latter also
+	 * counts arm-phase error reports (never on the channel) and omits
+	 * DEAD-skipped / suppressed pops (dequeued but not delivered). */
+	mark_handled_events(mgr, drained);
 
 	return out_idx;
 }
@@ -1228,11 +1395,12 @@ static void free_manager(struct event_manager *mgr)
 
 	/* Release any fds this manager never got an explicit UP_CLOSE for
 	 * (app exit without draining every connection). */
-	for (unsigned int i = 0; i < mgr->fd_cache_size; i++) {
-		if (mgr->fd_cache[i].file)
-			fput(mgr->fd_cache[i].file);
+	for (unsigned int i = 0; i < mgr->filer_cache_sz; i++) {
+		if (mgr->filep_cache[i].file)
+			fput(mgr->filep_cache[i].file);
 	}
-	vfree(mgr->fd_cache);
+	vfree(mgr->filep_cache);
+	kfree(mgr->anchor_hash);
 
 	upcall_mgr_debugfs_del(mgr);	/* blocks readers before we free place_stats */
 	upcall_place_stats_free(mgr);
@@ -1245,11 +1413,70 @@ static void free_manager_kref(struct kref *kref)
 	free_manager(mgr);
 }
 
+/*
+ * Manager teardown. Runs from the upcall fd's .release, so no new upcall_submit
+ * can start and -- because the syscall holds the fd across its whole run -- none
+ * is mid-drain. Reclaims every anchor the app never UP_CLOSE'd, plus any event
+ * still queued on a channel that no worker drained. Each anchor holds a mgr ref
+ * (build_anchor), so this MUST precede the base-ref put below: free_manager
+ * cannot run until these releases drop the last anchor's mgr ref.
+ *
+ * Phase A fences softirqs (set DEAD so handle_poll_event's claim fails, then
+ * remove_wait_queue) and drops the subscription ref. Phase B, now that every
+ * anchor is off its wait queue and DEAD (so no post can arrive), drops the
+ * queued refs left on the channel lists. An anchor holding both refs is freed
+ * by whichever drop is last.
+ */
+static void teardown_anchors(struct event_manager *mgr)
+{
+	struct event_anchor *a;
+	struct hlist_node *tmp;
+	unsigned long flags;
+	HLIST_HEAD(dying);
+
+	spin_lock_irqsave(&mgr->anchor_lock, flags);
+	for (unsigned int b = 0; b < UPCALL_ANCHOR_HASH_SZ; b++) {
+		hlist_for_each_entry_safe(a, tmp, &mgr->anchor_hash[b], hash_node) {
+			atomic_set(&a->state, ANCHOR_DEAD);
+			hlist_del(&a->hash_node);
+			hlist_add_head(&a->hash_node, &dying);
+		}
+	}
+	spin_unlock_irqrestore(&mgr->anchor_lock, flags);
+
+	hlist_for_each_entry_safe(a, tmp, &dying, hash_node) {
+		hlist_del(&a->hash_node);
+		if (a->whead)
+			remove_wait_queue(a->whead, &a->wait);
+		kref_put(&a->refs, anchor_release_pool);	/* subscription ref */
+	}
+
+	for (int cpu = 0; cpu < NR_CPUS; cpu++) {
+		struct event_channel *chan = mgr->channels[cpu];
+
+		if (!chan)
+			continue;
+		for (;;) {
+			spin_lock_irqsave(&chan->event_lock, flags);
+			a = list_first_entry_or_null(&chan->event_list,
+						     struct event_anchor, anchor);
+			if (a)
+				list_del_init(&a->anchor);
+			spin_unlock_irqrestore(&chan->event_lock, flags);
+			if (!a)
+				break;
+			kref_put(&a->refs, anchor_release_pool);	/* queued ref */
+		}
+	}
+}
+
 static int upcall_tear_down(struct inode *inode, struct file *file)
 {
 	struct event_manager *mgr = file->private_data;
-	if (mgr)
+	if (mgr) {
+		teardown_anchors(mgr);
 		kref_put(&mgr->ref_count, free_manager_kref);
+	}
 	return 0;
 }
 
@@ -1270,12 +1497,27 @@ static inline void clean_kitems(int count, struct up_event **kitems)
 	}
 }
 
+static struct event_channel *create_channel(void)
+{
+	struct event_channel *ret = kzalloc(sizeof(struct event_channel), GFP_KERNEL);
+
+	if (!ret)
+		return ret;
+
+	INIT_LIST_HEAD(&ret->event_list);
+	INIT_LIST_HEAD(&ret->sleeping_workers);
+	spin_lock_init(&ret->event_lock);
+	spin_lock_init(&ret->worker_lock);
+
+	return ret;
+}
+
 SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *, in,
 		int, out_cnt, struct up_event __user *, output)
 {
 	struct event_manager *mgr = NULL;
 	struct up_event **kitems = NULL;
-	struct up_event **koutput = NULL;
+	struct up_event *koutput = NULL;
 	int ret = -EINVAL;
 	int cnt;
 	struct worker_context *ctx;
@@ -1300,7 +1542,7 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 	kitems = kzalloc(sizeof(struct up_event *) * in_cnt, GFP_KERNEL);
 	if (!kitems)
 		goto out;
-	koutput = kzalloc(sizeof(struct up_event *) * out_cnt, GFP_KERNEL);
+	koutput = kzalloc(sizeof(struct up_event) * out_cnt, GFP_KERNEL);
 	if (!koutput)
 		goto out_free;
 
@@ -1318,6 +1560,10 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 		local_irq_save(flags);
 		reg_cpu = smp_processor_id();
 		reg_channel = mgr->channels[reg_cpu];
+		if (!reg_channel) {
+			reg_channel = create_channel();
+			mgr->channels[reg_cpu] = reg_channel;
+		}
 		spin_lock(&reg_channel->worker_lock);
 		/* Assumes one worker thread per CPU. If a second task ever registers
 		 * here, this slot already belongs to the first, so this ctx never
@@ -1369,7 +1615,7 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 	cnt = do_upcall_submit(mgr, in_cnt, kitems, out_cnt, koutput);
 
 	for (int i = 0; i < out_cnt && i < cnt; i++) {
-		if (copy_to_user(&output[i], koutput[i], sizeof(struct up_event))) {
+		if (copy_to_user(&output[i], &koutput[i], sizeof(struct up_event))) {
 			ret = -EFAULT;
 			goto out_clean;
 		}
@@ -1377,27 +1623,14 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 
 	ret = cnt;
 out_clean:
-	clean_kitems(cnt, koutput);
+	/* Inputs are copied into anchors by build_anchor(), never transferred,
+	 * so free every input event here. koutput is a plain value buffer. */
+	clean_kitems(in_cnt, kitems);
 out_free:
 	kfree(kitems);
 	kfree(koutput);
 out:
 	upcall_submit_time_end(t0);
-	return ret;
-}
-
-static struct event_channel *create_channel(void)
-{
-	struct event_channel *ret = kzalloc(sizeof(struct event_channel), GFP_KERNEL);
-
-	if (!ret)
-		return ret;
-
-	INIT_LIST_HEAD(&ret->wakeups);
-	INIT_LIST_HEAD(&ret->sleeping_workers);
-	spin_lock_init(&ret->wakeup_lock);
-	spin_lock_init(&ret->worker_lock);
-
 	return ret;
 }
 
@@ -1410,18 +1643,17 @@ static struct event_manager *create_manager(void)
 	if (!mgr)
 		return mgr;
 
-	for_each_online_cpu(i) {
-		mgr->channels[i] = create_channel();
-		if (!mgr->channels[i])
-			goto out_free;
-		mgr->channels[i]->cpu = i;
-	}
-
 	/* An fd beyond this just falls back to uncached (-EBADF). */
-	mgr->fd_cache_size = FD_CACHE_SIZE;
-	mgr->fd_cache = vzalloc(mgr->fd_cache_size * sizeof(struct fd_cache_entry));
-	if (!mgr->fd_cache)
+	mgr->filer_cache_sz = FD_CACHE_SIZE;
+	mgr->filep_cache = vzalloc(mgr->filer_cache_sz * sizeof(struct filep_cache));
+	if (!mgr->filep_cache)
 		goto out_free;
+
+	mgr->anchor_hash = kcalloc(UPCALL_ANCHOR_HASH_SZ, sizeof(struct hlist_head),
+				   GFP_KERNEL);
+	if (!mgr->anchor_hash)
+		goto out_free;
+	spin_lock_init(&mgr->anchor_lock);
 
 	if (!upcall_place_stats_alloc(mgr))
 		goto out_free;
@@ -1436,7 +1668,8 @@ out_free:
 	for_each_online_cpu(i) {
 		kfree(mgr->channels[i]);
 	}
-	vfree(mgr->fd_cache);
+	vfree(mgr->filep_cache);
+	kfree(mgr->anchor_hash);
 	upcall_place_stats_free(mgr);
 	kfree(mgr);
 	return NULL;
