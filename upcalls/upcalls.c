@@ -51,7 +51,10 @@ struct event_channel {
 	/* Used to measure available slots in the next trip to userspace */
 	size_t			event_count;
 	uint32_t		cpu;
-	uint8_t			pad[12];
+	/* napi_id of the RX ring that last delivered to this channel; the
+	 * busy-poll target in do_upcall_submit() (0 == none seen yet). */
+	uint32_t		napi_id;
+	uint8_t			pad[8];
 };
 /* Pad to a cacheline so each channel's hot event_lock/event_count don't
  * share a line with an adjacent channel's allocation. Only holds for the
@@ -60,8 +63,8 @@ struct event_channel {
 static_assert(sizeof(struct event_channel) == 64);
 
 /*
- * How to run read/write on a cached fd. Resolved once when the fd is first
- * cached (see fdcache_get) so the hot path skips the read()/write() demux
+ * How to run read/write on a socket fd. Resolved once when an anchor is first
+ * built (see build_anchor) so the hot path skips the read()/write() demux
  * (fdget -> f_op->read_iter -> LSM -> ops->recvmsg -> sk_prot->recvmsg) and
  * calls the protocol endpoint directly. TCP/UDP get a direct (retpoline-free)
  * call; any other socket goes through sk_prot; a non-socket fd falls back to
@@ -72,12 +75,6 @@ enum fd_io_kind {
 	FD_IO_TCP,
 	FD_IO_UDP,
 	FD_IO_SOCK_OTHER,	/* socket, but not TCP/UDP -- via sk->sk_prot */
-};
-
-struct filep_cache {
-	struct file	*file;	/* borrowed ref; slot empty when NULL */
-	struct sock	*sk;	/* set before file is published; NULL if non-socket */
-	enum fd_io_kind	kind;
 };
 
 #ifdef CONFIG_UPCALLS_STATS
@@ -109,10 +106,6 @@ struct event_manager {
 	/* Below this completion count, do one NAPI poll budget before returning. */
 	size_t			napi_poll_threshold;
 	int			id;		/* small stable id for observability */
-	/* fd -> cached {file, sk, io kind}; entries only clear via UP_CLOSE,
-	 * the only path that closes an fd this manager touches. */
-	struct filep_cache	*filep_cache;
-	unsigned int		filer_cache_sz;
 	/* (fd,type) -> live event_anchor, for re-arm find-or-create and teardown. */
 	struct hlist_head	*anchor_hash;
 	spinlock_t		anchor_lock;
@@ -222,11 +215,50 @@ static inline void upcall_submit_time_end(u64 t0) { }
 #endif
 
 /*
+ * Per-anchor forensic ring for the claim/enqueue/dequeue/deliver lifecycle --
+ * added to catch a reproducible lost-wakeup strand (an anchor stuck QUEUED
+ * with its owning worker parked forever) that static review couldn't pin
+ * down. A single global ring was tried first and discarded: one busy channel
+ * drowns it before a rarer stuck anchor's history survives to be read. Each
+ * anchor instead keeps its own small ring, so a stuck anchor's history is
+ * never overwritten by traffic on any other anchor or channel. Only
+ * claim/enqueue/dequeue/deliver/re-arm are recorded -- these are the events
+ * that have a specific anchor to attach to; channel-level wake/park events
+ * don't and are left to each task's wchan (under /proc) and the owners/
+ * anchors dumps. The enum is declared unconditionally so call sites don't
+ * need their own #ifdef;
+ * only the ring itself (and the recording work) is compiled out when
+ * disabled.
+ */
+enum anchor_trace_ev {
+	ANCHOR_TR_CLAIM,	/* ARMED->QUEUED claim won (any of the 3 sites) */
+	ANCHOR_TR_ENQUEUE,	/* post_event added anchor to target's event_list */
+	ANCHOR_TR_DEQUEUE,	/* get_next_wakeup popped this anchor off the channel */
+	ANCHOR_TR_DEAD_SKIP,	/* drain saw DEAD, suppressed */
+	ANCHOR_TR_DELIVER,	/* QUEUED->IDLE, delivered to out[] */
+	ANCHOR_TR_REARM_BUSY,	/* attach_poll re-arm bailed with -EBUSY */
+	ANCHOR_TR_REARM_OK,	/* attach_poll re-arm published ARMED */
+};
+
+#ifdef CONFIG_UPCALLS_STATS
+#define ANCHOR_TRACE_SZ 16
+struct anchor_trace_entry {
+	u64	ts;
+	int	cpu;
+	int	ev;
+};
+#endif
+
+/*
  * Anchor lifecycle (atomic). One-shot today: the ARMED -> QUEUED claim is won
  * by exactly one poster (the wakeup callback or the arming-path poll), after
  * which the drain recycles the anchor. IDLE (delivered, awaiting re-arm) and
  * DEAD (closing) are reserved for the persistent/teardown stages.
  */
+
+/* QUEUED is probably the incorrect name for this state, it is better described as fired
+ * meaning that we have an active subscription and a notification has fired (so we don't
+ * want new ones). */
 enum anchor_state {
 	ANCHOR_ARMED,
 	ANCHOR_QUEUED,
@@ -253,7 +285,32 @@ struct event_anchor {
 	wait_queue_head_t	*whead;
 	poll_table		pt;
 	__poll_t		events;
+#ifdef CONFIG_UPCALLS_STATS
+	struct anchor_trace_entry trace[ANCHOR_TRACE_SZ];
+	atomic_t		trace_idx;
+#endif
 };
+
+/*
+ * Record one lifecycle event into anchor's own ring. Real body only exists
+ * when CONFIG_UPCALLS_STATS is enabled; call sites never need an #ifdef.
+ * trace_idx is left unzeroed across anchor_pool recycling -- the ring is
+ * read as "last N events for whatever this anchor is now", not a log scoped
+ * to one subscription, so stale entries just age out as the anchor is reused.
+ */
+#ifdef CONFIG_UPCALLS_STATS
+static inline void anchor_trace(struct event_anchor *anchor, int ev)
+{
+	unsigned int idx = (unsigned int)atomic_inc_return(&anchor->trace_idx) - 1;
+	struct anchor_trace_entry *e = &anchor->trace[idx & (ANCHOR_TRACE_SZ - 1)];
+
+	e->ts = ktime_get_mono_fast_ns();
+	e->cpu = smp_processor_id();
+	e->ev = ev;
+}
+#else
+static inline void anchor_trace(struct event_anchor *anchor, int ev) { }
+#endif
 
 struct event_buffer {
 	struct iovec		iovec;
@@ -286,9 +343,6 @@ struct anchor_pool {
 	struct event_anchor	*free[ANCHOR_POOL_CAP];
 };
 static DEFINE_PER_CPU(struct anchor_pool, anchor_pool);
-
-/* fd -> struct file* cache size; see fdcache_get() near try_read(). */
-#define FD_CACHE_SIZE 65536
 
 /* Buffer cache */
 static struct kmem_cache *buffer_cache __read_mostly;
@@ -502,9 +556,9 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 		if (!chan)
 			continue;
 		count = READ_ONCE(chan->event_count);
-		if (count > 0 && count < mgr->batch_size)
+		if ((count > 0) && (count < mgr->batch_size))
 			return chan;
-		if (count == 0 && !idle)
+		if ((count == 0) && !idle)
 			idle = chan;
 	}
 
@@ -512,7 +566,7 @@ static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
 		return idle;
 
 	cpu = cpumask_first(&mgr->guaranteed_mask);
-	if (cpu < nr_cpu_ids)
+	if (cpu < nr_cpu_ids && mgr->channels[cpu])
 		return mgr->channels[cpu];
 
 	return NULL;
@@ -589,12 +643,12 @@ static void post_event(struct event_anchor *anchor)
 		/* Chosen target was stolen between pick_target() and the lock. */
 		place_stat_lost(mgr);
 		gcpu = cpumask_first(&mgr->guaranteed_mask);
-		if (gcpu >= nr_cpu_ids) {
+		target = gcpu < nr_cpu_ids ? mgr->channels[gcpu] : NULL;
+		if (!target) {
 			local_irq_restore(flags);
 			drop_anchor(anchor);
 			return;
 		}
-		target = mgr->channels[gcpu];
 		spin_lock(&target->event_lock);
 		congested = target->event_count > mgr->spread_threshold;
 		kref_get(&anchor->refs);	/* queued ref (see above) */
@@ -603,6 +657,7 @@ static void post_event(struct event_anchor *anchor)
 		spin_unlock(&target->event_lock);
 	}
 
+	anchor_trace(anchor, ANCHOR_TR_ENQUEUE);
 	wake_owned_worker(mgr, target->cpu);
 
 	if (congested)
@@ -614,7 +669,11 @@ static void post_event(struct event_anchor *anchor)
 /* Claim the anchor for posting: exactly one caller wins ARMED -> QUEUED. */
 static inline bool anchor_claim(struct event_anchor *anchor)
 {
-	return atomic_cmpxchg(&anchor->state, ANCHOR_ARMED, ANCHOR_QUEUED) == ANCHOR_ARMED;
+	bool won = atomic_cmpxchg(&anchor->state, ANCHOR_ARMED, ANCHOR_QUEUED) == ANCHOR_ARMED;
+
+	if (won)
+		anchor_trace(anchor, ANCHOR_TR_CLAIM);
+	return won;
 }
 
 static int handle_poll_event(struct wait_queue_entry *wq_entry, unsigned mode,
@@ -651,63 +710,6 @@ static enum fd_io_kind classify_sk(struct sock *sk)
 	if (sk->sk_prot->recvmsg == udp_recvmsg)
 		return FD_IO_UDP;
 	return FD_IO_SOCK_OTHER;
-}
-
-/*
- * Returns the cache entry for fd (file reference borrowed -- callers must
- * never fput() it), or NULL. On the first lookup the fd's socket and I/O kind
- * are resolved and stored before the file pointer is published, so any reader
- * that sees entry->file also sees a consistent sk/kind. fdcache_invalidate()
- * runs before close_fd() actually closes the fd, so a lookup never observes a
- * stale pointer.
- */
-static struct filep_cache *fdcache_get(struct event_manager *mgr, int fd)
-{
-	struct filep_cache *e;
-	struct file *file, *raced;
-	struct socket *sock;
-
-	if (fd < 0 || (unsigned int)fd >= mgr->filer_cache_sz)
-		return NULL;
-
-	e = &mgr->filep_cache[fd];
-	if (smp_load_acquire(&e->file))
-		return e;
-
-	file = fget(fd);
-	if (!file)
-		return NULL;
-
-	sock = sock_from_file(file);
-	if (sock && sock->sk) {
-		e->sk = sock->sk;
-		e->kind = classify_sk(sock->sk);
-	} else {
-		e->sk = NULL;
-		e->kind = FD_IO_NONSOCK;
-	}
-
-	/* Publish file last (cmpxchg is a full barrier) so the sk/kind stores
-	 * above are visible to any reader that observes e->file. A racing filler
-	 * resolves the same fd to identical sk/kind, so the loser's stores are
-	 * harmless. */
-	raced = cmpxchg(&e->file, NULL, file);
-	if (raced)
-		fput(file);	/* someone published first; drop our extra ref */
-	return e;
-}
-
-/* Called before close_fd() so no lookup can observe a stale cached file. */
-static void fdcache_invalidate(struct event_manager *mgr, int fd)
-{
-	struct file *file;
-
-	if (fd < 0 || (unsigned int)fd >= mgr->filer_cache_sz)
-		return;
-
-	file = xchg(&mgr->filep_cache[fd].file, NULL);
-	if (file)
-		fput(file);
 }
 
 static void get_buffer(struct iovec *iov)
@@ -908,6 +910,7 @@ static struct event_anchor *get_next_wakeup(struct event_manager *mgr)
 			goto out;
 		list_del_init(&anchor->anchor);
 	}
+	anchor_trace(anchor, ANCHOR_TR_DEQUEUE);
 out:
 	local_irq_restore(flags);
 	return anchor;
@@ -1100,7 +1103,7 @@ static struct event_anchor *build_anchor(struct event_manager *mgr, struct up_ev
 
 	/* The anchor owns its own file reference for its entire lifetime, so the
 	 * drain path (try_*) and poll can use anchor->file/sk without racing a
-	 * concurrent fdcache invalidate/close. fput happens at anchor release. */
+	 * concurrent close. fput happens at anchor release. */
 	anchor->file = fget(evt->fd);
 	if (!anchor->file) {
 		kmem_cache_free(anchor_cache, anchor);
@@ -1168,6 +1171,7 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t
 		 * event in flight, so refreshing its payload would race the drain. */
 		if (atomic_read(&anchor->state) != ANCHOR_IDLE) {
 			rc = -EBUSY;
+			anchor_trace(anchor, ANCHOR_TR_REARM_BUSY);
 		} else {
 			/* Refresh payload while IDLE (no concurrent reader), then
 			 * publish ARMED (the cmpxchg is the release) so a claimer
@@ -1175,7 +1179,11 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t
 			anchor->event = *evt;
 			if (atomic_cmpxchg(&anchor->state, ANCHOR_IDLE, ANCHOR_ARMED) != ANCHOR_IDLE) {
 				rc = -EBUSY;	/* raced a teardown; drop the re-arm */
-			} else if (vfs_poll(anchor->file, NULL) & anchor->events) {
+				anchor_trace(anchor, ANCHOR_TR_REARM_BUSY);
+			} else {
+				anchor_trace(anchor, ANCHOR_TR_REARM_OK);
+			}
+			if (rc == 0 && (vfs_poll(anchor->file, NULL) & anchor->events)) {
 				/* Re-check readiness WITHOUT re-adding to the wait
 				 * queue (already registered): vfs_poll(file, NULL)
 				 * polls without poll_wait(). Closes the
@@ -1216,11 +1224,19 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 	unsigned int out_idx = 0;
 	unsigned int drained = 0;	/* anchors popped off the channel this call */
 	int ret = 0;
-	int last_fd = -1;
-	int presleep_fd = -1;		/* first readable arm: queue to poll before sleeping */
+	int presleep_fd = -1;		/* first readable arm: gate the pre-sleep poll */
 	bool polled = false;
 	bool presleep_polled = false;
 	struct event_anchor *anchor;
+	struct event_channel *my_chan;
+	unsigned long cflags;
+
+	/* This worker's own (per-cpu) channel. The worker is pinned to one cpu
+	 * for its whole life, so this stays valid across the sleeps below; it is
+	 * where we drain from and where we cache the busy-poll napi_id. */
+	local_irq_save(cflags);
+	my_chan = get_event_channel(mgr);
+	local_irq_restore(cflags);
 
 	for (int i = 0; i < in_cnt; i++) {
 		ret = 0;
@@ -1244,7 +1260,6 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 
 		case UP_CLOSE:
 			close_fd_anchors(mgr, in[i]->fd);
-			fdcache_invalidate(mgr, in[i]->fd);
 			ret = close_fd(in[i]->fd);
 			break;
 
@@ -1277,6 +1292,7 @@ again:
 		/* Closing: a concurrent UP_CLOSE marked it DEAD. Suppress -- no I/O,
 		 * no delivery -- and drop the queued ref (may free it now). */
 		if (atomic_read(&anchor->state) == ANCHOR_DEAD) {
+			anchor_trace(anchor, ANCHOR_TR_DEAD_SKIP);
 			kref_put(&anchor->refs, anchor_release_pool);
 			continue;
 		}
@@ -1300,49 +1316,52 @@ again:
 		 * during try_* set DEAD, so the cmpxchg fails and we suppress the
 		 * now-stale event. Copy out by value before dropping the ref. */
 		if (atomic_cmpxchg(&anchor->state, ANCHOR_QUEUED, ANCHOR_IDLE) == ANCHOR_QUEUED) {
+			anchor_trace(anchor, ANCHOR_TR_DELIVER);
 			out[out_idx] = anchor->event;
-			last_fd = anchor->event.fd;
+			/* Remember the RX ring that fed this channel so the busy-poll
+			 * below can target it without a separate fd->sk lookup. */
+			if (anchor->sk)
+				WRITE_ONCE(my_chan->napi_id,
+					   READ_ONCE(anchor->sk->sk_napi_id));
 			out_idx++;
+		} else {
+			/* We shouldn't ever get here, this event is on our queue and if someone else transitioned
+			it to ARMED, then they are taking events from our queue or this event was posted twice. Both
+			cases are bugs. */
+			BUG();
 		}
 		kref_put(&anchor->refs, anchor_release_pool);	/* drop queued ref */
 	}
 
+	/* Busy-poll the RX ring that last delivered to this channel (cached at
+	 * delivery above), rather than inferring it from an arbitrary fd. */
 	if (!polled && out_idx > 0 && (size_t)out_idx < mgr->napi_poll_threshold) {
-		struct filep_cache *e = fdcache_get(mgr, last_fd);
-		struct sock *sk = e ? e->sk : NULL;
+		unsigned int napi_id = READ_ONCE(my_chan->napi_id);
 
 		polled = true;
-		if (sk) {
-			unsigned int napi_id = READ_ONCE(sk->sk_napi_id);
-
-			if (napi_id_valid(napi_id))
-				napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
-		}
+		if (napi_id_valid(napi_id))
+			napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
 		goto again;
 	}
 
 	if (!out_idx && out_cnt > 0) {
 		/*
-		 * About to sleep with nothing ready. Do one busy-poll pass on the
-		 * RX queue of a connection we're waiting on (presleep_fd) first: a
-		 * packet may already be sitting in that ring unprocessed. The poll
-		 * runs the full stack, and sk_data_ready() posts any resulting event
-		 * into our channel, so the re-drain finds it and we skip the
-		 * sleep/softirq-wake round trip. napi_busy_loop polls the whole NAPI
-		 * instance, so siblings on the same queue are drained too. One pass
-		 * per sleep attempt (presleep_polled), then actually sleep.
+		 * About to sleep with nothing ready. If we armed a readable fd this
+		 * submit (presleep_fd) and we know a ring that has fed this channel,
+		 * do one busy-poll pass first: a packet may already be sitting in that
+		 * ring unprocessed. The poll runs the full stack, and sk_data_ready()
+		 * posts any resulting event into our channel, so the re-drain finds it
+		 * and we skip the sleep/softirq-wake round trip. napi_busy_loop polls
+		 * the whole NAPI instance, so siblings on the same queue are drained
+		 * too. One pass per sleep attempt (presleep_polled), then actually
+		 * sleep.
 		 */
 		if (!presleep_polled && presleep_fd >= 0) {
-			struct filep_cache *e = fdcache_get(mgr, presleep_fd);
-			struct sock *sk = e ? e->sk : NULL;
+			unsigned int napi_id = READ_ONCE(my_chan->napi_id);
 
 			presleep_polled = true;
-			if (sk) {
-				unsigned int napi_id = READ_ONCE(sk->sk_napi_id);
-
-				if (napi_id_valid(napi_id))
-					napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
-			}
+			if (napi_id_valid(napi_id))
+				napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
 			goto again;
 		}
 
@@ -1393,13 +1412,6 @@ static void free_manager(struct event_manager *mgr)
 		kfree(chan);
 	}
 
-	/* Release any fds this manager never got an explicit UP_CLOSE for
-	 * (app exit without draining every connection). */
-	for (unsigned int i = 0; i < mgr->filer_cache_sz; i++) {
-		if (mgr->filep_cache[i].file)
-			fput(mgr->filep_cache[i].file);
-	}
-	vfree(mgr->filep_cache);
 	kfree(mgr->anchor_hash);
 
 	upcall_mgr_debugfs_del(mgr);	/* blocks readers before we free place_stats */
@@ -1497,9 +1509,12 @@ static inline void clean_kitems(int count, struct up_event **kitems)
 	}
 }
 
-static struct event_channel *create_channel(void)
+/* Allocated on cpu's own node so the channel's hot lock/list cacheline is
+ * local to the CPU that will actually touch it on every event. */
+static struct event_channel *create_channel(int cpu)
 {
-	struct event_channel *ret = kzalloc(sizeof(struct event_channel), GFP_KERNEL);
+	struct event_channel *ret = kzalloc_node(sizeof(struct event_channel),
+						  GFP_KERNEL, cpu_to_node(cpu));
 
 	if (!ret)
 		return ret;
@@ -1508,6 +1523,7 @@ static struct event_channel *create_channel(void)
 	INIT_LIST_HEAD(&ret->sleeping_workers);
 	spin_lock_init(&ret->event_lock);
 	spin_lock_init(&ret->worker_lock);
+	ret->cpu = cpu;
 
 	return ret;
 }
@@ -1557,13 +1573,11 @@ SYSCALL_DEFINE5(upcall_submit, int, upfd, int, in_cnt, struct up_event __user *,
 			goto out;
 		ctx->worker = current;
 		current->worker_context = ctx;
+
 		local_irq_save(flags);
 		reg_cpu = smp_processor_id();
 		reg_channel = mgr->channels[reg_cpu];
-		if (!reg_channel) {
-			reg_channel = create_channel();
-			mgr->channels[reg_cpu] = reg_channel;
-		}
+
 		spin_lock(&reg_channel->worker_lock);
 		/* Assumes one worker thread per CPU. If a second task ever registers
 		 * here, this slot already belongs to the first, so this ctx never
@@ -1643,12 +1657,6 @@ static struct event_manager *create_manager(void)
 	if (!mgr)
 		return mgr;
 
-	/* An fd beyond this just falls back to uncached (-EBADF). */
-	mgr->filer_cache_sz = FD_CACHE_SIZE;
-	mgr->filep_cache = vzalloc(mgr->filer_cache_sz * sizeof(struct filep_cache));
-	if (!mgr->filep_cache)
-		goto out_free;
-
 	mgr->anchor_hash = kcalloc(UPCALL_ANCHOR_HASH_SZ, sizeof(struct hlist_head),
 				   GFP_KERNEL);
 	if (!mgr->anchor_hash)
@@ -1657,6 +1665,18 @@ static struct event_manager *create_manager(void)
 
 	if (!upcall_place_stats_alloc(mgr))
 		goto out_free;
+
+	/* Every online cpu gets its channel up front, NUMA-local, instead of
+	 * on that cpu's first upcall_submit() -- lazy per-thread creation left
+	 * a window where a cpu could be claimed as owned/guaranteed (acquire_core
+	 * only touches core_pool/masks) before its own worker had ever run,
+	 * leaving mgr->channels[cpu] NULL for a target post_event() could still
+	 * pick. */
+	for_each_online_cpu(i) {
+		mgr->channels[i] = create_channel(i);
+		if (!mgr->channels[i])
+			goto out_free;
+	}
 
 	kref_init(&mgr->ref_count);
 	mgr->id = atomic_inc_return(&upcall_mgr_ids);
@@ -1668,7 +1688,6 @@ out_free:
 	for_each_online_cpu(i) {
 		kfree(mgr->channels[i]);
 	}
-	vfree(mgr->filep_cache);
 	kfree(mgr->anchor_hash);
 	upcall_place_stats_free(mgr);
 	kfree(mgr);
@@ -1739,6 +1758,121 @@ static int upcall_owners_show(struct seq_file *s, void *v)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(upcall_owners);
+
+#ifdef CONFIG_UPCALLS_ANCHOR_STATS
+static const char *anchor_state_name(int st)
+{
+	switch (st) {
+	case ANCHOR_ARMED:	return "ARMED";
+	case ANCHOR_QUEUED:	return "QUEUED";
+	case ANCHOR_IDLE:	return "IDLE";
+	case ANCHOR_DEAD:	return "DEAD";
+	default:		return "?";
+	}
+}
+
+/*
+ * Print a's own lifecycle ring (see anchor_trace()), oldest first, indented
+ * under its state line in /sys/kernel/debug/upcall/anchors. Called under
+ * mgr->anchor_lock; a torn read of one entry is acceptable for a debug dump.
+ * Real body only when CONFIG_UPCALLS_STATS is enabled.
+ */
+#ifdef CONFIG_UPCALLS_STATS
+static const char *anchor_trace_ev_name(int ev)
+{
+	static const char *names[] = {
+		[ANCHOR_TR_CLAIM]	= "CLAIM",
+		[ANCHOR_TR_ENQUEUE]	= "ENQUEUE",
+		[ANCHOR_TR_DEQUEUE]	= "DEQUEUE",
+		[ANCHOR_TR_DEAD_SKIP]	= "DEAD_SKIP",
+		[ANCHOR_TR_DELIVER]	= "DELIVER",
+		[ANCHOR_TR_REARM_BUSY]	= "REARM_BUSY",
+		[ANCHOR_TR_REARM_OK]	= "REARM_OK",
+	};
+	return (ev >= 0 && ev < ARRAY_SIZE(names) && names[ev]) ? names[ev] : "?";
+}
+
+static void anchor_trace_dump(struct seq_file *s, struct event_anchor *a)
+{
+	unsigned int total = (unsigned int)atomic_read(&a->trace_idx);
+	unsigned int start = total > ANCHOR_TRACE_SZ ? total - ANCHOR_TRACE_SZ : 0;
+	unsigned int n = total - start;
+
+	for (unsigned int i = 0; i < n; i++) {
+		struct anchor_trace_entry *e = &a->trace[(start + i) & (ANCHOR_TRACE_SZ - 1)];
+
+		seq_printf(s, "    %llu cpu=%d %s\n",
+			   (unsigned long long)e->ts, e->cpu,
+			   anchor_trace_ev_name(e->ev));
+	}
+}
+#else
+static inline void anchor_trace_dump(struct seq_file *s, struct event_anchor *a) { }
+#endif
+
+/*
+ * debugfs: /sys/kernel/debug/upcall/anchors -- every live (fd,type) subscription
+ * and its state, for diagnosing stranded connections. Ungated (works without
+ * CONFIG_UPCALLS_STATS). Managers are discovered via the cores they own, so a
+ * manager owning no core is not listed; the fixed snapshot cap keeps this off a
+ * NR_CPUS-sized stack array. The anchor_lock walk below runs with IRQs off and
+ * can be long under many connections -- acceptable for a debug read.
+ */
+#define UPCALL_ANCHORS_MGR_CAP 32
+static int upcall_anchors_show(struct seq_file *s, void *v)
+{
+	struct event_manager *seen[UPCALL_ANCHORS_MGR_CAP];
+	int nseen = 0;
+	unsigned long flags;
+	int cpu, i;
+
+	spin_lock_irqsave(&core_pool.lock, flags);
+	for_each_online_cpu(cpu) {
+		struct event_manager *mgr = READ_ONCE(core_pool.owner[cpu]);
+		bool dup = false;
+
+		if (!mgr)
+			continue;
+		for (i = 0; i < nseen; i++)
+			if (seen[i] == mgr) {
+				dup = true;
+				break;
+			}
+		if (!dup && nseen < UPCALL_ANCHORS_MGR_CAP)
+			seen[nseen++] = mgr;
+	}
+	spin_unlock_irqrestore(&core_pool.lock, flags);
+
+	for (i = 0; i < nseen; i++) {
+		struct event_manager *mgr = seen[i];
+		struct event_anchor *a;
+		unsigned int b, n = 0;
+
+		seq_printf(s, "mgr %d:\n", mgr->id);
+		spin_lock_irqsave(&mgr->anchor_lock, flags);
+		for (b = 0; b < UPCALL_ANCHOR_HASH_SZ; b++)
+			hlist_for_each_entry(a, &mgr->anchor_hash[b], hash_node) {
+				seq_printf(s, "  fd %d type %d state %s wq %c\n",
+					   a->event.fd, a->event.type,
+					   anchor_state_name(atomic_read(&a->state)),
+					   a->whead ? 'y' : 'n');
+				anchor_trace_dump(s, a);
+				n++;
+			}
+		spin_unlock_irqrestore(&mgr->anchor_lock, flags);
+		seq_printf(s, "  (%u anchors)\n", n);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(upcall_anchors);
+
+static void upcall_anchors_debugfs_init(struct dentry *parent)
+{
+	debugfs_create_file("anchors", 0444, parent, NULL, &upcall_anchors_fops);
+}
+#else
+static void upcall_anchors_debugfs_init(struct dentry *parent) { }
+#endif /* CONFIG_UPCALLS_ANCHOR_STATS */
 
 #ifdef CONFIG_UPCALLS_STATS
 /* debugfs: /sys/kernel/debug/upcall/submit_ns -- whole-syscall upcall_submit()
@@ -1842,6 +1976,7 @@ static int __init upcall_init(void)
 	upcall_debugfs_dir = debugfs_create_dir("upcall", NULL);
 	debugfs_create_file("owners", 0444, upcall_debugfs_dir, NULL,
 			    &upcall_owners_fops);
+	upcall_anchors_debugfs_init(upcall_debugfs_dir);
 	upcall_stats_debugfs_init(upcall_debugfs_dir);
 
 	event_cache = kmem_cache_create("upcall_event", sizeof(struct up_event),

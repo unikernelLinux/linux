@@ -19,4 +19,15 @@ config UPCALLS_STATS
 	  per-event overhead on the submission hot path; leave disabled
 	  unless actively profiling placement.
 
+config UPCALLS_ANCHOR_STATS
+	bool "Upcall per-anchor state dump"
+	depends on UPCALLS_STATS
+	default n
+	help
+	  Expose /sys/kernel/debug/upcall/anchors, listing every live
+	  (fd,type) subscription and its state (ARMED/QUEUED/IDLE/DEAD).
+	  Diagnostic only: reading it walks every manager's anchor hash
+	  with IRQs disabled. Leave disabled unless debugging stranded
+	  subscriptions.
+
 #depends on NET_RX_BUSY_POLL
