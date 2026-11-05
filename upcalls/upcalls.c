@@ -63,6 +63,19 @@ struct event_channel {
 static_assert(sizeof(struct event_channel) == 64);
 
 /*
+ * A channel's event_list is a FIFO of these fixed-capacity batches, not a flat
+ * anchor list: the tail batch accumulates anchors until it hits batch_size
+ * (sealed) and a fresh tail starts; a drainer/hunter claims one whole batch at
+ * a time (O(1) detach). The last batch is kept resident when empty so trickle
+ * load doesn't churn the slab. Protected by the owning channel's event_lock.
+ */
+struct event_batch {
+	struct list_head	node;		/* link in channel->event_list */
+	struct list_head	anchors;	/* anchors in this batch, FIFO */
+	unsigned int		count;		/* anchors currently in `anchors` */
+};
+
+/*
  * How to run read/write on a socket fd. Resolved once when an anchor is first
  * built (see build_anchor) so the hot path skips the read()/write() demux
  * (fdget -> f_op->read_iter -> LSM -> ops->recvmsg -> sk_prot->recvmsg) and
@@ -78,11 +91,24 @@ enum fd_io_kind {
 };
 
 #ifdef CONFIG_UPCALLS_STATS
-struct upcall_place_stats {
-	u64	local;			/* placed on the local core (fast path) */
-	u64	remote_not_ours;	/* local core not owned -> spread remote */
-	u64	remote_full;		/* local core owned but full -> spread remote */
-	u64	lost;			/* target stolen between pick and enqueue */
+/*
+ * Pull-model runtime stats, per manager per cpu: this_cpu_inc on the hot path
+ * (no cross-cpu bouncing), summed/printed only at debugfs read. dwell[] is the
+ * completion-dwell histogram -- claim (ARMED->QUEUED) to in-kernel delivery
+ * (QUEUED->IDLE) -- in log2(ns) buckets.
+ */
+#define UPCALL_DWELL_BUCKETS 40
+struct upcall_stats {
+	u64	hunts_attempted;	/* hunt_batch() calls (own channel empty) */
+	u64	hunts_succeeded;	/* hunts that moved a sibling batch */
+	u64	stolen_events;		/* anchors pulled across cpus by hunts */
+	u64	seals;			/* batches filled (scale-up trigger) */
+	u64	scale_up_woke;		/* scale-up acquired a core */
+	u64	scale_up_nocore;	/* scale-up wanted a core, none free/stealable */
+	u64	local_wakes;		/* a post woke a parked local worker */
+	u64	worker_sleeps;		/* a worker parked (domain empty) */
+	u64	backstop_hits;		/* cross-domain guaranteed-core backstop fired */
+	u64	dwell[UPCALL_DWELL_BUCKETS];
 };
 #endif
 
@@ -100,67 +126,56 @@ struct event_manager {
 	struct cpumask		guaranteed_electing;	/* per-domain create-once token */
 	atomic_t		owned_count;
 	size_t			batch_size;
-	/* Kept separate from batch_size -- coupling scale-up to the placement
-	 * threshold caused a regression before. */
-	size_t			spread_threshold;
 	/* Below this completion count, do one NAPI poll budget before returning. */
 	size_t			napi_poll_threshold;
 	int			id;		/* small stable id for observability */
 	/* (fd,type) -> live event_anchor, for re-arm find-or-create and teardown. */
 	struct hlist_head	*anchor_hash;
 	spinlock_t		anchor_lock;
+	/* Per-domain hint: domain_hint[domain_id] is the set of CPUs in that
+	 * domain whose channel currently holds claimable work. Idle workers read
+	 * it to find a batch to steal (Stage 3); maintained via atomic bitops as
+	 * channels transition empty<->non-empty. Sized upcall_nr_domains. */
+	struct cpumask		*domain_hint;
 #ifdef CONFIG_UPCALLS_STATS
-	/* Placement observability: per-CPU to avoid bouncing a shared cacheline
-	 * across every posting CPU; summed only at debugfs read. */
-	struct upcall_place_stats __percpu *place_stats;
-	struct dentry		*dbg;		/* /sys/kernel/debug/upcall/managers/<id> */
+	struct upcall_stats __percpu *stats;
+	struct dentry		*dbg;	/* /sys/kernel/debug/upcall/managers/<id> */
 #endif
 };
 
 /*
- * Event placement counters: always called unconditionally from the
- * placement/submit paths; the real bodies only exist when
- * CONFIG_UPCALLS_STATS is enabled, otherwise these are no-op stubs so no
- * #ifdef is needed at any call site.
+ * Stat helpers: no-op stubs when CONFIG_UPCALLS_STATS is off, so call sites
+ * never need an #ifdef. All use this_cpu_* (preempt-safe, local cpu only).
  */
 #ifdef CONFIG_UPCALLS_STATS
-static inline void place_stat_local(struct event_manager *mgr)
-{
-	this_cpu_inc(mgr->place_stats->local);
-}
-
-static inline void place_stat_remote_full(struct event_manager *mgr)
-{
-	this_cpu_inc(mgr->place_stats->remote_full);
-}
-
-static inline void place_stat_remote_not_ours(struct event_manager *mgr)
-{
-	this_cpu_inc(mgr->place_stats->remote_not_ours);
-}
-
-static inline void place_stat_lost(struct event_manager *mgr)
-{
-	this_cpu_inc(mgr->place_stats->lost);
-}
-
-static inline bool upcall_place_stats_alloc(struct event_manager *mgr)
-{
-	mgr->place_stats = alloc_percpu(struct upcall_place_stats);
-	return mgr->place_stats != NULL;
-}
-
-static inline void upcall_place_stats_free(struct event_manager *mgr)
-{
-	free_percpu(mgr->place_stats);
-}
+static inline void stat_hunt_attempt(struct event_manager *mgr)
+{ this_cpu_inc(mgr->stats->hunts_attempted); }
+static inline void stat_hunt_success(struct event_manager *mgr, unsigned int n)
+{ this_cpu_inc(mgr->stats->hunts_succeeded); this_cpu_add(mgr->stats->stolen_events, n); }
+static inline void stat_seal(struct event_manager *mgr)
+{ this_cpu_inc(mgr->stats->seals); }
+static inline void stat_scale_up(struct event_manager *mgr, bool woke)
+{ if (woke) this_cpu_inc(mgr->stats->scale_up_woke); else this_cpu_inc(mgr->stats->scale_up_nocore); }
+static inline void stat_local_wake(struct event_manager *mgr)
+{ this_cpu_inc(mgr->stats->local_wakes); }
+static inline void stat_sleep(struct event_manager *mgr)
+{ this_cpu_inc(mgr->stats->worker_sleeps); }
+static inline void stat_backstop(struct event_manager *mgr)
+{ this_cpu_inc(mgr->stats->backstop_hits); }
+static inline bool upcall_stats_alloc(struct event_manager *mgr)
+{ mgr->stats = alloc_percpu(struct upcall_stats); return mgr->stats != NULL; }
+static inline void upcall_stats_free(struct event_manager *mgr)
+{ free_percpu(mgr->stats); }
 #else
-static inline void place_stat_local(struct event_manager *mgr) { }
-static inline void place_stat_remote_full(struct event_manager *mgr) { }
-static inline void place_stat_remote_not_ours(struct event_manager *mgr) { }
-static inline void place_stat_lost(struct event_manager *mgr) { }
-static inline bool upcall_place_stats_alloc(struct event_manager *mgr) { return true; }
-static inline void upcall_place_stats_free(struct event_manager *mgr) { }
+static inline void stat_hunt_attempt(struct event_manager *mgr) { }
+static inline void stat_hunt_success(struct event_manager *mgr, unsigned int n) { }
+static inline void stat_seal(struct event_manager *mgr) { }
+static inline void stat_scale_up(struct event_manager *mgr, bool woke) { }
+static inline void stat_local_wake(struct event_manager *mgr) { }
+static inline void stat_sleep(struct event_manager *mgr) { }
+static inline void stat_backstop(struct event_manager *mgr) { }
+static inline bool upcall_stats_alloc(struct event_manager *mgr) { return true; }
+static inline void upcall_stats_free(struct event_manager *mgr) { }
 #endif
 
 /*
@@ -288,13 +303,14 @@ struct event_anchor {
 #ifdef CONFIG_UPCALLS_STATS
 	struct anchor_trace_entry trace[ANCHOR_TRACE_SZ];
 	atomic_t		trace_idx;
+	u64			claim_ns;	/* ktime at ARMED->QUEUED, for dwell */
 #endif
 };
 
 /*
  * Record one lifecycle event into anchor's own ring. Real body only exists
  * when CONFIG_UPCALLS_STATS is enabled; call sites never need an #ifdef.
- * trace_idx is left unzeroed across anchor_pool recycling -- the ring is
+ * trace_idx is left unzeroed across anchor slab reuse -- the ring is
  * read as "last N events for whatever this anchor is now", not a log scoped
  * to one subscription, so stale entries just age out as the anchor is reused.
  */
@@ -310,6 +326,25 @@ static inline void anchor_trace(struct event_anchor *anchor, int ev)
 }
 #else
 static inline void anchor_trace(struct event_anchor *anchor, int ev) { }
+#endif
+
+#ifdef CONFIG_UPCALLS_STATS
+static inline void anchor_mark_claim(struct event_anchor *anchor)
+{ anchor->claim_ns = ktime_get_mono_fast_ns(); }
+/* Completion dwell: claim (ARMED->QUEUED) -> now (in-kernel delivery), bucketed
+ * log2(ns) on the delivering cpu. */
+static inline void stat_dwell(struct event_manager *mgr, struct event_anchor *anchor)
+{
+	u64 d = ktime_get_mono_fast_ns() - anchor->claim_ns;
+	int b = d ? ilog2(d) : 0;
+
+	if (b >= UPCALL_DWELL_BUCKETS)
+		b = UPCALL_DWELL_BUCKETS - 1;
+	this_cpu_inc(mgr->stats->dwell[b]);
+}
+#else
+static inline void anchor_mark_claim(struct event_anchor *anchor) { }
+static inline void stat_dwell(struct event_manager *mgr, struct event_anchor *anchor) { }
 #endif
 
 struct event_buffer {
@@ -330,19 +365,23 @@ static struct kmem_cache *event_cache __read_mostly;
 /* Anchor cache */
 static struct kmem_cache *anchor_cache __read_mostly;
 
+/* Batch cache (struct event_batch); allocated in the softirq enqueue path. */
+static struct kmem_cache *batch_cache __read_mostly;
+
 /*
- * Per-CPU recycle pool for event_anchor objects; build_anchor()/attach_poll()
- * reinitialize every field on reuse. Every free runs through anchor_release_pool
- * in task context (drain, UP_CLOSE, teardown) -- the softirq-reachable
- * drop_anchor() only un-claims and never frees -- so preempt-disable
- * (get_cpu_var/put_cpu_var) is enough without irq-off.
+ * Per-CPU recycle pool for event_batch objects. Batches churn at I/O rate (one
+ * per batch_size events), so pooling keeps the softirq enqueue path off the
+ * slab allocator -- and off GFP_ATOMIC -- on the common path. Touched from both
+ * the softirq enqueue (alloc) and task-context drain/teardown (free), so the
+ * pool ops disable IRQs, not just preemption. Anchors, by contrast, now churn
+ * only at file-descriptor rate and allocate straight from anchor_cache.
  */
-#define ANCHOR_POOL_CAP 64
-struct anchor_pool {
+#define BATCH_POOL_CAP 64
+struct batch_pool {
 	int			count;
-	struct event_anchor	*free[ANCHOR_POOL_CAP];
+	struct event_batch	*free[BATCH_POOL_CAP];
 };
-static DEFINE_PER_CPU(struct anchor_pool, anchor_pool);
+static DEFINE_PER_CPU(struct batch_pool, batch_pool);
 
 /* Buffer cache */
 static struct kmem_cache *buffer_cache __read_mostly;
@@ -351,11 +390,11 @@ static void free_manager_kref(struct kref *kref);
 
 /* anchor->refs release callback: recycle to the per-CPU pool. Only ever called
  * from task context (drain, UP_CLOSE, teardown), never from the softirq
- * post_event/drop_anchor path. */
-static void anchor_release_pool(struct kref *kref);
+ * post_event() path. */
+static void anchor_release(struct kref *kref);
 
-/* Per-manager debugfs (placement counters); defined with the debugfs section.
- * Always called unconditionally -- no-op stubs when stats are disabled. */
+/* Per-manager stats debugfs; defined with the debugfs section. Called
+ * unconditionally -- no-op stubs when CONFIG_UPCALLS_STATS is off. */
 static void upcall_mgr_debugfs_add(struct event_manager *mgr);
 static void upcall_mgr_debugfs_del(struct event_manager *mgr);
 
@@ -391,6 +430,45 @@ static const struct cpumask *upcall_domain_mask(int cpu)
 	if (m && cpumask_weight(m) > 1)
 		return m;
 	return cpu_online_mask;
+}
+
+/*
+ * cpu -> compact domain id, built once from topology. Done lazily at first
+ * create_manager() rather than at __initcall time, because the LLC masks are
+ * only fully populated once SMP topology is up; building too early would make
+ * upcall_domain_mask() report singletons and scatter every CPU into its own
+ * domain.
+ */
+static int upcall_cpu_domain[NR_CPUS] __read_mostly;
+static int upcall_nr_domains __read_mostly;
+static bool upcall_domains_ready __read_mostly;
+
+/* Build upcall_cpu_domain[]/upcall_nr_domains. Caller holds core_pool.lock. */
+static void upcall_build_domains(void)
+{
+	int cpu, id = 0;
+
+	if (upcall_domains_ready)
+		return;
+	for (cpu = 0; cpu < NR_CPUS; cpu++)
+		upcall_cpu_domain[cpu] = -1;
+	for_each_online_cpu(cpu) {
+		int c;
+
+		if (upcall_cpu_domain[cpu] != -1)
+			continue;	/* already folded into an earlier domain */
+		for_each_cpu(c, upcall_domain_mask(cpu))
+			upcall_cpu_domain[c] = id;
+		id++;
+	}
+	upcall_nr_domains = id;
+	smp_wmb();		/* publish the map before the ready flag */
+	upcall_domains_ready = true;
+}
+
+static inline int domain_of(int cpu)
+{
+	return upcall_cpu_domain[cpu];
 }
 
 /*
@@ -467,8 +545,19 @@ static void claim_guaranteed_core(struct event_manager *mgr, int cpu)
 	if (cpumask_test_and_set_cpu(cpumask_first(domain), &mgr->guaranteed_electing))
 		return;
 	c = acquire_core(mgr, domain);
-	if (c < 0 && atomic_read(&mgr->owned_count) == 0)
+	if (c < 0 && atomic_read(&mgr->owned_count) == 0) {
 		c = acquire_core(mgr, cpu_online_mask);
+		/* Backstop: the domain had no free/stealable core and mgr owns none,
+		 * so we grabbed one machine-wide -- possibly in another domain, which
+		 * breaks the one-guaranteed-core-per-domain model (events in this
+		 * domain would then have to cross to it). Shouldn't happen under sane
+		 * provisioning; warn once if it does. */
+		if (c >= 0) {
+			stat_backstop(mgr);
+			pr_warn_once("upcall: mgr %d claimed a guaranteed core via the machine-wide backstop (cpu %d's domain was exhausted)\n",
+				     mgr->id, cpu);
+		}
+	}
 	if (c >= 0)
 		cpumask_set_cpu(c, &mgr->guaranteed_mask);
 }
@@ -492,95 +581,23 @@ static void mark_stealable(struct event_manager *mgr, int cpu)
 	spin_unlock_irqrestore(&chan->event_lock, flags);
 }
 
-/* Wake the manager's worker on cpu if it is parked.  Caller has IRQs off. */
-static void wake_owned_worker(struct event_manager *mgr, int cpu)
+/* Wake the manager's worker on cpu if it is parked. Returns true if it woke a
+ * parked worker. Caller has IRQs off. */
+static bool wake_owned_worker(struct event_manager *mgr, int cpu)
 {
 	struct event_channel *chan = mgr->channels[cpu];
 	struct worker_context *ctx;
+	bool woke = false;
 
 	spin_lock(&chan->worker_lock);
 	ctx = mgr->pcpu_workers[cpu];
 	if (ctx && !list_empty(&ctx->anchor)) {
 		list_del_init(&ctx->anchor);
 		wake_up_process(ctx->worker);
+		woke = true;
 	}
 	spin_unlock(&chan->worker_lock);
-}
-
-/*
- * Choose an owned channel for mgr to receive an event that arrived on my_cpu.
- * Fast path: the local core, as long as it is owned and its queue depth is
- * below mgr->batch_sz. Past that, scans the domain starting at my_cpu and
- * wrapping (not always from the domain's lowest cpu), in two passes merged
- * into one loop: prefer the first owned core that already has queued work
- * and isn't full; failing that, fall back to the first owned core seen
- * sitting completely idle. If neither exists, fall back to a guaranteed
- * core (never released, always a valid target). Reads owned/guaranteed
- * masks lock-free — hint quality; post_event re-validates the chosen core's
- * ownership under its event_lock. Returns NULL only if the manager owns no
- * cores at all (pathological, fully-allocated machine).
- */
-static struct event_channel *pick_target(struct event_manager *mgr, int my_cpu)
-{
-	const struct cpumask *domain = upcall_domain_mask(my_cpu);
-	struct event_channel *idle = NULL;
-	int cpu;
-
-	if (cpumask_test_cpu(my_cpu, &mgr->owned_mask)) {
-		struct event_channel *local = mgr->channels[my_cpu];
-
-		if (local && READ_ONCE(local->event_count) < mgr->batch_size) {
-			place_stat_local(mgr);
-			return local;
-		}
-		/* Owned but full -> spread remote. */
-		place_stat_remote_full(mgr);
-	} else {
-		/* Local core isn't ours -> spread remote. */
-		place_stat_remote_not_ours(mgr);
-	}
-
-	/* First-fit, not least-loaded: a core with event_count > 0 already has
-	 * work queued (and so is very likely already running, not parked), so
-	 * placing here shouldn't need wake_owned_worker() to call
-	 * try_to_wake_up() on a remote core. Stop at the first match. Remember
-	 * the first idle owned core we pass over so we can use it instead of
-	 * the guaranteed core if the scan finds no active match. */
-	for_each_cpu_wrap(cpu, domain, my_cpu) {
-		struct event_channel *chan;
-		size_t count;
-
-		if (!cpumask_test_cpu(cpu, &mgr->owned_mask))
-			continue;
-		chan = mgr->channels[cpu];
-		if (!chan)
-			continue;
-		count = READ_ONCE(chan->event_count);
-		if ((count > 0) && (count < mgr->batch_size))
-			return chan;
-		if ((count == 0) && !idle)
-			idle = chan;
-	}
-
-	if (idle)
-		return idle;
-
-	cpu = cpumask_first(&mgr->guaranteed_mask);
-	if (cpu < nr_cpu_ids && mgr->channels[cpu])
-		return mgr->channels[cpu];
-
-	return NULL;
-}
-
-/* Only reachable when mgr owns no cores at all (fully-allocated machine). */
-static void drop_anchor(struct event_anchor *anchor)
-{
-	pr_warn_once("upcall: manager owns no cores, dropping event\n");
-	/* Persistent: keep the subscription (its refs, mgr ref, and wait-queue
-	 * entry) and just drop this event by un-claiming, so a later wakeup or
-	 * re-arm retries. Freeing here would be unsafe -- the anchor is still on
-	 * the wait queue and this path can run under the waker's lock. */
-	atomic_cmpxchg(&anchor->state, ANCHOR_QUEUED, ANCHOR_ARMED);
+	return woke;
 }
 
 /* Runs with IRQs disabled (placement context). */
@@ -589,79 +606,241 @@ static void upcall_scale_up(struct event_manager *mgr, int cpu)
 	int claimed;
 
 	if (cpumask_empty(&core_pool.free_mask) &&
-	    cpumask_empty(&core_pool.stealable_mask))
+	    cpumask_empty(&core_pool.stealable_mask)) {
+		stat_scale_up(mgr, false);
 		return;
+	}
 	claimed = acquire_core(mgr, upcall_domain_mask(cpu));
+	stat_scale_up(mgr, claimed >= 0);
 	if (claimed >= 0)
 		wake_owned_worker(mgr, claimed);
 }
 
+/* Per-CPU batch pool get/put. IRQs off (not just preempt) because batch_alloc
+ * runs in the softirq enqueue path while frees run in task context -- a softirq
+ * must not interrupt a task-context pool op on the same cpu. */
+static struct event_batch *batch_pool_get(void)
+{
+	struct batch_pool *pool;
+	struct event_batch *b = NULL;
+	unsigned long flags;
+
+	local_irq_save(flags);
+	pool = this_cpu_ptr(&batch_pool);
+	if (pool->count)
+		b = pool->free[--pool->count];
+	local_irq_restore(flags);
+	return b;
+}
+
+static void batch_pool_put(struct event_batch *b)
+{
+	struct batch_pool *pool;
+	unsigned long flags;
+	bool pooled = false;
+
+	local_irq_save(flags);
+	pool = this_cpu_ptr(&batch_pool);
+	if (pool->count < BATCH_POOL_CAP) {
+		pool->free[pool->count++] = b;
+		pooled = true;
+	}
+	local_irq_restore(flags);
+
+	if (!pooled)
+		kmem_cache_free(batch_cache, b);
+}
+
+/* Fresh empty batch, pool first then the slab (GFP_ATOMIC, softirq-callable).
+ * We bet allocation failure is unlikely; BUG() loudly for now rather than
+ * silently stranding an event (a real fallback is future work if this trips). */
+static struct event_batch *batch_alloc(void)
+{
+	struct event_batch *b = batch_pool_get();
+
+	if (!b)
+		b = kmem_cache_alloc(batch_cache, GFP_ATOMIC);
+	if (!b)
+		BUG();
+	INIT_LIST_HEAD(&b->node);
+	INIT_LIST_HEAD(&b->anchors);
+	b->count = 0;
+	return b;
+}
+
+/* Append anchor to the channel's tail batch, sealing (starting a fresh tail)
+ * when the current tail is full. A resident empty tail from a prior drain is
+ * reused. Returns true if this add filled (sealed) the tail batch -- the
+ * scale-up signal. Caller holds channel->event_lock. */
+static bool batch_add(struct event_channel *chan, struct event_anchor *anchor,
+		      unsigned int cap)
+{
+	struct event_batch *tail;
+
+	if (list_empty(&chan->event_list)) {
+		tail = batch_alloc();
+		list_add_tail(&tail->node, &chan->event_list);
+	} else {
+		tail = list_last_entry(&chan->event_list, struct event_batch, node);
+		if (tail->count == cap) {
+			tail = batch_alloc();
+			list_add_tail(&tail->node, &chan->event_list);
+		}
+	}
+	list_add_tail(&anchor->anchor, &tail->anchors);
+	tail->count++;
+	return tail->count == cap;	/* this add sealed the batch */
+}
+
+/* Pop the oldest anchor from the channel, or NULL if none remain. Frees a head
+ * batch once fully drained, except the last one -- kept as the resident empty
+ * tail so trickle load doesn't churn the slab. Caller holds channel->event_lock. */
+static struct event_anchor *batch_pop(struct event_channel *chan)
+{
+	while (!list_empty(&chan->event_list)) {
+		struct event_batch *head =
+			list_first_entry(&chan->event_list, struct event_batch, node);
+		struct event_anchor *anchor =
+			list_first_entry_or_null(&head->anchors, struct event_anchor,
+						 anchor);
+
+		if (anchor) {
+			list_del_init(&anchor->anchor);
+			head->count--;
+			return anchor;
+		}
+		if (list_is_singular(&chan->event_list))
+			return NULL;	/* keep the lone empty batch resident */
+		list_del(&head->node);
+		batch_pool_put(head);
+	}
+	return NULL;
+}
+
 /*
- * Softirq-reachable: places anchor on a target channel's wakeup queue and
- * wakes its worker. May run on a CPU this manager doesn't own (NAPI softirq
- * follows the interrupt, not mgr's ownership).
+ * Does the channel hold any claimable anchor? Structural (not event_count,
+ * which is bulk-decremented at pass end and reads stale mid-drain): the only
+ * empty batch that can be present at a lock-held observation point is a lone
+ * resident tail, so work exists unless the list is empty or a single empty
+ * batch. Caller holds channel->event_lock.
+ */
+static bool channel_has_work(struct event_channel *chan)
+{
+	struct event_batch *first;
+
+	if (list_empty(&chan->event_list))
+		return false;
+	first = list_first_entry(&chan->event_list, struct event_batch, node);
+	return !list_is_singular(&chan->event_list) || first->count > 0;
+}
+
+/* Detach the oldest batch (O(1)), or NULL if the channel has no claimable
+ * work. channel_has_work() guarantees the head is non-empty (the only empty
+ * batch that can be present is a lone resident tail). Decrements event_count by
+ * the batch's anchor count. Caller holds chan->event_lock. */
+static struct event_batch *detach_head_batch(struct event_channel *chan)
+{
+	struct event_batch *head;
+
+	if (!channel_has_work(chan))
+		return NULL;
+	head = list_first_entry(&chan->event_list, struct event_batch, node);
+	list_del(&head->node);
+	chan->event_count -= head->count;
+	return head;
+}
+
+/*
+ * Idle-worker pull: `me` (this worker's own channel) is empty, so try to take
+ * one whole batch from a sibling in the same domain and splice it onto `me`,
+ * to be drained by the normal loop. O(1) per channel touched; the domain hint
+ * directs us so we don't blind-scan. Returns true if a batch was moved.
+ *
+ * Correctness note: push-placement + wake_owned_worker() still deliver every
+ * event to a worker on their own, so this is a pure load-balancing assist (it
+ * drains a busy sibling's backlog from an otherwise-idle core); a missed/stale
+ * hint bit only costs a hunt opportunity, never a stranded event. Each channel
+ * lock is taken alone (victim then me, never nested), so hunters can't deadlock.
+ */
+static bool hunt_batch(struct event_manager *mgr, struct event_channel *me)
+{
+	struct cpumask *hint = &mgr->domain_hint[domain_of(me->cpu)];
+	struct event_batch *batch = NULL;
+	unsigned long flags;
+	int victim;
+
+	stat_hunt_attempt(mgr);
+	for_each_cpu_wrap(victim, hint, me->cpu) {
+		struct event_channel *vc = mgr->channels[victim];
+
+		if (victim == me->cpu || !vc)
+			continue;	/* skip self; channels are created up front */
+		spin_lock_irqsave(&vc->event_lock, flags);
+		batch = detach_head_batch(vc);
+		if (batch && !channel_has_work(vc))
+			cpumask_clear_cpu(victim, hint);
+		spin_unlock_irqrestore(&vc->event_lock, flags);
+		if (batch)
+			break;
+	}
+	if (!batch)
+		return false;
+
+	stat_hunt_success(mgr, batch->count);
+	spin_lock_irqsave(&me->event_lock, flags);
+	if (!channel_has_work(me))
+		cpumask_set_cpu(me->cpu, hint);
+	list_add_tail(&batch->node, &me->event_list);
+	me->event_count += batch->count;
+	spin_unlock_irqrestore(&me->event_lock, flags);
+	return true;
+}
+
+/*
+ * Softirq-reachable: enqueue anchor onto the LOCAL cpu's channel -- the cpu
+ * that processed the packet -- for data locality, regardless of which cpu this
+ * manager "owns" (ownership gates who drains, not where events land). The local
+ * worker drains its own channel; idle domain siblings pull a backlog via the
+ * hunt, and a sealed batch adds a core. channels[my_cpu] always exists (every
+ * online cpu gets one at create_manager time).
  */
 static void post_event(struct event_anchor *anchor)
 {
 	unsigned long flags;
 	struct event_manager *mgr = anchor->mgr;
 	struct event_channel *target;
-	bool enqueued = false;
-	bool congested = false;
-	int my_cpu, gcpu;
+	bool sealed;
+	int my_cpu;
 
 	local_irq_save(flags);
 	my_cpu = smp_processor_id();
-
-	target = pick_target(mgr, my_cpu);
-	if (!target) {
-		local_irq_restore(flags);
-		drop_anchor(anchor);
-		return;
-	}
+	target = mgr->channels[my_cpu];
 
 	INIT_LIST_HEAD(&anchor->anchor);
 
-	/* If mgr released the core since pick_target(), owner[] no longer
-	 * points at mgr; fall back to a guaranteed core instead of enqueuing
-	 * onto a channel nothing will ever drain. */
 	spin_lock(&target->event_lock);
-	if (READ_ONCE(core_pool.owner[target->cpu]) == mgr) {
-		congested = target->event_count > mgr->spread_threshold;
-		/* Queued ref: held while on the channel list and across the drain;
-		 * the worker drops it. Keeps the anchor alive against a concurrent
-		 * UP_CLOSE that drops the subscription ref. Taken before the anchor
-		 * is visible to a draining worker. */
-		kref_get(&anchor->refs);
-		list_add_tail(&anchor->anchor, &target->event_list);
-		target->event_count++;
-		enqueued = true;
-	}
+	/* Queued ref: held while on the channel list and across the drain; the
+	 * worker drops it. Keeps the anchor alive against a concurrent UP_CLOSE
+	 * that drops the subscription ref. */
+	kref_get(&anchor->refs);
+	if (!channel_has_work(target))
+		cpumask_set_cpu(my_cpu, &mgr->domain_hint[domain_of(my_cpu)]);
+	sealed = batch_add(target, anchor, mgr->batch_size);
+	target->event_count++;
 	spin_unlock(&target->event_lock);
 
-	if (!enqueued) {
-		/* Chosen target was stolen between pick_target() and the lock. */
-		place_stat_lost(mgr);
-		gcpu = cpumask_first(&mgr->guaranteed_mask);
-		target = gcpu < nr_cpu_ids ? mgr->channels[gcpu] : NULL;
-		if (!target) {
-			local_irq_restore(flags);
-			drop_anchor(anchor);
-			return;
-		}
-		spin_lock(&target->event_lock);
-		congested = target->event_count > mgr->spread_threshold;
-		kref_get(&anchor->refs);	/* queued ref (see above) */
-		list_add_tail(&anchor->anchor, &target->event_list);
-		target->event_count++;
-		spin_unlock(&target->event_lock);
-	}
-
 	anchor_trace(anchor, ANCHOR_TR_ENQUEUE);
-	wake_owned_worker(mgr, target->cpu);
 
-	if (congested)
+	/* Wake the local worker to drain its own channel (no-op if it is already
+	 * running -- it drains this when it loops). If the channel just backed up
+	 * a full batch, add a core to the domain so an extra worker can hunt the
+	 * backlog. */
+	if (wake_owned_worker(mgr, my_cpu))
+		stat_local_wake(mgr);
+	if (sealed) {
+		stat_seal(mgr);
 		upcall_scale_up(mgr, my_cpu);
+	}
 
 	local_irq_restore(flags);
 }
@@ -671,8 +850,10 @@ static inline bool anchor_claim(struct event_anchor *anchor)
 {
 	bool won = atomic_cmpxchg(&anchor->state, ANCHOR_ARMED, ANCHOR_QUEUED) == ANCHOR_ARMED;
 
-	if (won)
+	if (won) {
+		anchor_mark_claim(anchor);	/* dwell clock starts here */
 		anchor_trace(anchor, ANCHOR_TR_CLAIM);
+	}
 	return won;
 }
 
@@ -905,13 +1086,15 @@ static struct event_anchor *get_next_wakeup(struct event_manager *mgr)
 	local_irq_save(flags);
 	channel = get_event_channel(mgr);
 	scoped_guard(spinlock, &channel->event_lock) {
-		anchor = list_first_entry_or_null(&channel->event_list, struct event_anchor, anchor);
-		if (!anchor)
-			goto out;
-		list_del_init(&anchor->anchor);
+		anchor = batch_pop(channel);
+		/* Cleared under the same lock that sets it in post_event, so this
+		 * channel's own hint bit transitions stay ordered. */
+		if (!channel_has_work(channel))
+			cpumask_clear_cpu(channel->cpu,
+					  &mgr->domain_hint[domain_of(channel->cpu)]);
 	}
-	anchor_trace(anchor, ANCHOR_TR_DEQUEUE);
-out:
+	if (anchor)
+		anchor_trace(anchor, ANCHOR_TR_DEQUEUE);
 	local_irq_restore(flags);
 	return anchor;
 }
@@ -944,6 +1127,7 @@ static void worker_sleep(struct event_manager *mgr)
 	set_current_state(TASK_INTERRUPTIBLE);
 	spin_unlock(&channel->worker_lock);
 	local_irq_restore(flags);
+	stat_sleep(mgr);	/* committed to parking (domain empty) */
 
 	mark_stealable(mgr, cpu);
 again:
@@ -969,35 +1153,6 @@ out:
 	return;
 }
 
-static struct event_anchor *anchor_pool_get(void)
-{
-	struct anchor_pool *pool;
-	struct event_anchor *anchor = NULL;
-
-	pool = &get_cpu_var(anchor_pool);
-	if (pool->count)
-		anchor = pool->free[--pool->count];
-	put_cpu_var(anchor_pool);
-
-	return anchor;
-}
-
-static void anchor_pool_put(struct event_anchor *anchor)
-{
-	struct anchor_pool *pool;
-	bool queued = false;
-
-	pool = &get_cpu_var(anchor_pool);
-	if (pool->count < ANCHOR_POOL_CAP) {
-		pool->free[pool->count++] = anchor;
-		queued = true;
-	}
-	put_cpu_var(anchor_pool);
-
-	if (!queued)
-		kmem_cache_free(anchor_cache, anchor);
-}
-
 static inline unsigned int anchor_bucket(int fd)
 {
 	return hash_32((u32)fd, UPCALL_ANCHOR_HASH_BITS);
@@ -1015,7 +1170,7 @@ static void anchor_insert(struct event_manager *mgr, struct event_anchor *anchor
 
 /* Find the live anchor for (fd,type) and take a reference so the caller can use
  * it safely against a concurrent close that drops the subscription ref. Caller
- * must kref_put(anchor_release_pool) when done. */
+ * must kref_put(anchor_release) when done. */
 static struct event_anchor *anchor_lookup(struct event_manager *mgr,
 					  int fd, int type)
 {
@@ -1067,7 +1222,7 @@ static void close_fd_anchors(struct event_manager *mgr, int fd)
 		hlist_del(&a->hash_node);
 		if (a->whead)
 			remove_wait_queue(a->whead, &a->wait);
-		kref_put(&a->refs, anchor_release_pool);	/* drop subscription ref */
+		kref_put(&a->refs, anchor_release);	/* drop subscription ref */
 	}
 }
 
@@ -1075,26 +1230,26 @@ static void close_fd_anchors(struct event_manager *mgr, int fd)
  * Final free, once both refs (subscription + any queued) are gone. The closer
  * (close_fd_anchors / manager teardown) has already removed the anchor from the
  * hash and the wait queue before the last ref could drop, so there is no hash
- * work here. Runs in task context (drain or UP_CLOSE), so the per-CPU pool and
+ * work here. Runs in task context (drain or UP_CLOSE), so the slab free and
  * put_mgr()'s possible free_manager() are both safe.
  */
-static void anchor_release_pool(struct kref *kref)
+static void anchor_release(struct kref *kref)
 {
 	struct event_anchor *anchor = container_of(kref, struct event_anchor, refs);
 
 	put_mgr(anchor->mgr);
 	if (anchor->file)
 		fput(anchor->file);
-	anchor_pool_put(anchor);
+	kmem_cache_free(anchor_cache, anchor);
 }
 
 static struct event_anchor *build_anchor(struct event_manager *mgr, struct up_event *evt)
 {
 	struct event_anchor *anchor;
 
-	anchor = anchor_pool_get();
-	if (!anchor)
-		anchor = kmem_cache_alloc(anchor_cache, GFP_KERNEL);
+	/* fd-rate churn (one per (fd,type) subscription), so straight from the
+	 * dedicated slab -- no per-cpu pool needed. */
+	anchor = kmem_cache_alloc(anchor_cache, GFP_KERNEL);
 	if (!anchor) {
 		// Not sure what to do here, needs thinking
 		return NULL;
@@ -1192,7 +1347,7 @@ static int attach_poll(struct event_manager *mgr, struct up_event *evt, __poll_t
 					post_event(anchor);
 			}
 		}
-		kref_put(&anchor->refs, anchor_release_pool);	/* drop lookup ref */
+		kref_put(&anchor->refs, anchor_release);	/* drop lookup ref */
 		return rc;
 	}
 
@@ -1285,15 +1440,21 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 again:
 	while (out_idx < out_cnt) {
 		anchor = get_next_wakeup(mgr);
-		if (!anchor)
+		if (!anchor) {
+			/* Own channel drained: pull a batch from a busy sibling in
+			 * the domain and drain that too. Only when the whole domain
+			 * is empty (nothing to hunt) do we fall through to sleep. */
+			if (hunt_batch(mgr, my_chan))
+				continue;
 			break;
+		}
 		drained++;	/* popped off the channel; event_count owes a decrement */
 
 		/* Closing: a concurrent UP_CLOSE marked it DEAD. Suppress -- no I/O,
 		 * no delivery -- and drop the queued ref (may free it now). */
 		if (atomic_read(&anchor->state) == ANCHOR_DEAD) {
 			anchor_trace(anchor, ANCHOR_TR_DEAD_SKIP);
-			kref_put(&anchor->refs, anchor_release_pool);
+			kref_put(&anchor->refs, anchor_release);
 			continue;
 		}
 
@@ -1308,7 +1469,7 @@ again:
 			try_accept(&anchor->event);
 			break;
 		default:
-			kref_put(&anchor->refs, anchor_release_pool);
+			kref_put(&anchor->refs, anchor_release);
 			mark_handled_events(mgr, drained);
 			return -EINVAL;
 		}
@@ -1317,6 +1478,7 @@ again:
 		 * now-stale event. Copy out by value before dropping the ref. */
 		if (atomic_cmpxchg(&anchor->state, ANCHOR_QUEUED, ANCHOR_IDLE) == ANCHOR_QUEUED) {
 			anchor_trace(anchor, ANCHOR_TR_DELIVER);
+			stat_dwell(mgr, anchor);	/* claim -> delivery */
 			out[out_idx] = anchor->event;
 			/* Remember the RX ring that fed this channel so the busy-poll
 			 * below can target it without a separate fd->sk lookup. */
@@ -1325,12 +1487,17 @@ again:
 					   READ_ONCE(anchor->sk->sk_napi_id));
 			out_idx++;
 		} else {
-			/* We shouldn't ever get here, this event is on our queue and if someone else transitioned
-			it to ARMED, then they are taking events from our queue or this event was posted twice. Both
-			cases are bugs. */
-			BUG();
+			/* The only transition that can beat us here is a concurrent
+			 * UP_CLOSE setting DEAD during try_* (the persistent anchor's
+			 * own fget + the queued ref keep it memory-safe). Suppress the
+			 * now-stale event rather than hand the app a result for a closed
+			 * fd. This did not occur in the memcached port, so WARN once if
+			 * it ever does -- state == DEAD is the expected close race, any
+			 * other state is a genuine bug (double-post / stolen event). */
+			WARN_ONCE(1, "upcall: suppressed non-QUEUED drained event (state %d)\n",
+				  atomic_read(&anchor->state));
 		}
-		kref_put(&anchor->refs, anchor_release_pool);	/* drop queued ref */
+		kref_put(&anchor->refs, anchor_release);	/* drop queued ref */
 	}
 
 	/* Busy-poll the RX ring that last delivered to this channel (cached at
@@ -1364,6 +1531,16 @@ again:
 				napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
 			goto again;
 		}
+
+		/* Reconcile event_count for everything drained so far BEFORE parking.
+		 * worker_sleep() won't park while event_count > 0, and the final
+		 * mark_handled_events() below is only reached on the out_idx > 0 exit
+		 * -- so without this, a pass that drained anchors but delivered none
+		 * (e.g. all DEAD) would leave event_count permanently inflated and the
+		 * worker would spin instead of sleeping. (event_count >= drained, so no
+		 * underflow.) */
+		mark_handled_events(mgr, drained);
+		drained = 0;
 
 		worker_sleep(mgr);
 		presleep_polled = false;	/* fresh poll allowed on the next sleep */
@@ -1407,15 +1584,23 @@ static void free_manager(struct event_manager *mgr)
 	spin_unlock_irqrestore(&core_pool.lock, flags);
 
 	for (uint64_t i = 0; i < NR_CPUS; i++) {
+		struct event_batch *b, *tmp;
+
 		chan = mgr->channels[i];
 		mgr->channels[i] = NULL;
+		if (chan) {
+			/* teardown_anchors() already drained the anchors; only the
+			 * (now-empty) batch objects remain to free. */
+			list_for_each_entry_safe(b, tmp, &chan->event_list, node)
+				batch_pool_put(b);
+		}
 		kfree(chan);
 	}
 
+	kfree(mgr->domain_hint);
 	kfree(mgr->anchor_hash);
-
-	upcall_mgr_debugfs_del(mgr);	/* blocks readers before we free place_stats */
-	upcall_place_stats_free(mgr);
+	upcall_mgr_debugfs_del(mgr);	/* blocks readers before freeing stats */
+	upcall_stats_free(mgr);
 	kfree(mgr);
 }
 
@@ -1460,7 +1645,7 @@ static void teardown_anchors(struct event_manager *mgr)
 		hlist_del(&a->hash_node);
 		if (a->whead)
 			remove_wait_queue(a->whead, &a->wait);
-		kref_put(&a->refs, anchor_release_pool);	/* subscription ref */
+		kref_put(&a->refs, anchor_release);	/* subscription ref */
 	}
 
 	for (int cpu = 0; cpu < NR_CPUS; cpu++) {
@@ -1470,14 +1655,11 @@ static void teardown_anchors(struct event_manager *mgr)
 			continue;
 		for (;;) {
 			spin_lock_irqsave(&chan->event_lock, flags);
-			a = list_first_entry_or_null(&chan->event_list,
-						     struct event_anchor, anchor);
-			if (a)
-				list_del_init(&a->anchor);
+			a = batch_pop(chan);
 			spin_unlock_irqrestore(&chan->event_lock, flags);
 			if (!a)
 				break;
-			kref_put(&a->refs, anchor_release_pool);	/* queued ref */
+			kref_put(&a->refs, anchor_release);	/* queued ref */
 		}
 	}
 }
@@ -1663,7 +1845,16 @@ static struct event_manager *create_manager(void)
 		goto out_free;
 	spin_lock_init(&mgr->anchor_lock);
 
-	if (!upcall_place_stats_alloc(mgr))
+	if (!upcall_stats_alloc(mgr))
+		goto out_free;
+
+	/* Build the cpu->domain map once (topology is up by now), then a
+	 * per-domain hint cpumask for this manager. */
+	scoped_guard(spinlock_irqsave, &core_pool.lock)
+		upcall_build_domains();
+	mgr->domain_hint = kcalloc(upcall_nr_domains, sizeof(struct cpumask),
+				   GFP_KERNEL);
+	if (!mgr->domain_hint)
 		goto out_free;
 
 	/* Every online cpu gets its channel up front, NUMA-local, instead of
@@ -1688,8 +1879,9 @@ out_free:
 	for_each_online_cpu(i) {
 		kfree(mgr->channels[i]);
 	}
+	kfree(mgr->domain_hint);
 	kfree(mgr->anchor_hash);
-	upcall_place_stats_free(mgr);
+	upcall_stats_free(mgr);
 	kfree(mgr);
 	return NULL;
 }
@@ -1708,7 +1900,6 @@ SYSCALL_DEFINE2(upcall_create, size_t, batch_sz, int, flags)
 		return -ENOMEM;
 
 	mgr->batch_size = batch_sz;
-	mgr->spread_threshold = batch_sz - 2;
 	mgr->napi_poll_threshold = batch_sz / 2;
 
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
@@ -1731,7 +1922,10 @@ SYSCALL_DEFINE2(upcall_create, size_t, batch_sz, int, flags)
 out_put_fd:
 	put_unused_fd(fd);
 out_free:
-	kfree(mgr);
+	/* create_manager() fully allocated (channels, anchor_hash, domain_hint,
+	 * stats, debugfs); free it all, not just the mgr struct. No cores owned
+	 * and no other ref exists yet, so a direct free_manager() is safe. */
+	free_manager(mgr);
 	return error;
 }
 
@@ -1912,28 +2106,58 @@ static const struct file_operations upcall_submit_fops = {
 	.write		= upcall_submit_write,
 };
 
-/* debugfs: /sys/kernel/debug/upcall/managers/<id> -- per-manager placement. */
+/*
+ * debugfs: /sys/kernel/debug/upcall/managers/<id> -- per-cpu pull-model
+ * counters plus the completion-dwell histogram. Read prints one counters row
+ * per cpu followed by that cpu's non-empty dwell buckets (upper-bound ns,
+ * count); any write zeroes every cpu's stats so a sweep brackets a run.
+ */
 static int upcall_mgr_show(struct seq_file *s, void *v)
 {
 	struct event_manager *mgr = s->private;
-	u64 local = 0, not_ours = 0, full = 0, lost = 0;
-	int cpu;
+	int cpu, b;
 
 	for_each_possible_cpu(cpu) {
-		struct upcall_place_stats *st = per_cpu_ptr(mgr->place_stats, cpu);
+		struct upcall_stats *st = per_cpu_ptr(mgr->stats, cpu);
 
-		local    += st->local;
-		not_ours += st->remote_not_ours;
-		full     += st->remote_full;
-		lost     += st->lost;
+		seq_printf(s,
+			   "cpu %d hunts_attempted %llu hunts_succeeded %llu stolen_events %llu seals %llu scale_up_woke %llu scale_up_nocore %llu local_wakes %llu worker_sleeps %llu backstop_hits %llu\n",
+			   cpu, st->hunts_attempted, st->hunts_succeeded,
+			   st->stolen_events, st->seals, st->scale_up_woke,
+			   st->scale_up_nocore, st->local_wakes, st->worker_sleeps,
+			   st->backstop_hits);
+		for (b = 0; b < UPCALL_DWELL_BUCKETS; b++)
+			if (st->dwell[b])
+				seq_printf(s, "cpu %d dwell_ns %llu %llu\n",
+					   cpu, 1ULL << (b + 1), st->dwell[b]);
 	}
-	seq_printf(s, "local            %llu\n", (unsigned long long)local);
-	seq_printf(s, "remote_not_ours  %llu\n", (unsigned long long)not_ours);
-	seq_printf(s, "remote_full      %llu\n", (unsigned long long)full);
-	seq_printf(s, "place_lost       %llu\n", (unsigned long long)lost);
 	return 0;
 }
-DEFINE_SHOW_ATTRIBUTE(upcall_mgr);
+
+static int upcall_mgr_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, upcall_mgr_show, inode->i_private);
+}
+
+static ssize_t upcall_mgr_write(struct file *file, const char __user *ubuf,
+				size_t len, loff_t *off)
+{
+	struct event_manager *mgr = ((struct seq_file *)file->private_data)->private;
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		memset(per_cpu_ptr(mgr->stats, cpu), 0, sizeof(struct upcall_stats));
+	return len;
+}
+
+static const struct file_operations upcall_mgr_fops = {
+	.owner		= THIS_MODULE,
+	.open		= upcall_mgr_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= upcall_mgr_write,
+};
 
 static void upcall_mgr_debugfs_add(struct event_manager *mgr)
 {
@@ -1942,7 +2166,7 @@ static void upcall_mgr_debugfs_add(struct event_manager *mgr)
 	if (!upcall_mgr_dbg_dir)
 		return;
 	snprintf(name, sizeof(name), "%d", mgr->id);
-	mgr->dbg = debugfs_create_file(name, 0444, upcall_mgr_dbg_dir, mgr,
+	mgr->dbg = debugfs_create_file(name, 0644, upcall_mgr_dbg_dir, mgr,
 				       &upcall_mgr_fops);
 }
 
@@ -1987,6 +2211,11 @@ static int __init upcall_init(void)
 	anchor_cache = kmem_cache_create("upcall_anchor", sizeof(struct event_anchor),
 			0, SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);
 	if (!anchor_cache)
+		return -ENOMEM;
+
+	batch_cache = kmem_cache_create("upcall_batch", sizeof(struct event_batch),
+			0, SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT, NULL);
+	if (!batch_cache)
 		return -ENOMEM;
 
 	buffer_cache = kmem_cache_create("upcall_buffer", sizeof(struct event_buffer),
