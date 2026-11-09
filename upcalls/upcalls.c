@@ -73,6 +73,7 @@ struct event_batch {
 	struct list_head	node;		/* link in channel->event_list */
 	struct list_head	anchors;	/* anchors in this batch, FIFO */
 	unsigned int		count;		/* anchors currently in `anchors` */
+	bool			closed;		/* no more enqueues: hit batch_size, or claimed */
 };
 
 /*
@@ -99,7 +100,7 @@ enum fd_io_kind {
  */
 #define UPCALL_DWELL_BUCKETS 40
 struct upcall_stats {
-	u64	hunts_attempted;	/* hunt_batch() calls (own channel empty) */
+	u64	hunts_attempted;	/* hunt_claim() calls (own channel empty) */
 	u64	hunts_succeeded;	/* hunts that moved a sibling batch */
 	u64	stolen_events;		/* anchors pulled across cpus by hunts */
 	u64	seals;			/* batches filled (scale-up trigger) */
@@ -108,7 +109,11 @@ struct upcall_stats {
 	u64	local_wakes;		/* a post woke a parked local worker */
 	u64	worker_sleeps;		/* a worker parked (domain empty) */
 	u64	backstop_hits;		/* cross-domain guaranteed-core backstop fired */
-	u64	dwell[UPCALL_DWELL_BUCKETS];
+	u64	local_arrivals;		/* local post_event()s on this cpu (monotonic) */
+	u64	jitter_steals;		/* steals during which own channel got a local arrival */
+	u64	idle_steals;		/* steals during which own channel stayed empty */
+	u64	dwell[UPCALL_DWELL_BUCKETS];	/* claim->delivery, log2(ns) */
+	u64	sleep[UPCALL_DWELL_BUCKETS];	/* worker parked interval, log2(ns) */
 };
 #endif
 
@@ -162,6 +167,28 @@ static inline void stat_sleep(struct event_manager *mgr)
 { this_cpu_inc(mgr->stats->worker_sleeps); }
 static inline void stat_backstop(struct event_manager *mgr)
 { this_cpu_inc(mgr->stats->backstop_hits); }
+static inline void stat_local_arrival(struct event_manager *mgr)
+{ this_cpu_inc(mgr->stats->local_arrivals); }
+static inline u64 stat_local_arrivals_read(struct event_manager *mgr)
+{ return this_cpu_read(mgr->stats->local_arrivals); }
+/* Classify a completed steal: if our own channel took a local arrival between
+ * `snapshot` (grabbed when we found it empty) and now, we raided a sibling in
+ * the sub-us gap before our own next packet -- jitter, not real idle. */
+static inline void stat_steal_class(struct event_manager *mgr, u64 snapshot)
+{
+	if (this_cpu_read(mgr->stats->local_arrivals) > snapshot)
+		this_cpu_inc(mgr->stats->jitter_steals);
+	else
+		this_cpu_inc(mgr->stats->idle_steals);
+}
+static inline void stat_sleep_hist(struct event_manager *mgr, u64 ns)
+{
+	int b = ns ? ilog2(ns) : 0;
+
+	if (b >= UPCALL_DWELL_BUCKETS)
+		b = UPCALL_DWELL_BUCKETS - 1;
+	this_cpu_inc(mgr->stats->sleep[b]);
+}
 static inline bool upcall_stats_alloc(struct event_manager *mgr)
 { mgr->stats = alloc_percpu(struct upcall_stats); return mgr->stats != NULL; }
 static inline void upcall_stats_free(struct event_manager *mgr)
@@ -174,6 +201,10 @@ static inline void stat_scale_up(struct event_manager *mgr, bool woke) { }
 static inline void stat_local_wake(struct event_manager *mgr) { }
 static inline void stat_sleep(struct event_manager *mgr) { }
 static inline void stat_backstop(struct event_manager *mgr) { }
+static inline void stat_local_arrival(struct event_manager *mgr) { }
+static inline u64 stat_local_arrivals_read(struct event_manager *mgr) { return 0; }
+static inline void stat_steal_class(struct event_manager *mgr, u64 snapshot) { }
+static inline void stat_sleep_hist(struct event_manager *mgr, u64 ns) { }
 static inline bool upcall_stats_alloc(struct event_manager *mgr) { return true; }
 static inline void upcall_stats_free(struct event_manager *mgr) { }
 #endif
@@ -214,19 +245,8 @@ static void upcall_submit_record(u64 delta)
 	upcall_submit_hist[cpu][b]++;
 	put_cpu();
 }
-
-static inline u64 upcall_submit_time_start(void)
-{
-	return ktime_get_mono_fast_ns();
-}
-
-static inline void upcall_submit_time_end(u64 t0)
-{
-	upcall_submit_record(ktime_get_mono_fast_ns() - t0);
-}
-#else
-static inline u64 upcall_submit_time_start(void) { return 0; }
-static inline void upcall_submit_time_end(u64 t0) { }
+/* upcall_submit_time_start/end are defined after struct worker_context, since
+ * they read the per-worker slept-time accumulator to exclude sleep. */
 #endif
 
 /*
@@ -248,7 +268,7 @@ static inline void upcall_submit_time_end(u64 t0) { }
 enum anchor_trace_ev {
 	ANCHOR_TR_CLAIM,	/* ARMED->QUEUED claim won (any of the 3 sites) */
 	ANCHOR_TR_ENQUEUE,	/* post_event added anchor to target's event_list */
-	ANCHOR_TR_DEQUEUE,	/* get_next_wakeup popped this anchor off the channel */
+	ANCHOR_TR_DEQUEUE,	/* drain_anchor took this anchor off a claimed batch */
 	ANCHOR_TR_DEAD_SKIP,	/* drain saw DEAD, suppressed */
 	ANCHOR_TR_DELIVER,	/* QUEUED->IDLE, delivered to out[] */
 	ANCHOR_TR_REARM_BUSY,	/* attach_poll re-arm bailed with -EBUSY */
@@ -357,7 +377,44 @@ struct worker_context {
 	struct list_head	buffers;
 	struct list_head	anchor;
 	uint64_t		spurious_count;
+#ifdef CONFIG_UPCALLS_STATS
+	u64			slept_ns;	/* sleep accumulated this upcall_submit() */
+#endif
 };
+
+/*
+ * submit_ns excludes time spent parked: worker_sleep() accumulates each
+ * schedule() sleep into the worker's slept_ns, start zeroes it, end subtracts
+ * it from the whole-syscall delta so the histogram reflects active work only.
+ * Per-worker (not per-cpu) because co-tenant apps' workers can share a cpu.
+ */
+#ifdef CONFIG_UPCALLS_STATS
+static inline u64 sleep_clock(void)
+{ return ktime_get_mono_fast_ns(); }
+
+static inline void submit_sleep_add(u64 ns)
+{ if (current->worker_context) current->worker_context->slept_ns += ns; }
+
+static inline u64 upcall_submit_time_start(void)
+{
+	if (current->worker_context)
+		current->worker_context->slept_ns = 0;
+	return ktime_get_mono_fast_ns();
+}
+
+static inline void upcall_submit_time_end(u64 t0)
+{
+	u64 total = ktime_get_mono_fast_ns() - t0;
+	u64 slept = current->worker_context ? current->worker_context->slept_ns : 0;
+
+	upcall_submit_record(total > slept ? total - slept : 0);
+}
+#else
+static inline u64 sleep_clock(void) { return 0; }
+static inline void submit_sleep_add(u64 ns) { }
+static inline u64 upcall_submit_time_start(void) { return 0; }
+static inline void upcall_submit_time_end(u64 t0) { }
+#endif
 
 /* up_event cache */
 static struct kmem_cache *event_cache __read_mostly;
@@ -665,108 +722,90 @@ static struct event_batch *batch_alloc(void)
 	INIT_LIST_HEAD(&b->node);
 	INIT_LIST_HEAD(&b->anchors);
 	b->count = 0;
+	b->closed = false;
 	return b;
 }
 
-/* Append anchor to the channel's tail batch, sealing (starting a fresh tail)
- * when the current tail is full. A resident empty tail from a prior drain is
- * reused. Returns true if this add filled (sealed) the tail batch -- the
- * scale-up signal. Caller holds channel->event_lock. */
+/* Append anchor to the channel's open tail batch, starting a fresh one when the
+ * tail is closed (full, or a re-queued/claimed batch). Marks the tail closed
+ * when this add fills it to batch_size and returns true then -- the scale-up
+ * signal. Caller holds channel->event_lock. */
 static bool batch_add(struct event_channel *chan, struct event_anchor *anchor,
 		      unsigned int cap)
 {
 	struct event_batch *tail;
 
-	if (list_empty(&chan->event_list)) {
+	if (list_empty(&chan->event_list) ||
+	    list_last_entry(&chan->event_list, struct event_batch, node)->closed) {
 		tail = batch_alloc();
 		list_add_tail(&tail->node, &chan->event_list);
 	} else {
 		tail = list_last_entry(&chan->event_list, struct event_batch, node);
-		if (tail->count == cap) {
-			tail = batch_alloc();
-			list_add_tail(&tail->node, &chan->event_list);
-		}
 	}
 	list_add_tail(&anchor->anchor, &tail->anchors);
 	tail->count++;
-	return tail->count == cap;	/* this add sealed the batch */
-}
-
-/* Pop the oldest anchor from the channel, or NULL if none remain. Frees a head
- * batch once fully drained, except the last one -- kept as the resident empty
- * tail so trickle load doesn't churn the slab. Caller holds channel->event_lock. */
-static struct event_anchor *batch_pop(struct event_channel *chan)
-{
-	while (!list_empty(&chan->event_list)) {
-		struct event_batch *head =
-			list_first_entry(&chan->event_list, struct event_batch, node);
-		struct event_anchor *anchor =
-			list_first_entry_or_null(&head->anchors, struct event_anchor,
-						 anchor);
-
-		if (anchor) {
-			list_del_init(&anchor->anchor);
-			head->count--;
-			return anchor;
-		}
-		if (list_is_singular(&chan->event_list))
-			return NULL;	/* keep the lone empty batch resident */
-		list_del(&head->node);
-		batch_pool_put(head);
+	if (tail->count == cap) {
+		tail->closed = true;	/* sealed on full */
+		return true;
 	}
-	return NULL;
+	return false;
 }
 
-/*
- * Does the channel hold any claimable anchor? Structural (not event_count,
- * which is bulk-decremented at pass end and reads stale mid-drain): the only
- * empty batch that can be present at a lock-held observation point is a lone
- * resident tail, so work exists unless the list is empty or a single empty
- * batch. Caller holds channel->event_lock.
- */
+/* Every batch on a channel carries at least one anchor (batch_add never leaves
+ * an empty batch; claim/requeue move whole batches), so "has work" is just a
+ * non-empty list. Caller holds channel->event_lock. */
 static bool channel_has_work(struct event_channel *chan)
 {
-	struct event_batch *first;
-
-	if (list_empty(&chan->event_list))
-		return false;
-	first = list_first_entry(&chan->event_list, struct event_batch, node);
-	return !list_is_singular(&chan->event_list) || first->count > 0;
+	return !list_empty(&chan->event_list);
 }
 
-/* Detach the oldest batch (O(1)), or NULL if the channel has no claimable
- * work. channel_has_work() guarantees the head is non-empty (the only empty
- * batch that can be present is a lone resident tail). Decrements event_count by
- * the batch's anchor count. Caller holds chan->event_lock. */
+/* Detach the oldest batch (O(1)) and CLOSE it -- now private to the caller,
+ * drained lock-free and off every channel, so nothing adds to it or steals it
+ * again. NULL if the channel is empty. Decrements event_count by the batch's
+ * anchor count. Caller holds chan->event_lock. */
 static struct event_batch *detach_head_batch(struct event_channel *chan)
 {
 	struct event_batch *head;
 
-	if (!channel_has_work(chan))
+	if (list_empty(&chan->event_list))
 		return NULL;
 	head = list_first_entry(&chan->event_list, struct event_batch, node);
 	list_del(&head->node);
 	chan->event_count -= head->count;
+	head->closed = true;
 	return head;
 }
 
+/* Claim (detach + close) the oldest batch from `chan`, clearing the hint bit if
+ * that empties the channel. Returns the now-private batch, or NULL. */
+static struct event_batch *claim_batch(struct event_manager *mgr,
+				       struct event_channel *chan)
+{
+	struct event_batch *batch;
+	unsigned long flags;
+
+	spin_lock_irqsave(&chan->event_lock, flags);
+	batch = detach_head_batch(chan);
+	if (batch && !channel_has_work(chan))
+		cpumask_clear_cpu(chan->cpu, &mgr->domain_hint[domain_of(chan->cpu)]);
+	spin_unlock_irqrestore(&chan->event_lock, flags);
+	return batch;
+}
+
 /*
- * Idle-worker pull: `me` (this worker's own channel) is empty, so try to take
- * one whole batch from a sibling in the same domain and splice it onto `me`,
- * to be drained by the normal loop. O(1) per channel touched; the domain hint
- * directs us so we don't blind-scan. Returns true if a batch was moved.
- *
- * Correctness note: push-placement + wake_owned_worker() still deliver every
- * event to a worker on their own, so this is a pure load-balancing assist (it
- * drains a busy sibling's backlog from an otherwise-idle core); a missed/stale
- * hint bit only costs a hunt opportunity, never a stranded event. Each channel
- * lock is taken alone (victim then me, never nested), so hunters can't deadlock.
+ * Idle-worker pull: `me`'s own channel is empty, so claim one whole batch from a
+ * busy sibling in the same domain (hint-directed, rotating start) and return it
+ * private -- the caller drains it lock-free. The claimed batch is off every
+ * channel, so it can't be added to or stolen again (re-steal is impossible by
+ * construction). Each channel lock is taken alone, so hunters can't deadlock. A
+ * stale/missed hint bit only costs a hunt opportunity, never a strand --
+ * local-enqueue + local-wake still deliver every event to its RX cpu's worker.
  */
-static bool hunt_batch(struct event_manager *mgr, struct event_channel *me)
+static struct event_batch *hunt_claim(struct event_manager *mgr,
+				      struct event_channel *me)
 {
 	struct cpumask *hint = &mgr->domain_hint[domain_of(me->cpu)];
 	struct event_batch *batch = NULL;
-	unsigned long flags;
 	int victim;
 
 	stat_hunt_attempt(mgr);
@@ -775,25 +814,29 @@ static bool hunt_batch(struct event_manager *mgr, struct event_channel *me)
 
 		if (victim == me->cpu || !vc)
 			continue;	/* skip self; channels are created up front */
-		spin_lock_irqsave(&vc->event_lock, flags);
-		batch = detach_head_batch(vc);
-		if (batch && !channel_has_work(vc))
-			cpumask_clear_cpu(victim, hint);
-		spin_unlock_irqrestore(&vc->event_lock, flags);
+		batch = claim_batch(mgr, vc);
 		if (batch)
 			break;
 	}
-	if (!batch)
-		return false;
+	if (batch)
+		stat_hunt_success(mgr, batch->count);
+	return batch;
+}
 
-	stat_hunt_success(mgr, batch->count);
-	spin_lock_irqsave(&me->event_lock, flags);
-	if (!channel_has_work(me))
-		cpumask_set_cpu(me->cpu, hint);
-	list_add_tail(&batch->node, &me->event_list);
-	me->event_count += batch->count;
-	spin_unlock_irqrestore(&me->event_lock, flags);
-	return true;
+/* Out[] filled before the claimed batch drained: put the (still-closed) leftover
+ * back at `chan`'s head and re-advertise the hint, so a sibling can relieve it
+ * rather than wait for this worker's next trip (head-of-line avoidance). Caller
+ * must not touch `batch` after this. */
+static void requeue_leftover(struct event_manager *mgr, struct event_channel *chan,
+			     struct event_batch *batch)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&chan->event_lock, flags);
+	list_add(&batch->node, &chan->event_list);	/* head: oldest, claimed first */
+	chan->event_count += batch->count;
+	cpumask_set_cpu(chan->cpu, &mgr->domain_hint[domain_of(chan->cpu)]);
+	spin_unlock_irqrestore(&chan->event_lock, flags);
 }
 
 /*
@@ -830,6 +873,7 @@ static void post_event(struct event_anchor *anchor)
 	spin_unlock(&target->event_lock);
 
 	anchor_trace(anchor, ANCHOR_TR_ENQUEUE);
+	stat_local_arrival(mgr);	/* local work landed on this cpu's channel */
 
 	/* Wake the local worker to drain its own channel (no-op if it is already
 	 * running -- it drains this when it loops). If the channel just backed up
@@ -1064,39 +1108,59 @@ static __poll_t upcall_item_poll(struct event_anchor *anchor, __poll_t events)
 	return res & events;
 }
 
-static void mark_handled_events(struct event_manager *mgr, unsigned int cnt)
+/*
+ * Process one anchor taken (lock-free) from a claimed, private batch. Returns
+ * true if it was delivered to *out, false if suppressed (closed/DEAD or a
+ * concurrent close raced). Drops the anchor's queued ref either way.
+ */
+static bool drain_anchor(struct event_manager *mgr, struct event_channel *my_chan,
+			 struct event_anchor *anchor, struct up_event *out)
 {
-	unsigned long flags;
-	struct event_channel *channel;
+	anchor_trace(anchor, ANCHOR_TR_DEQUEUE);
 
-	local_irq_save(flags);
-	channel = get_event_channel(mgr);
-	scoped_guard(spinlock, &channel->event_lock) {
-		channel->event_count -= cnt;
+	/* Closing: a concurrent UP_CLOSE marked it DEAD -- no I/O, no delivery. */
+	if (atomic_read(&anchor->state) == ANCHOR_DEAD) {
+		anchor_trace(anchor, ANCHOR_TR_DEAD_SKIP);
+		kref_put(&anchor->refs, anchor_release);
+		return false;
 	}
-	local_irq_restore(flags);
-}
 
-static struct event_anchor *get_next_wakeup(struct event_manager *mgr)
-{
-	unsigned long flags;
-	struct event_channel *channel;
-	struct event_anchor *anchor;
-
-	local_irq_save(flags);
-	channel = get_event_channel(mgr);
-	scoped_guard(spinlock, &channel->event_lock) {
-		anchor = batch_pop(channel);
-		/* Cleared under the same lock that sets it in post_event, so this
-		 * channel's own hint bit transitions stay ordered. */
-		if (!channel_has_work(channel))
-			cpumask_clear_cpu(channel->cpu,
-					  &mgr->domain_hint[domain_of(channel->cpu)]);
+	switch (anchor->event.type) {
+	case UP_READ:
+		try_read(anchor);
+		break;
+	case UP_WRITE:
+		try_write(anchor);
+		break;
+	case UP_ACCEPT:
+		try_accept(&anchor->event);
+		break;
+	default:
+		/* Unreachable -- only READ/WRITE/ACCEPT are ever posted. Drop it. */
+		WARN_ONCE(1, "upcall: drained anchor with bad type %d\n",
+			  anchor->event.type);
+		kref_put(&anchor->refs, anchor_release);
+		return false;
 	}
-	if (anchor)
-		anchor_trace(anchor, ANCHOR_TR_DEQUEUE);
-	local_irq_restore(flags);
-	return anchor;
+
+	/* Deliver iff still ours: QUEUED -> IDLE. A close that raced in during
+	 * try_* set DEAD, so the cmpxchg fails and we suppress the now-stale event
+	 * rather than hand the app a result for a closed fd. */
+	if (atomic_cmpxchg(&anchor->state, ANCHOR_QUEUED, ANCHOR_IDLE) == ANCHOR_QUEUED) {
+		anchor_trace(anchor, ANCHOR_TR_DELIVER);
+		stat_dwell(mgr, anchor);	/* claim -> delivery */
+		*out = anchor->event;
+		/* Remember the RX ring that fed this channel for the busy-poll below. */
+		if (anchor->sk)
+			WRITE_ONCE(my_chan->napi_id, READ_ONCE(anchor->sk->sk_napi_id));
+		kref_put(&anchor->refs, anchor_release);
+		return true;
+	}
+	WARN_ONCE(atomic_read(&anchor->state) != ANCHOR_DEAD,
+		  "upcall: suppressed non-QUEUED drained event (state %d)\n",
+		  atomic_read(&anchor->state));
+	kref_put(&anchor->refs, anchor_release);
+	return false;
 }
 
 /* Park the calling worker until an event arrives or a spurious wakeup
@@ -1107,6 +1171,7 @@ static void worker_sleep(struct event_manager *mgr)
 	unsigned long flags;
 	struct event_channel *channel;
 	int cpu;
+	u64 sleep_t0;
 
 	local_irq_save(flags);
 	cpu = smp_processor_id();
@@ -1130,6 +1195,7 @@ static void worker_sleep(struct event_manager *mgr)
 	stat_sleep(mgr);	/* committed to parking (domain empty) */
 
 	mark_stealable(mgr, cpu);
+	sleep_t0 = sleep_clock();	/* start of the parked interval */
 again:
 	schedule();
 
@@ -1149,6 +1215,14 @@ again:
 	 * mark_stealable() on the way to sleep). */
 	cpumask_clear_cpu(cpu, &core_pool.stealable_mask);
 	local_irq_restore(flags);
+	/* Exclude the whole parked interval (incl. spurious re-sleeps) from
+	 * submit_ns, and record it in the per-cpu sleep histogram. */
+	{
+		u64 slept = sleep_clock() - sleep_t0;
+
+		submit_sleep_add(slept);
+		stat_sleep_hist(mgr, slept);
+	}
 out:
 	return;
 }
@@ -1377,12 +1451,10 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 		struct up_event **in, int out_cnt, struct up_event *out)
 {
 	unsigned int out_idx = 0;
-	unsigned int drained = 0;	/* anchors popped off the channel this call */
 	int ret = 0;
 	int presleep_fd = -1;		/* first readable arm: gate the pre-sleep poll */
 	bool polled = false;
 	bool presleep_polled = false;
-	struct event_anchor *anchor;
 	struct event_channel *my_chan;
 	unsigned long cflags;
 
@@ -1439,65 +1511,42 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 
 again:
 	while (out_idx < out_cnt) {
-		anchor = get_next_wakeup(mgr);
-		if (!anchor) {
-			/* Own channel drained: pull a batch from a busy sibling in
-			 * the domain and drain that too. Only when the whole domain
-			 * is empty (nothing to hunt) do we fall through to sleep. */
-			if (hunt_batch(mgr, my_chan))
-				continue;
-			break;
-		}
-		drained++;	/* popped off the channel; event_count owes a decrement */
+		/* Claim a whole batch -- own channel first, else steal a sibling's.
+		 * The claimed batch is detached + closed, so it's private: we drain
+		 * it with no event_lock, nothing adds to it, nothing re-steals it. */
+		struct event_batch *batch = claim_batch(mgr, my_chan);
+		bool stole = false;
+		u64 arrivals_snap = 0;
 
-		/* Closing: a concurrent UP_CLOSE marked it DEAD. Suppress -- no I/O,
-		 * no delivery -- and drop the queued ref (may free it now). */
-		if (atomic_read(&anchor->state) == ANCHOR_DEAD) {
-			anchor_trace(anchor, ANCHOR_TR_DEAD_SKIP);
-			kref_put(&anchor->refs, anchor_release);
-			continue;
+		if (!batch) {
+			/* Own channel empty: about to raid a sibling. Snapshot our
+			 * local-arrival count so we can tell afterwards whether our
+			 * own next packet landed while we were off stealing. */
+			arrivals_snap = stat_local_arrivals_read(mgr);
+			batch = hunt_claim(mgr, my_chan);
+			stole = batch;
+		}
+		if (!batch)
+			break;	/* own channel empty and nothing to steal in the domain */
+
+		while (batch->count && out_idx < out_cnt) {
+			struct event_anchor *a =
+				list_first_entry(&batch->anchors, struct event_anchor,
+						 anchor);
+
+			list_del_init(&a->anchor);
+			batch->count--;
+			if (drain_anchor(mgr, my_chan, a, &out[out_idx]))
+				out_idx++;
 		}
 
-		switch (anchor->event.type) {
-		case UP_READ:
-			try_read(anchor);
-			break;
-		case UP_WRITE:
-			try_write(anchor);
-			break;
-		case UP_ACCEPT:
-			try_accept(&anchor->event);
-			break;
-		default:
-			kref_put(&anchor->refs, anchor_release);
-			mark_handled_events(mgr, drained);
-			return -EINVAL;
-		}
-		/* Deliver iff still ours: QUEUED -> IDLE. A close that raced in
-		 * during try_* set DEAD, so the cmpxchg fails and we suppress the
-		 * now-stale event. Copy out by value before dropping the ref. */
-		if (atomic_cmpxchg(&anchor->state, ANCHOR_QUEUED, ANCHOR_IDLE) == ANCHOR_QUEUED) {
-			anchor_trace(anchor, ANCHOR_TR_DELIVER);
-			stat_dwell(mgr, anchor);	/* claim -> delivery */
-			out[out_idx] = anchor->event;
-			/* Remember the RX ring that fed this channel so the busy-poll
-			 * below can target it without a separate fd->sk lookup. */
-			if (anchor->sk)
-				WRITE_ONCE(my_chan->napi_id,
-					   READ_ONCE(anchor->sk->sk_napi_id));
-			out_idx++;
-		} else {
-			/* The only transition that can beat us here is a concurrent
-			 * UP_CLOSE setting DEAD during try_* (the persistent anchor's
-			 * own fget + the queued ref keep it memory-safe). Suppress the
-			 * now-stale event rather than hand the app a result for a closed
-			 * fd. This did not occur in the memcached port, so WARN once if
-			 * it ever does -- state == DEAD is the expected close race, any
-			 * other state is a genuine bug (double-post / stolen event). */
-			WARN_ONCE(1, "upcall: suppressed non-QUEUED drained event (state %d)\n",
-				  atomic_read(&anchor->state));
-		}
-		kref_put(&anchor->refs, anchor_release);	/* drop queued ref */
+		if (stole)
+			stat_steal_class(mgr, arrivals_snap);
+
+		if (batch->count)
+			requeue_leftover(mgr, my_chan, batch);	/* out[] full: stay stealable */
+		else
+			batch_pool_put(batch);			/* fully drained */
 	}
 
 	/* Busy-poll the RX ring that last delivered to this channel (cached at
@@ -1532,26 +1581,13 @@ again:
 			goto again;
 		}
 
-		/* Reconcile event_count for everything drained so far BEFORE parking.
-		 * worker_sleep() won't park while event_count > 0, and the final
-		 * mark_handled_events() below is only reached on the out_idx > 0 exit
-		 * -- so without this, a pass that drained anchors but delivered none
-		 * (e.g. all DEAD) would leave event_count permanently inflated and the
-		 * worker would spin instead of sleeping. (event_count >= drained, so no
-		 * underflow.) */
-		mark_handled_events(mgr, drained);
-		drained = 0;
-
 		worker_sleep(mgr);
 		presleep_polled = false;	/* fresh poll allowed on the next sleep */
 		goto again;
 	}
 
-	/* Decrement by anchors actually dequeued, not out_idx: the latter also
-	 * counts arm-phase error reports (never on the channel) and omits
-	 * DEAD-skipped / suppressed pops (dequeued but not delivered). */
-	mark_handled_events(mgr, drained);
-
+	/* event_count is maintained at claim/enqueue/requeue time (not here), so
+	 * there is nothing to reconcile on the way out. */
 	return out_idx;
 }
 
@@ -1650,16 +1686,19 @@ static void teardown_anchors(struct event_manager *mgr)
 
 	for (int cpu = 0; cpu < NR_CPUS; cpu++) {
 		struct event_channel *chan = mgr->channels[cpu];
+		struct event_batch *batch;
 
 		if (!chan)
 			continue;
-		for (;;) {
-			spin_lock_irqsave(&chan->event_lock, flags);
-			a = batch_pop(chan);
-			spin_unlock_irqrestore(&chan->event_lock, flags);
-			if (!a)
-				break;
-			kref_put(&a->refs, anchor_release);	/* queued ref */
+		while ((batch = claim_batch(mgr, chan))) {
+			while (batch->count) {
+				a = list_first_entry(&batch->anchors,
+						     struct event_anchor, anchor);
+				list_del_init(&a->anchor);
+				batch->count--;
+				kref_put(&a->refs, anchor_release);	/* queued ref */
+			}
+			batch_pool_put(batch);
 		}
 	}
 }
@@ -2121,15 +2160,19 @@ static int upcall_mgr_show(struct seq_file *s, void *v)
 		struct upcall_stats *st = per_cpu_ptr(mgr->stats, cpu);
 
 		seq_printf(s,
-			   "cpu %d hunts_attempted %llu hunts_succeeded %llu stolen_events %llu seals %llu scale_up_woke %llu scale_up_nocore %llu local_wakes %llu worker_sleeps %llu backstop_hits %llu\n",
+			   "cpu %d hunts_attempted %llu hunts_succeeded %llu stolen_events %llu seals %llu scale_up_woke %llu scale_up_nocore %llu local_wakes %llu worker_sleeps %llu backstop_hits %llu jitter_steals %llu idle_steals %llu\n",
 			   cpu, st->hunts_attempted, st->hunts_succeeded,
 			   st->stolen_events, st->seals, st->scale_up_woke,
 			   st->scale_up_nocore, st->local_wakes, st->worker_sleeps,
-			   st->backstop_hits);
+			   st->backstop_hits, st->jitter_steals, st->idle_steals);
 		for (b = 0; b < UPCALL_DWELL_BUCKETS; b++)
 			if (st->dwell[b])
 				seq_printf(s, "cpu %d dwell_ns %llu %llu\n",
 					   cpu, 1ULL << (b + 1), st->dwell[b]);
+		for (b = 0; b < UPCALL_DWELL_BUCKETS; b++)
+			if (st->sleep[b])
+				seq_printf(s, "cpu %d sleep_ns %llu %llu\n",
+					   cpu, 1ULL << (b + 1), st->sleep[b]);
 	}
 	return 0;
 }
