@@ -52,7 +52,7 @@ struct event_channel {
 	size_t			event_count;
 	uint32_t		cpu;
 	/* napi_id of the RX ring that last delivered to this channel; the
-	 * busy-poll target in do_upcall_submit() (0 == none seen yet). */
+	 * pre-sleep busy-poll target in do_upcall_submit() (0 == none seen yet). */
 	uint32_t		napi_id;
 	uint8_t			pad[8];
 };
@@ -131,8 +131,6 @@ struct event_manager {
 	struct cpumask		guaranteed_electing;	/* per-domain create-once token */
 	atomic_t		owned_count;
 	size_t			batch_size;
-	/* Below this completion count, do one NAPI poll budget before returning. */
-	size_t			napi_poll_threshold;
 	int			id;		/* small stable id for observability */
 	/* (fd,type) -> live event_anchor, for re-arm find-or-create and teardown. */
 	struct hlist_head	*anchor_hash;
@@ -954,6 +952,21 @@ static void get_buffer(struct iovec *iov)
 	kmem_cache_free(buffer_cache, buf);
 }
 
+/* Give back a buffer that try_read took but will not deliver. */
+static void put_buffer(void *base, size_t len)
+{
+	struct event_buffer *buf = kmem_cache_alloc(buffer_cache, GFP_KERNEL);
+
+	if (!buf) {
+		pr_warn_once("upcall: could not return a read buffer to the worker pool\n");
+		return;
+	}
+	INIT_LIST_HEAD(&buf->anchor);
+	buf->iovec.iov_base = base;
+	buf->iovec.iov_len = len;
+	list_add(&buf->anchor, &current->worker_context->buffers);
+}
+
 /*
  * One recvmsg into base[0..len). TCP/UDP are called directly (no retpoline);
  * any other socket goes through sk_prot. The protocol manages its own socket
@@ -1010,6 +1023,10 @@ static void try_read(struct event_anchor *anchor)
 
 	get_buffer(&iov);
 	if (iov.iov_base == NULL) {
+		/* No buffer taken: say so in the event, so neither the
+		 * suppressed-drain path nor the app treats buf as one. */
+		evt->buf = NULL;
+		evt->len = 0;
 		evt->result = -ENOMEM;
 		return;
 	}
@@ -1150,7 +1167,7 @@ static bool drain_anchor(struct event_manager *mgr, struct event_channel *my_cha
 		anchor_trace(anchor, ANCHOR_TR_DELIVER);
 		stat_dwell(mgr, anchor);	/* claim -> delivery */
 		*out = anchor->event;
-		/* Remember the RX ring that fed this channel for the busy-poll below. */
+		/* Remember the RX ring that fed this channel for the pre-sleep busy-poll. */
 		if (anchor->sk)
 			WRITE_ONCE(my_chan->napi_id, READ_ONCE(anchor->sk->sk_napi_id));
 		kref_put(&anchor->refs, anchor_release);
@@ -1159,6 +1176,11 @@ static bool drain_anchor(struct event_manager *mgr, struct event_channel *my_cha
 	WARN_ONCE(atomic_read(&anchor->state) != ANCHOR_DEAD,
 		  "upcall: suppressed non-QUEUED drained event (state %d)\n",
 		  atomic_read(&anchor->state));
+	/* The read's buffer would leave the pool with the suppressed event. */
+	if (anchor->event.type == UP_READ && anchor->event.buf) {
+		put_buffer(anchor->event.buf, anchor->event.len);
+		anchor->event.buf = NULL;
+	}
 	kref_put(&anchor->refs, anchor_release);
 	return false;
 }
@@ -1382,6 +1404,13 @@ static void attach_buffers(uint64_t cnt, struct iovec __user *bufs)
 			kmem_cache_free(buffer_cache, buf);
 			return;
 		}
+		/* A NULL base would come back from get_buffer as "pool empty"
+		 * forever; drop it here instead. */
+		if (!buf->iovec.iov_base || !buf->iovec.iov_len) {
+			pr_warn_once("upcall: ignoring NULL/empty read buffer from user\n");
+			kmem_cache_free(buffer_cache, buf);
+			continue;
+		}
 		list_add(&buf->anchor, &ctx->buffers);
 	}
 }
@@ -1453,7 +1482,6 @@ static int do_upcall_submit(struct event_manager *mgr, int in_cnt,
 	unsigned int out_idx = 0;
 	int ret = 0;
 	int presleep_fd = -1;		/* first readable arm: gate the pre-sleep poll */
-	bool polled = false;
 	bool presleep_polled = false;
 	struct event_channel *my_chan;
 	unsigned long cflags;
@@ -1547,17 +1575,6 @@ again:
 			requeue_leftover(mgr, my_chan, batch);	/* out[] full: stay stealable */
 		else
 			batch_pool_put(batch);			/* fully drained */
-	}
-
-	/* Busy-poll the RX ring that last delivered to this channel (cached at
-	 * delivery above), rather than inferring it from an arbitrary fd. */
-	if (!polled && out_idx > 0 && (size_t)out_idx < mgr->napi_poll_threshold) {
-		unsigned int napi_id = READ_ONCE(my_chan->napi_id);
-
-		polled = true;
-		if (napi_id_valid(napi_id))
-			napi_busy_loop(napi_id, NULL, NULL, false, BUSY_POLL_BUDGET);
-		goto again;
 	}
 
 	if (!out_idx && out_cnt > 0) {
@@ -1939,7 +1956,6 @@ SYSCALL_DEFINE2(upcall_create, size_t, batch_sz, int, flags)
 		return -ENOMEM;
 
 	mgr->batch_size = batch_sz;
-	mgr->napi_poll_threshold = batch_sz / 2;
 
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
 	if (fd < 0) {
