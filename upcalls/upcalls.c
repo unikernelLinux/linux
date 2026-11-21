@@ -299,8 +299,8 @@ enum anchor_state {
 	ANCHOR_DEAD,
 };
 
-/* Per-manager (fd,type) -> live anchor registry. Touched only at subscribe
- * and anchor free (syscall/softirq frequency, not per-packet), so one lock. */
+/* Per-manager (fd,type) -> live anchor registry. Lookup (each re-arm) is RCU;
+ * anchor_lock serialises insert and removal only. */
 #define UPCALL_ANCHOR_HASH_BITS	10
 #define UPCALL_ANCHOR_HASH_SZ	(1u << UPCALL_ANCHOR_HASH_BITS)
 
@@ -312,6 +312,8 @@ struct event_anchor {
 	struct sock		*sk;	/* from file; NULL if non-socket */
 	enum fd_io_kind		kind;
 	struct hlist_node	hash_node;	/* (fd,type) registry membership */
+	struct hlist_node	dying_node;	/* teardown list; hash_node stays valid for RCU readers */
+	struct rcu_head		rcu;
 	atomic_t		state;	/* enum anchor_state */
 	struct kref		refs;	/* lifetime: recycled when this hits 0 */
 	wait_queue_entry_t	wait;
@@ -1259,30 +1261,31 @@ static void anchor_insert(struct event_manager *mgr, struct event_anchor *anchor
 	unsigned long flags;
 
 	spin_lock_irqsave(&mgr->anchor_lock, flags);
-	hlist_add_head(&anchor->hash_node,
-		       &mgr->anchor_hash[anchor_bucket(anchor->event.fd)]);
+	hlist_add_head_rcu(&anchor->hash_node,
+			   &mgr->anchor_hash[anchor_bucket(anchor->event.fd)]);
 	spin_unlock_irqrestore(&mgr->anchor_lock, flags);
 }
 
 /* Find the live anchor for (fd,type) and take a reference so the caller can use
  * it safely against a concurrent close that drops the subscription ref. Caller
- * must kref_put(anchor_release) when done. */
+ * must kref_put(anchor_release) when done.
+ * The walk can see an anchor that a concurrent close has unhashed. Such an
+ * anchor is DEAD or has no references; a caller must check the state. */
 static struct event_anchor *anchor_lookup(struct event_manager *mgr,
 					  int fd, int type)
 {
 	struct event_anchor *a;
-	unsigned long flags;
 	struct event_anchor *found = NULL;
 
-	spin_lock_irqsave(&mgr->anchor_lock, flags);
-	hlist_for_each_entry(a, &mgr->anchor_hash[anchor_bucket(fd)], hash_node) {
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(a, &mgr->anchor_hash[anchor_bucket(fd)], hash_node) {
 		if (a->event.fd == fd && a->event.type == type) {
-			kref_get(&a->refs);
-			found = a;
+			if (kref_get_unless_zero(&a->refs))
+				found = a;
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&mgr->anchor_lock, flags);
+	rcu_read_unlock();
 	return found;
 }
 
@@ -1290,8 +1293,8 @@ static struct event_anchor *anchor_lookup(struct event_manager *mgr,
  * Tear down every (fd, *) subscription at UP_CLOSE, before close_fd() drops the
  * fd. Under anchor_lock, mark each matching anchor DEAD (this gates
  * handle_poll_event's ARMED->QUEUED claim, so no new event posts, and makes the
- * drain suppress any event already in flight) and unhash it, re-chaining it onto
- * a local list via the now-free hash_node. After dropping the lock -- so we are
+ * drain suppress any event already in flight) and unhash it, chaining it onto
+ * a local list via dying_node. After dropping the lock -- so we are
  * not under the waker's whead->lock -- detach from the wait queue and drop the
  * subscription ref. A queued ref may still keep the anchor alive until a
  * draining worker sees DEAD and releases it; the last ref frees it.
@@ -1309,25 +1312,30 @@ static void close_fd_anchors(struct event_manager *mgr, int fd)
 		if (a->event.fd != fd)
 			continue;
 		atomic_set(&a->state, ANCHOR_DEAD);
-		hlist_del(&a->hash_node);
-		hlist_add_head(&a->hash_node, &dying);
+		hlist_del_rcu(&a->hash_node);
+		hlist_add_head(&a->dying_node, &dying);
 	}
 	spin_unlock_irqrestore(&mgr->anchor_lock, flags);
 
-	hlist_for_each_entry_safe(a, tmp, &dying, hash_node) {
-		hlist_del(&a->hash_node);
+	hlist_for_each_entry_safe(a, tmp, &dying, dying_node) {
+		hlist_del(&a->dying_node);
 		if (a->whead)
 			remove_wait_queue(a->whead, &a->wait);
 		kref_put(&a->refs, anchor_release);	/* drop subscription ref */
 	}
 }
 
+static void anchor_free_rcu(struct rcu_head *rcu)
+{
+	kmem_cache_free(anchor_cache, container_of(rcu, struct event_anchor, rcu));
+}
+
 /*
  * Final free, once both refs (subscription + any queued) are gone. The closer
  * (close_fd_anchors / manager teardown) has already removed the anchor from the
  * hash and the wait queue before the last ref could drop, so there is no hash
- * work here. Runs in task context (drain or UP_CLOSE), so the slab free and
- * put_mgr()'s possible free_manager() are both safe.
+ * work here. Runs in task context (drain or UP_CLOSE), so
+ * put_mgr()'s possible free_manager() is safe.
  */
 static void anchor_release(struct kref *kref)
 {
@@ -1336,7 +1344,8 @@ static void anchor_release(struct kref *kref)
 	put_mgr(anchor->mgr);
 	if (anchor->file)
 		fput(anchor->file);
-	kmem_cache_free(anchor_cache, anchor);
+	/* An RCU lookup can still read this anchor. */
+	call_rcu(&anchor->rcu, anchor_free_rcu);
 }
 
 static struct event_anchor *build_anchor(struct event_manager *mgr, struct up_event *evt)
@@ -1688,14 +1697,14 @@ static void teardown_anchors(struct event_manager *mgr)
 	for (unsigned int b = 0; b < UPCALL_ANCHOR_HASH_SZ; b++) {
 		hlist_for_each_entry_safe(a, tmp, &mgr->anchor_hash[b], hash_node) {
 			atomic_set(&a->state, ANCHOR_DEAD);
-			hlist_del(&a->hash_node);
-			hlist_add_head(&a->hash_node, &dying);
+			hlist_del_rcu(&a->hash_node);
+			hlist_add_head(&a->dying_node, &dying);
 		}
 	}
 	spin_unlock_irqrestore(&mgr->anchor_lock, flags);
 
-	hlist_for_each_entry_safe(a, tmp, &dying, hash_node) {
-		hlist_del(&a->hash_node);
+	hlist_for_each_entry_safe(a, tmp, &dying, dying_node) {
+		hlist_del(&a->dying_node);
 		if (a->whead)
 			remove_wait_queue(a->whead, &a->wait);
 		kref_put(&a->refs, anchor_release);	/* subscription ref */
